@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <pthread.h>
 #include <jansson.h>
 
 #include "maelys/mcp/content.h"
@@ -48,6 +49,15 @@ typedef struct maelys_mcp_owned_resource_template {
     struct maelys_mcp_provider *provider;
 } maelys_mcp_owned_resource_template_t;
 
+typedef struct maelys_mcp_subscription {
+    json_t *id;
+    char **resource_uris;
+    size_t resource_uri_count;
+    int tools_list_changed;
+    int resources_list_changed;
+    int active;
+} maelys_mcp_subscription_t;
+
 struct maelys_mcp_provider {
     char *name;
     char *version;
@@ -69,6 +79,7 @@ struct maelys_mcp_runtime {
     char *instructions;
     size_t max_providers;
     size_t max_message_bytes;
+    size_t max_subscriptions;
     maelys_mcp_provider_t **providers;
     size_t provider_count;
     const struct maelys_mcp_module_descriptor *modules[MAELYS_MCP_MAX_MODULES];
@@ -79,6 +90,11 @@ struct maelys_mcp_runtime {
     maelys_mcp_authorize_fn authorize;
     maelys_mcp_audit_fn audit;
     void *policy_context;
+    pthread_mutex_t subscriptions_mutex;
+    int subscriptions_mutex_initialized;
+    maelys_mcp_subscription_t *subscriptions;
+    size_t subscription_count;
+    maelys_mcp_outbox_t *outbox;
 };
 
 typedef struct maelys_mcp_module_request {
@@ -93,7 +109,7 @@ typedef struct maelys_mcp_module_descriptor {
     maelys_mcp_module_kind_t kind;
     const char *name;
     const char *capability_name;
-    json_t *(*capability)(const maelys_mcp_runtime_t *runtime);
+    json_t *(*capability)(const maelys_mcp_runtime_t *runtime, int modern);
     int (*handles)(const char *method);
     json_t *(*handle)(
         maelys_mcp_runtime_t *runtime,
@@ -148,8 +164,14 @@ maelys_mcp_result_t maelys_mcp_validate_schema_definition(
 maelys_mcp_result_t maelys_mcp_isolate_stdout(int *out_transport_fd);
 const maelys_mcp_module_descriptor_t *maelys_mcp_module_descriptor(
     maelys_mcp_module_kind_t kind);
-json_t *maelys_mcp_runtime_capabilities(const maelys_mcp_runtime_t *runtime);
+json_t *maelys_mcp_runtime_capabilities(
+    const maelys_mcp_runtime_t *runtime,
+    int modern);
 int maelys_mcp_add_server_meta(
     maelys_mcp_runtime_t *runtime,
     json_t *result,
     const char *result_type);
+void maelys_mcp_subscription_clear(maelys_mcp_subscription_t *subscription);
+void maelys_mcp_cancel_subscription(
+    maelys_mcp_runtime_t *runtime,
+    const json_t *request_id);

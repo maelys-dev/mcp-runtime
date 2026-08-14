@@ -277,9 +277,11 @@ static json_t *read_resource(
     return response;
 }
 
-static json_t *capability(const maelys_mcp_runtime_t *runtime) {
-    (void)runtime;
-    return json_pack("{s:b,s:b}", "listChanged", 0, "subscribe", 0);
+static json_t *capability(const maelys_mcp_runtime_t *runtime, int modern) {
+    int subscriptions = modern && maelys_mcp_runtime_module_enabled(
+        runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS);
+    return json_pack("{s:b,s:b}", "listChanged", subscriptions,
+        "subscribe", subscriptions);
 }
 
 static int handles(const char *method) {

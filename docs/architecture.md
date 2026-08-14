@@ -16,6 +16,7 @@ maelys-mcp host
     |- module registry
     |   |- Tools
     |   |- Resources
+    |   |- Subscriptions
     |   `- MRTR
     |
     +--> in-process C provider
@@ -51,6 +52,9 @@ client-specific adapter belongs in this library.
 - `maelys_mcp_outbox_enqueue_take` steals a Jansson reference only on success. The
   unique writer releases it after the write callback returns; producers never write
   to the protocol descriptor.
+- `maelys_mcp_runtime_attach_outbox` borrows the bus. The embedding transport must
+  stop event producers and detach the bus before destroying it. Subscription ids and
+  resource filters are deep-copied by the runtime.
 
 ## Protocol eras
 
@@ -73,7 +77,8 @@ The core owns lifecycle, version negotiation, discovery and generic JSON-RPC rou
 It does not contain method-name branches for `tools/list` or `tools/call`. Active
 modules publish their capabilities and claim their methods through the internal
 registry. A newly created runtime has no application capability; the host explicitly
-enables Tools, Resources and MRTR. A provider may expose tools, resources, or both;
+enables Tools, Resources, MRTR and Subscriptions. A provider may expose tools,
+resources, or both;
 registration fails unless every required module is enabled.
 
 MRTR deliberately remains separate from Tools even though the first supported use is
@@ -81,6 +86,12 @@ MRTR deliberately remains separate from Tools even though the first supported us
 multi-round results and retry fields. Future Prompts or Resources modules can reuse
 MRTR without copying it. Resources owns catalog, template and read semantics, while
 the opaque `maelys-uri` facade owns bounded parsing and normalization.
+
+Subscriptions owns long-lived listen requests and accepted event filters, but no
+provider business logic. Enabling it makes the Tools `listChanged` and Resources
+`listChanged`/`subscribe` capability flags true. Producers publish semantic events
+through the public runtime API; the module snapshots matching subscription ids under
+its mutex and releases that mutex before constructing or enqueueing messages.
 
 ## Current JSON Schema subset
 
@@ -102,5 +113,7 @@ Responses are preferred, but after eight consecutive responses one pending
 notification is selected. Keyed notification replacement moves the event to the tail,
 preserving the most recent causal position rather than its first occurrence.
 
-The bus is ready for multiple producers, but 0.5 keeps request dispatch and provider
-calls synchronous. The asynchronous subscription producers are introduced separately.
+The bus accepts multiple producers. In 0.6, subscription event APIs are asynchronous
+with respect to protocol writes, while request dispatch and provider calls remain
+synchronous. A mandatory subscription acknowledgement uses the priority lane so a
+later completion response cannot overtake the stream's first message.

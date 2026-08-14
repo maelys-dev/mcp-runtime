@@ -7,4 +7,5 @@
 #include "maelys/mcp/provider.h"
 #include "maelys/mcp/resources.h"
 #include "maelys/mcp/runtime.h"
+#include "maelys/mcp/subscriptions.h"
 #include "maelys/mcp/uri.h"

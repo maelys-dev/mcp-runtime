@@ -3,7 +3,7 @@ AR ?= ar
 PKG_CONFIG ?= pkg-config
 ANALYZER ?= clang
 PREFIX ?= /usr/local
-VERSION := 0.5.0
+VERSION := 0.6.0
 DOCKER ?= docker
 DOCKER_PLATFORM ?= linux/arm64
 ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
@@ -41,6 +41,7 @@ LIB_SOURCES := \
 	src/modules/mrtr.c \
 	src/modules/tools.c \
 	src/modules/resources.c \
+	src/modules/subscriptions.c \
 	src/provider/provider.c \
 	src/provider/process_provider.c \
 	src/transport/stdio.c \
@@ -111,17 +112,22 @@ $(BIN)/test-outbox: $(OBJ)/tests/test_outbox.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
+$(BIN)/test-subscriptions: $(OBJ)/tests/test_subscriptions.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
 $(OBJ)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
 	$(BIN)/test-modules-content-mrtr
 	$(BIN)/test-resources
 	$(BIN)/test-outbox
+	$(BIN)/test-subscriptions
 	$(BIN)/test-runtime
 	$(BIN)/test-runtime-protocol
 	$(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
@@ -181,8 +187,9 @@ asan:
 tsan:
 	$(MAKE) clean
 	TSAN_OPTIONS=halt_on_error=1 \
-	$(MAKE) $(BIN)/test-outbox CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
+	$(MAKE) $(BIN)/test-outbox $(BIN)/test-subscriptions CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 
 FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer

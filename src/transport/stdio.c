@@ -1,5 +1,6 @@
 #include "src/internal/internal.h"
 #include "maelys/mcp/outbox.h"
+#include "maelys/mcp/subscriptions.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -33,6 +34,12 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
         maelys_mcp_line_reader_clear(&reader);
         return initialized;
     }
+    initialized = maelys_mcp_runtime_attach_outbox(runtime, outbox);
+    if (initialized != MAELYS_MCP_OK) {
+        maelys_mcp_line_reader_clear(&reader);
+        (void)maelys_mcp_outbox_destroy(outbox, 0);
+        return initialized;
+    }
     for (;;) {
         json_t *request = NULL;
         char *error = NULL;
@@ -41,7 +48,10 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
         if (status == MAELYS_MCP_ERR_NOT_FOUND) {
             free(error);
             maelys_mcp_line_reader_clear(&reader);
-            return maelys_mcp_outbox_destroy(outbox, 1);
+            status = maelys_mcp_runtime_complete_subscriptions(runtime);
+            maelys_mcp_runtime_detach_outbox(runtime);
+            maelys_mcp_result_t outbox_status = maelys_mcp_outbox_destroy(outbox, 1);
+            return status == MAELYS_MCP_OK ? outbox_status : status;
         }
         if (status != MAELYS_MCP_OK) {
             json_t *response = maelys_mcp_error_response(NULL, -32700,
@@ -49,6 +59,7 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
             free(error);
             if (!response) {
                 maelys_mcp_line_reader_clear(&reader);
+                maelys_mcp_runtime_detach_outbox(runtime);
                 (void)maelys_mcp_outbox_destroy(outbox, 0);
                 return MAELYS_MCP_ERR_MEMORY;
             }
@@ -57,6 +68,7 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
             if (status != MAELYS_MCP_OK) {
                 json_decref(response);
                 maelys_mcp_line_reader_clear(&reader);
+                maelys_mcp_runtime_detach_outbox(runtime);
                 (void)maelys_mcp_outbox_destroy(outbox, 0);
                 return status;
             }
@@ -70,6 +82,7 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
         if (status != MAELYS_MCP_OK) {
             json_decref(response);
             maelys_mcp_line_reader_clear(&reader);
+            maelys_mcp_runtime_detach_outbox(runtime);
             (void)maelys_mcp_outbox_destroy(outbox, 0);
             return status;
         }

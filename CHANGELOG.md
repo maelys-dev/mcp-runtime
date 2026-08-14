@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0 - 2026-08-14
+
+- Add an independently enabled MCP 2026-07-28 Subscriptions module implementing
+  `subscriptions/listen` with an acknowledged accepted-filter subset.
+- Negotiate Tools and Resources list changes plus canonical resource URI subscriptions;
+  omit unsupported Prompt filters instead of advertising an unavailable capability.
+- Tag every event and graceful completion with
+  `io.modelcontextprotocol/subscriptionId`, and cancel active listens through
+  `notifications/cancelled` without producing an unsolicited response.
+- Route acknowledgements, resource/tool notifications and completion responses through
+  the 0.5 single-writer outbox; keyed updates inherit causal coalescence and bounded
+  backpressure.
+- Add public event-producer APIs, bounded subscription storage, duplicate-id rejection,
+  URI normalization, exact/subresource matching and native/ASan/TSan coverage.
+
 ## 0.5.0 - 2026-08-14
 
 - Add a reusable bounded asynchronous outbox with one writer thread and explicit

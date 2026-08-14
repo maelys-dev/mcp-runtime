@@ -18,10 +18,12 @@ resources, enforce SEP-2164 not-found errors, return rich tool content, complete
 two-round elicitation, and respect declared client capabilities.
 
 This is deliberately a partial conformance result. The frozen 2026-07-28 requirements
-also mandate prompts, request-scoped SSE, subscriptions and further MRTR scenarios
-outside the current modules. The runtime does not implement or
-advertise those capabilities and therefore does not claim complete MCP 2026-07-28
-conformance.
+also mandate prompts, request-scoped SSE and further MRTR scenarios outside the current
+modules. Subscriptions are implemented in 0.6.0, but the pinned upstream package does
+not currently expose a server subscription scenario and this repository's one-response
+HTTP adapter cannot model a long-lived listen stream. Subscription messages are
+therefore validated by native protocol contract tests. The runtime does not
+claim complete MCP 2026-07-28 conformance.
 
 The private `maelys-provider/2` protocol has a separate black-box runner in
 `conformance/provider_conformance.py`. The TypeScript and Python packages under `sdk/`

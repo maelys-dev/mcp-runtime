@@ -400,9 +400,10 @@ static json_t *handle(
         list_tools(runtime, request) : call_tool(runtime, request);
 }
 
-static json_t *capability(const maelys_mcp_runtime_t *runtime) {
-    (void)runtime;
-    return json_object();
+static json_t *capability(const maelys_mcp_runtime_t *runtime, int modern) {
+    return json_pack("{s:b}", "listChanged",
+        modern && maelys_mcp_runtime_module_enabled(
+            runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS));
 }
 
 const maelys_mcp_module_descriptor_t maelys_mcp_tools_module = {

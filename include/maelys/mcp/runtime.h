@@ -5,6 +5,7 @@
 
 #include "maelys/mcp/error.h"
 #include "maelys/mcp/module.h"
+#include "maelys/mcp/outbox.h"
 #include "maelys/mcp/provider.h"
 
 #ifdef __cplusplus
@@ -49,6 +50,7 @@ typedef struct maelys_mcp_runtime_config {
     const char *instructions;
     size_t max_providers;
     size_t max_message_bytes;
+    size_t max_subscriptions;
     maelys_mcp_authorize_fn authorize;
     maelys_mcp_audit_fn audit;
     void *policy_context;
@@ -68,6 +70,13 @@ maelys_mcp_result_t maelys_mcp_runtime_add_provider(
 json_t *maelys_mcp_runtime_handle(
     maelys_mcp_runtime_t *runtime,
     json_t *request);
+
+/* The runtime borrows the outbox. Detach it before destroying the outbox. */
+maelys_mcp_result_t maelys_mcp_runtime_attach_outbox(
+    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_outbox_t *outbox);
+
+void maelys_mcp_runtime_detach_outbox(maelys_mcp_runtime_t *runtime);
 
 maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
     maelys_mcp_runtime_t *runtime,

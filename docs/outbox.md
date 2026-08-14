@@ -25,6 +25,12 @@ keeps only the newest JSON message and moves its node to the queue tail. Thus th
 order `A, B, A` is observed as `B, A`, which reflects the newest invalidation order.
 Responses are never coalesced.
 
+Subscription acknowledgements are wire-level JSON-RPC notifications, but are queued
+in the response-priority lane. MCP requires acknowledgement to be the first message of
+the listen stream; this classification prevents a later ordinary or graceful-close
+response from overtaking it. Resource and list-change notifications use keyed
+coalescence keys that include both the subscription id and event subject.
+
 The callback must obey its transport's own shutdown contract. In particular, it must
 not call back into the same outbox and should use bounded or cancellable I/O when the
 underlying transport can stall indefinitely.

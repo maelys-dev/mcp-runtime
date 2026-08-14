@@ -58,29 +58,85 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->max_providers = config->max_providers ? config->max_providers : 16u;
     runtime->max_message_bytes = config->max_message_bytes ?
         config->max_message_bytes : MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES;
+    runtime->max_subscriptions = config->max_subscriptions ?
+        config->max_subscriptions : 64u;
     runtime->authorize = config->authorize;
     runtime->audit = config->audit;
     runtime->policy_context = config->policy_context;
     runtime->providers = calloc(runtime->max_providers, sizeof(*runtime->providers));
+    runtime->subscriptions = calloc(runtime->max_subscriptions,
+        sizeof(*runtime->subscriptions));
     if (!runtime->server_name || !runtime->server_version || !runtime->instructions ||
-        !runtime->providers) {
+        !runtime->providers || !runtime->subscriptions ||
+        pthread_mutex_init(&runtime->subscriptions_mutex, NULL) != 0) {
         maelys_mcp_runtime_destroy(runtime);
         return MAELYS_MCP_ERR_MEMORY;
     }
+    runtime->subscriptions_mutex_initialized = 1;
     *out_runtime = runtime;
     return MAELYS_MCP_OK;
 }
 
 void maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     if (!runtime) return;
+    if (runtime->subscriptions_mutex_initialized) {
+        pthread_mutex_lock(&runtime->subscriptions_mutex);
+        runtime->outbox = NULL;
+        for (size_t index = 0; index < runtime->subscription_count; ++index) {
+            maelys_mcp_subscription_clear(&runtime->subscriptions[index]);
+        }
+        runtime->subscription_count = 0u;
+        pthread_mutex_unlock(&runtime->subscriptions_mutex);
+        pthread_mutex_destroy(&runtime->subscriptions_mutex);
+    }
     for (size_t index = 0; index < runtime->provider_count; ++index) {
         maelys_mcp_provider_destroy(runtime->providers[index]);
     }
     free(runtime->providers);
+    free(runtime->subscriptions);
     free(runtime->server_name);
     free(runtime->server_version);
     free(runtime->instructions);
     free(runtime);
+}
+
+maelys_mcp_result_t maelys_mcp_runtime_attach_outbox(
+    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_outbox_t *outbox) {
+    if (!runtime || !outbox || !runtime->subscriptions_mutex_initialized) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    pthread_mutex_lock(&runtime->subscriptions_mutex);
+    if (runtime->outbox && runtime->outbox != outbox) {
+        pthread_mutex_unlock(&runtime->subscriptions_mutex);
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    runtime->outbox = outbox;
+    pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    return MAELYS_MCP_OK;
+}
+
+void maelys_mcp_runtime_detach_outbox(maelys_mcp_runtime_t *runtime) {
+    if (!runtime || !runtime->subscriptions_mutex_initialized) return;
+    pthread_mutex_lock(&runtime->subscriptions_mutex);
+    runtime->outbox = NULL;
+    pthread_mutex_unlock(&runtime->subscriptions_mutex);
+}
+
+static int valid_request_id(const json_t *value) {
+    return json_is_integer(value) ||
+        (json_is_string(value) && !maelys_mcp_json_string_has_nul(value));
+}
+
+static void handle_cancelled_notification(
+    maelys_mcp_runtime_t *runtime,
+    json_t *params) {
+    if (!maelys_mcp_runtime_module_enabled(runtime,
+        MAELYS_MCP_MODULE_SUBSCRIPTIONS) || !json_is_object(params)) return;
+    json_t *request_id = json_object_get(params, "requestId");
+    if (valid_request_id(request_id)) {
+        maelys_mcp_cancel_subscription(runtime, request_id);
+    }
 }
 
 maelys_mcp_result_t maelys_mcp_runtime_add_provider(
@@ -167,7 +223,7 @@ static json_t *initialize(maelys_mcp_runtime_t *runtime, json_t *id, json_t *par
     runtime->legacy_initialize_received = 1;
     json_t *result = json_object();
     json_t *info = server_info(runtime);
-    json_t *caps = maelys_mcp_runtime_capabilities(runtime);
+    json_t *caps = maelys_mcp_runtime_capabilities(runtime, 0);
     if (!result || !info || !caps ||
         json_object_set_new(result, "protocolVersion",
             json_string(MAELYS_MCP_PROTOCOL_LEGACY)) != 0 ||
@@ -189,7 +245,7 @@ static json_t *initialize(maelys_mcp_runtime_t *runtime, json_t *id, json_t *par
 static json_t *discover(maelys_mcp_runtime_t *runtime, json_t *id) {
     json_t *result = json_object();
     json_t *versions = json_array();
-    json_t *caps = maelys_mcp_runtime_capabilities(runtime);
+    json_t *caps = maelys_mcp_runtime_capabilities(runtime, 1);
     if (!result || !versions || !caps ||
         json_array_append_new(versions, json_string(MAELYS_MCP_PROTOCOL_MODERN)) != 0 ||
         json_array_append_new(versions, json_string(MAELYS_MCP_PROTOCOL_LEGACY)) != 0 ||
@@ -268,6 +324,10 @@ json_t *maelys_mcp_runtime_handle(maelys_mcp_runtime_t *runtime, json_t *request
     if (strcmp(method_name, "initialize") == 0) return initialize(runtime, id, params);
     if (strcmp(method_name, "notifications/initialized") == 0) {
         if (runtime->legacy_initialize_received) runtime->legacy_initialized = 1;
+        return NULL;
+    }
+    if (strcmp(method_name, "notifications/cancelled") == 0 && !id) {
+        handle_cancelled_notification(runtime, params);
         return NULL;
     }
     if (!id) return NULL;

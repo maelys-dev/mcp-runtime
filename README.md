@@ -12,7 +12,8 @@ The first milestone provides:
 - persistent out-of-process providers using the explicit `maelys-provider/2` result contract;
 - MCP `2026-07-28` stateless requests and `server/discover`;
 - legacy MCP `2025-11-25` initialization for compatibility;
-- an explicit module registry with independently enabled Tools, Resources and MRTR modules;
+- an explicit module registry with independently enabled Tools, Resources, MRTR and
+  Subscriptions modules;
 - `tools/list`, `tools/call`, rich text/image/audio/resource content, and
   multi-round `input_required` tool calls;
 - `resources/list`, `resources/templates/list`, and `resources/read`, backed by
@@ -25,6 +26,8 @@ The first milestone provides:
 - isolated protocol stdout that cannot be contaminated by ordinary `printf()` calls;
 - a bounded asynchronous output bus with a single protocol writer, response priority,
   anti-starvation and causal notification coalescence;
+- MCP 2026-07-28 `subscriptions/listen`, negotiated Tools/Resources filters,
+  subscription-tagged change notifications, cancellation and graceful completion;
 - Linux sanitizer and libFuzzer release gates.
 
 It is deliberately not a shell-command wrapper. Provider executables are absolute,
@@ -95,7 +98,7 @@ library writes diagnostics with `printf()`.
 ```text
 include/maelys/mcp/  public C API
 src/core/            MCP core, content, URI and schema validation
-src/modules/         capability registry, Tools, Resources and MRTR modules
+src/modules/         capability registry, Tools, Resources, MRTR and Subscriptions
 src/provider/        in-process and process-provider adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
@@ -109,16 +112,16 @@ docs/                architecture, security and provider protocol
 
 See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-protocol.md),
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
-[Asynchronous outbox](docs/outbox.md), [Test parity](docs/test-parity.md), and
-[Provenance](docs/provenance.md).
+[Asynchronous outbox](docs/outbox.md), [Subscriptions](docs/subscriptions.md),
+[Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
 Client setup examples are in [Codex and Claude clients](docs/clients.md).
 The scope and limitations of the upstream test suite are in
 [Official MCP conformance](docs/official-conformance.md).
 
 ## Status
 
-Version 0.5.0 adds the asynchronous single-writer output foundation while preserving
-the private `maelys-provider/2` contract. Provider calls remain synchronous in this
-release; Streamable HTTP, cancellation, subscriptions, prompts, dynamic provider
-reload, full JSON Schema 2020-12, Windows support and stable ABI guarantees are not
-implemented yet.
+Version 0.6.0 adds modern long-lived subscriptions over the asynchronous single-writer
+output foundation while preserving the private `maelys-provider/2` contract. Provider
+calls remain synchronous in this release; provider-originated event transport,
+Streamable HTTP, prompts, Tasks, progress, dynamic provider reload, full JSON Schema
+2020-12, Windows support and stable ABI guarantees are not implemented yet.
