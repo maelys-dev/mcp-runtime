@@ -13,7 +13,7 @@ Current Codex clients support local stdio MCP servers and share MCP configuratio
 
 ```sh
 codex mcp add yavena-hermes -- \
-  /absolute/path/to/mcp-runtime/build/bin/maelys-mcp \
+  /absolute/path/to/mcp-runtime/build/release/bin/maelys-mcp \
   --provider /absolute/path/to/yavena-hermes/apps/hermes-mcp-provider/dist/index.js
 
 codex mcp get yavena-hermes
@@ -35,7 +35,7 @@ every project on the machine:
 
 ```sh
 claude mcp add yavena-hermes --scope user -- \
-  /absolute/path/to/mcp-runtime/build/bin/maelys-mcp \
+  /absolute/path/to/mcp-runtime/build/release/bin/maelys-mcp \
   --provider /absolute/path/to/yavena-hermes/apps/hermes-mcp-provider/dist/index.js
 
 claude mcp get yavena-hermes

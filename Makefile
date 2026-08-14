@@ -3,7 +3,7 @@ AR ?= ar
 PKG_CONFIG ?= pkg-config
 ANALYZER ?= clang
 PREFIX ?= /usr/local
-VERSION := 0.6.0
+VERSION := 0.6.1
 DOCKER ?= docker
 DOCKER_PLATFORM ?= linux/arm64
 ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
@@ -15,7 +15,9 @@ CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread
 LDLIBS += $(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread
 
-BUILD := build
+BUILD_ROOT ?= build
+BUILD_PROFILE ?= release
+BUILD ?= $(BUILD_ROOT)/$(BUILD_PROFILE)
 OBJ := $(BUILD)/obj
 BIN := $(BUILD)/bin
 LIB := $(BUILD)/lib
@@ -48,7 +50,7 @@ LIB_SOURCES := \
 	src/transport/stdio_isolation.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJ)/%.o)
 
-.PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan analyze audit install fuzz-build fuzz-smoke \
+.PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
 	asan-linux-image test-asan-linux test-asan-linux-fresh
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
@@ -180,56 +182,59 @@ install: all
 	cp -R include/maelys "$(DESTDIR)$(PREFIX)/include/"
 
 asan:
-	$(MAKE) clean
 	ASAN_OPTIONS=$(ASAN_OPTIONS_VALUE) UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-	$(MAKE) check CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=address,undefined -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=address,undefined"
+	$(MAKE) BUILD_PROFILE=asan check CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=address,undefined -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=address,undefined"
 
 tsan:
-	$(MAKE) clean
 	TSAN_OPTIONS=halt_on_error=1 \
-	$(MAKE) $(BIN)/test-outbox $(BIN)/test-subscriptions CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
+	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
+
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 
 FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-FUZZ_BINARIES := $(BUILD)/fuzz/json-lines $(BUILD)/fuzz/content-length $(BUILD)/fuzz/schema $(BUILD)/fuzz/content $(BUILD)/fuzz/uri
+FUZZ_BUILD := $(BUILD_ROOT)/fuzz
+FUZZ_BIN := $(FUZZ_BUILD)/bin
+FUZZ_CORPUS := $(FUZZ_BUILD)/corpus
+FUZZ_BINARIES := $(FUZZ_BIN)/json-lines $(FUZZ_BIN)/content-length $(FUZZ_BIN)/schema $(FUZZ_BIN)/content $(FUZZ_BIN)/uri
 
-$(BUILD)/fuzz/json-lines: fuzz/fuzz_json_lines.c $(LIB_SOURCES)
+$(FUZZ_BIN)/json-lines: fuzz/fuzz_json_lines.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD)/fuzz/content-length: fuzz/fuzz_content_length.c $(LIB_SOURCES)
+$(FUZZ_BIN)/content-length: fuzz/fuzz_content_length.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD)/fuzz/schema: fuzz/fuzz_schema.c $(LIB_SOURCES)
+$(FUZZ_BIN)/schema: fuzz/fuzz_schema.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD)/fuzz/content: fuzz/fuzz_content.c $(LIB_SOURCES)
+$(FUZZ_BIN)/content: fuzz/fuzz_content.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD)/fuzz/uri: fuzz/fuzz_uri.c $(LIB_SOURCES)
+$(FUZZ_BIN)/uri: fuzz/fuzz_uri.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
 fuzz-build: $(FUZZ_BINARIES)
 
 fuzz-smoke: fuzz-build
-	rm -rf $(BUILD)/fuzz-corpus
-	mkdir -p $(BUILD)/fuzz-corpus/json-lines $(BUILD)/fuzz-corpus/content-length $(BUILD)/fuzz-corpus/schema $(BUILD)/fuzz-corpus/content $(BUILD)/fuzz-corpus/uri
-	cp fuzz/seeds/json-lines/* $(BUILD)/fuzz-corpus/json-lines/
-	printf 'Content-Length: 2\r\n\r\n{}' >$(BUILD)/fuzz-corpus/content-length/frame
-	cp fuzz/seeds/schema/* $(BUILD)/fuzz-corpus/schema/
-	cp fuzz/seeds/content/* $(BUILD)/fuzz-corpus/content/
-	cp fuzz/seeds/uri/* $(BUILD)/fuzz-corpus/uri/
-	$(BUILD)/fuzz/json-lines -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/json-lines
-	$(BUILD)/fuzz/content-length -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/content-length
-	$(BUILD)/fuzz/schema -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/schema
-	$(BUILD)/fuzz/content -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/content
-	$(BUILD)/fuzz/uri -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/uri
+	rm -rf $(FUZZ_CORPUS)
+	mkdir -p $(FUZZ_CORPUS)/json-lines $(FUZZ_CORPUS)/content-length $(FUZZ_CORPUS)/schema $(FUZZ_CORPUS)/content $(FUZZ_CORPUS)/uri
+	cp fuzz/seeds/json-lines/* $(FUZZ_CORPUS)/json-lines/
+	printf 'Content-Length: 2\r\n\r\n{}' >$(FUZZ_CORPUS)/content-length/frame
+	cp fuzz/seeds/schema/* $(FUZZ_CORPUS)/schema/
+	cp fuzz/seeds/content/* $(FUZZ_CORPUS)/content/
+	cp fuzz/seeds/uri/* $(FUZZ_CORPUS)/uri/
+	$(FUZZ_BIN)/json-lines -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/json-lines
+	$(FUZZ_BIN)/content-length -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/content-length
+	$(FUZZ_BIN)/schema -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/schema
+	$(FUZZ_BIN)/content -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/content
+	$(FUZZ_BIN)/uri -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/uri
 
 asan-linux-image:
 	$(DOCKER) build --platform $(DOCKER_PLATFORM) \
@@ -238,7 +243,7 @@ asan-linux-image:
 test-asan-linux: asan-linux-image
 	$(DOCKER) run --rm --platform $(DOCKER_PLATFORM) \
 		-v "$(CURDIR):/source:ro" $(ASAN_LINUX_IMAGE) \
-		bash -lc 'cp -a /source /tmp/mcp-runtime && cd /tmp/mcp-runtime && make asan CC=clang && make fuzz-smoke FUZZ_CC=clang'
+		bash -lc 'cp -a /source /tmp/mcp-runtime && cd /tmp/mcp-runtime && make clean && make asan CC=clang && make fuzz-smoke FUZZ_CC=clang'
 
 test-asan-linux-fresh:
 	$(DOCKER) build --no-cache --pull --platform $(DOCKER_PLATFORM) \
@@ -246,4 +251,4 @@ test-asan-linux-fresh:
 	$(MAKE) test-asan-linux
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD_ROOT)

@@ -9,3 +9,4 @@
 #include "maelys/mcp/runtime.h"
 #include "maelys/mcp/subscriptions.h"
 #include "maelys/mcp/uri.h"
+#include "maelys/mcp/version.h"

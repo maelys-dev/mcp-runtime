@@ -81,6 +81,8 @@ static json_t *response_result(json_t *response) {
 
 int main(void) {
     test_context_t state = {0};
+    ASSERT_TRUE(strcmp(maelys_mcp_version_string(), "0.6.1") == 0);
+    ASSERT_TRUE(maelys_mcp_abi_version() == MAELYS_MCP_ABI_VERSION);
     maelys_mcp_tool_effect_t parsed_effect = MAELYS_MCP_EFFECT_UNSPECIFIED;
     ASSERT_TRUE(maelys_mcp_tool_effect_parse("commit", &parsed_effect) == MAELYS_MCP_OK);
     ASSERT_TRUE(parsed_effect == MAELYS_MCP_EFFECT_COMMIT);

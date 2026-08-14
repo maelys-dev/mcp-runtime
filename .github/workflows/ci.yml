@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-runtime-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  check:
+    name: Native, SDK and provider checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3
+      - run: make check-all CC=clang ANALYZER=clang
+      - run: make analyze CC=clang ANALYZER=clang
+
+  sanitizers:
+    name: ASan, UBSan and TSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev
+      - run: make asan CC=clang
+      - run: make tsan CC=clang
+
+  fuzz:
+    name: Fuzzer smoke campaigns
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev
+      - run: make fuzz-smoke CC=clang FUZZ_CC=clang
+
+  official-conformance:
+    name: Supported official MCP scenarios
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3
+      - run: make test-mcp-conformance-official CC=clang

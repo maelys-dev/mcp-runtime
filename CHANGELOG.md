@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.1 - 2026-08-14
+
+- Add continuous integration for every push and pull request, covering native, SDK,
+  provider, analyzer, sanitizer, fuzzer and supported official MCP conformance gates.
+- Isolate release, ASan, TSan and libFuzzer artifacts under separate build profiles so
+  instrumentation flags can never leak into a normal build.
+- Publish the MIT license at the repository root.
+- Define native ABI version 1, expose runtime/package version queries, keep all stateful
+  public handles opaque and document the compatibility policy through 1.0.
+
 ## 0.6.0 - 2026-08-14
 
 - Add an independently enabled MCP 2026-07-28 Subscriptions module implementing

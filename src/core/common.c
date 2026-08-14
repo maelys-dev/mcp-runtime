@@ -1,5 +1,6 @@
 #include "src/internal/internal.h"
 #include "src/jsonrpc/core.h"
+#include "maelys/mcp/version.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -8,6 +9,14 @@
 #include <unistd.h>
 
 #define MAELYS_MCP_READ_CHUNK_BYTES 4096u
+
+const char *maelys_mcp_version_string(void) {
+    return MAELYS_MCP_VERSION;
+}
+
+unsigned int maelys_mcp_abi_version(void) {
+    return MAELYS_MCP_ABI_VERSION;
+}
 
 const char *maelys_mcp_result_string(maelys_mcp_result_t result) {
     switch (result) {

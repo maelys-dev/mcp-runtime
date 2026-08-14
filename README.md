@@ -1,5 +1,7 @@
 # Maelys MCP Runtime
 
+[![CI](https://github.com/maelys-dev/mcp-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/maelys-dev/mcp-runtime/actions/workflows/ci.yml)
+
 Maelys MCP Runtime is a native, policy-enforced MCP host for polyglot developer tools.
 It exposes explicitly configured providers through one local MCP endpoint without
 embedding provider business logic in the protocol runtime.
@@ -47,6 +49,10 @@ make test-asan-linux
 make test-mcp-conformance-official
 ```
 
+Build profiles never share object files. Normal builds use `build/release`, while
+sanitizer and fuzzer targets use `build/asan`, `build/tsan` and `build/fuzz`.
+Consequently, running `make tsan` cannot contaminate a later `make check-all`.
+
 `make check` keeps the native C gate dependency-minimal. `make check-all` additionally
 runs the TypeScript and Python SDK tests plus the black-box provider conformance suite.
 The separately invoked official MCP target uses the upstream HTTP-only alpha runner
@@ -70,15 +76,15 @@ This installs the public headers, static library, host executable, and
 Start the example server:
 
 ```sh
-build/bin/maelys-mcp \
-  --provider "$PWD/build/bin/example-provider"
+build/release/bin/maelys-mcp \
+  --provider "$PWD/build/release/bin/example-provider"
 ```
 
 Provider deadlines can be tuned without changing the provider contract:
 
 ```sh
-build/bin/maelys-mcp \
-  --provider "$PWD/build/bin/example-provider" \
+build/release/bin/maelys-mcp \
+  --provider "$PWD/build/release/bin/example-provider" \
   --provider-describe-timeout-ms 5000 \
   --provider-call-timeout-ms 300000 \
   --provider-shutdown-timeout-ms 2000
@@ -112,6 +118,7 @@ docs/                architecture, security and provider protocol
 
 See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-protocol.md),
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
+[C API and ABI policy](docs/abi-policy.md),
 [Asynchronous outbox](docs/outbox.md), [Subscriptions](docs/subscriptions.md),
 [Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
 Client setup examples are in [Codex and Claude clients](docs/clients.md).
@@ -120,8 +127,12 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.6.0 adds modern long-lived subscriptions over the asynchronous single-writer
-output foundation while preserving the private `maelys-provider/2` contract. Provider
-calls remain synchronous in this release; provider-originated event transport,
+Version 0.6.1 hardens release engineering around the 0.6 subscription milestone:
+isolated build profiles, continuous integration, an explicit native ABI version and a
+published compatibility policy. Provider calls remain synchronous in this release;
+provider-originated event transport,
 Streamable HTTP, prompts, Tasks, progress, dynamic provider reload, full JSON Schema
-2020-12, Windows support and stable ABI guarantees are not implemented yet.
+2020-12 and Windows support are not implemented yet. The pre-1.0 ABI policy is
+documented and versioned; same-major ABI stability begins with 1.0.
+
+The source is available under the [MIT License](LICENSE).
