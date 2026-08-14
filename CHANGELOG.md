@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2 - 2026-08-14
+
+- Give queued subscription metadata and completion responses independent Jansson ID
+  objects, eliminating a producer/writer reference-count race detected by Linux TSan.
+- Keep continuous integration on every branch push while avoiding duplicate runs when
+  an already-tested commit is subsequently tagged for release.
+
 ## 0.6.1 - 2026-08-14
 
 - Add continuous integration for every push and pull request, covering native, SDK,

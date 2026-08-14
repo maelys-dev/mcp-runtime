@@ -127,9 +127,10 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.6.1 hardens release engineering around the 0.6 subscription milestone:
+Version 0.6.2 hardens release engineering around the 0.6 subscription milestone:
 isolated build profiles, continuous integration, an explicit native ABI version and a
-published compatibility policy. Provider calls remain synchronous in this release;
+published compatibility policy. It also isolates subscription identifiers across the
+producer and single-writer threads. Provider calls remain synchronous in this release;
 provider-originated event transport,
 Streamable HTTP, prompts, Tasks, progress, dynamic provider reload, full JSON Schema
 2020-12 and Windows support are not implemented yet. The pre-1.0 ABI policy is

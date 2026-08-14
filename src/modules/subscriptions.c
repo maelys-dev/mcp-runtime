@@ -158,10 +158,14 @@ failed:
 
 static json_t *subscription_meta(const json_t *id) {
     json_t *meta = json_object();
-    if (!meta || json_object_set(meta, SUBSCRIPTION_META_KEY, (json_t *)id) != 0) {
+    json_t *id_copy = id ? json_deep_copy(id) : NULL;
+    if (!meta || !id_copy ||
+        json_object_set(meta, SUBSCRIPTION_META_KEY, id_copy) != 0) {
         if (meta) json_decref(meta);
+        if (id_copy) json_decref(id_copy);
         return NULL;
     }
+    json_decref(id_copy);
     return meta;
 }
 
@@ -476,7 +480,11 @@ maelys_mcp_result_t maelys_mcp_runtime_complete_subscriptions(
             outcome = MAELYS_MCP_ERR_MEMORY;
         } else {
             json_decref(meta);
-            json_t *response = maelys_mcp_success_response(ids[index], result);
+            json_t *response_id = json_deep_copy(ids[index]);
+            json_t *response = response_id ?
+                maelys_mcp_success_response(response_id, result) : NULL;
+            if (!response_id) json_decref(result);
+            if (response_id) json_decref(response_id);
             if (!response || !outbox) {
                 if (response) json_decref(response);
                 outcome = outbox ? MAELYS_MCP_ERR_MEMORY : MAELYS_MCP_ERR_ARGUMENT;
