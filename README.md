@@ -30,9 +30,17 @@ Requirements: a C11 compiler, POSIX shell utilities, `make`, `pkg-config`, and J
 
 ```sh
 make check
+make check-all
 make asan
 make test-asan-linux
+make test-mcp-conformance-official
 ```
+
+`make check` keeps the native C gate dependency-minimal. `make check-all` additionally
+runs the TypeScript and Python SDK tests plus the black-box provider conformance suite.
+The separately invoked official MCP target uses the upstream HTTP-only alpha runner
+through a test adapter and covers only the scenarios matching the tools-only contract.
+It is not a claim of complete MCP 2026-07-28 conformance.
 
 `make test-asan-linux` is the reproducible release gate. It uses a digest-pinned
 Ubuntu 24.04/Clang image, enables ASan, UBSan and leak detection, then runs smoke
@@ -73,6 +81,9 @@ src/provider/        in-process and process-provider adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
 providers/example/   independent reference provider
+conformance/          black-box maelys-provider/1 runner and call scenarios
+sdk/typescript/       dependency-free TypeScript/JavaScript provider SDK
+sdk/python/           dependency-free Python provider SDK
 tests/               unit and end-to-end tests
 docs/                architecture, security and provider protocol
 ```
@@ -80,9 +91,12 @@ docs/                architecture, security and provider protocol
 See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-protocol.md),
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
 [Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
+Client setup examples are in [Codex and Claude clients](docs/clients.md).
+The scope and limitations of the upstream test suite are in
+[Official MCP conformance](docs/official-conformance.md).
 
 ## Status
 
-Version 0.1.0 establishes the tested local stdio and provider boundary. Streamable
+Version 0.2.0 establishes the tested local stdio and polyglot provider boundary. Streamable
 HTTP, cancellation, subscriptions, MRTR, dynamic provider reload, full JSON Schema
 2020-12, Windows support and stable ABI guarantees are not implemented yet.

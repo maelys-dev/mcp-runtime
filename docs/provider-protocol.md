@@ -61,6 +61,24 @@ being advertised and silently ignored.
 
 The result may be any JSON value accepted by the declared output schema.
 
+## Conformance
+
+`conformance/provider_conformance.py` treats a provider as a black box. It checks the
+persistent lifecycle, exact envelopes and ids, structured unknown-tool errors, schema
+definitions, declared call scenarios, graceful shutdown and exclusive stdout usage.
+
+```sh
+python3 conformance/provider_conformance.py /absolute/provider \
+  --cases /absolute/provider-cases.json
+```
+
+Case files contain a `calls` array. An argument value that is exactly `${VARIABLE}` is
+resolved from the runner environment, which permits repository-specific integration
+tests without storing machine paths in source control.
+
+The language SDKs under `sdk/typescript` and `sdk/python` implement this lifecycle so
+application adapters only define descriptors and handlers.
+
 ## `provider/shutdown`
 
 The host requests graceful shutdown before closing the socket. Providers should return

@@ -3,13 +3,14 @@ AR ?= ar
 PKG_CONFIG ?= pkg-config
 ANALYZER ?= clang
 PREFIX ?= /usr/local
-VERSION := 0.1.0
+VERSION := 0.2.0
 DOCKER ?= docker
 DOCKER_PLATFORM ?= linux/arm64
 ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
 FUZZ_CC ?= clang
+MCP_CONFORMANCE_PACKAGE ?= @modelcontextprotocol/conformance@0.2.0-alpha.11
 
-CPPFLAGS += -Iinclude -I. $(shell $(PKG_CONFIG) --cflags jansson)
+CPPFLAGS += -Iinclude -I. -DMAELYS_MCP_VERSION='"$(VERSION)"' $(shell $(PKG_CONFIG) --cflags jansson)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L
 LDLIBS += $(shell $(PKG_CONFIG) --libs jansson)
@@ -38,7 +39,7 @@ LIB_SOURCES := \
 	src/transport/stdio_isolation.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJ)/%.o)
 
-.PHONY: all clean test check asan analyze audit install fuzz-build fuzz-smoke \
+.PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan analyze audit install fuzz-build fuzz-smoke \
 	asan-linux-image test-asan-linux test-asan-linux-fresh
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
@@ -116,6 +117,29 @@ analyze:
 	done
 
 check: test audit
+
+check-sdks:
+	node --test sdk/typescript/test/*.test.js
+	PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests -v
+	python3 -m unittest tests/test_provider_conformance.py -v
+
+test-provider-conformance: all
+	python3 conformance/provider_conformance.py $(abspath $(BIN)/example-provider) \
+		--cases conformance/example-cases.json
+	python3 conformance/provider_conformance.py \
+		$(abspath sdk/typescript/test/fixture-provider.js) --cases conformance/sdk-cases.json
+	PYTHONPATH=sdk/python/src python3 conformance/provider_conformance.py \
+		$(abspath sdk/python/tests/fixture_provider.py) --cases conformance/sdk-cases.json
+
+test-conformance: test-provider-conformance
+
+test-mcp-conformance-official: all
+	PYTHONPATH=sdk/python/src python3 conformance/run_official_mcp.py \
+		--runtime $(abspath $(BIN)/maelys-mcp) \
+		--provider $(abspath conformance/official_tools_provider.py) \
+		--package '$(MCP_CONFORMANCE_PACKAGE)'
+
+check-all: check check-sdks test-provider-conformance
 
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/lib/pkgconfig" \

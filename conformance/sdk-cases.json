@@ -1,0 +1,14 @@
+{
+  "calls": [
+    {
+      "tool": "fixture.echo",
+      "arguments": { "message": "conformance" },
+      "expect": "success"
+    },
+    {
+      "tool": "fixture.echo",
+      "arguments": {},
+      "expect": "error"
+    }
+  ]
+}

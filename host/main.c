@@ -6,6 +6,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifndef MAELYS_MCP_VERSION
+#define MAELYS_MCP_VERSION "0.0.0-dev"
+#endif
+
 typedef struct host_policy {
     unsigned int allowed_effects;
 } host_policy_t;
@@ -67,7 +71,7 @@ int main(int argc, char **argv) {
 
     maelys_mcp_runtime_config_t config = {
         .server_name = "maelys-mcp",
-        .server_version = "0.1.0",
+        .server_version = MAELYS_MCP_VERSION,
         .instructions = "A policy-enforced local MCP runtime for explicitly configured providers.",
         .max_providers = provider_count,
         .max_message_bytes = MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES,

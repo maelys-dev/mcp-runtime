@@ -16,3 +16,9 @@ release-candidate wire shape. Primary references:
 The current milestone exposes tools only. Prompts, resources, subscriptions,
 Multi Round-Trip Requests, Tasks, HTTP header routing, and authorization transports
 are not yet implemented.
+
+The upstream conformance runner currently requires an HTTP server and its complete
+2026-07-28 requirement set covers capabilities beyond this milestone. The repository
+therefore runs a documented, pinned subset through a test-only HTTP-to-stdio adapter;
+see [Official MCP conformance](official-conformance.md). This validates the supported
+wire surface without claiming complete protocol conformance.

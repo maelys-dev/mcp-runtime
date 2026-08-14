@@ -1,0 +1,69 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createProvider, describeProvider, handleProviderMessage, validateSchemaDefinition } from "../src/index.js";
+
+function fixtureProvider() {
+  return createProvider({
+    name: "fixture",
+    version: "1.0.0",
+    tools: [{
+      name: "fixture.echo",
+      description: "Echo a message.",
+      inputSchema: {
+        type: "object",
+        properties: { message: { type: "string", minLength: 1 } },
+        required: ["message"],
+        additionalProperties: false,
+      },
+      outputSchema: { type: "object" },
+      effect: "read",
+      handler: async ({ message }) => ({ message }),
+    }],
+  });
+}
+
+test("description never exposes handlers", () => {
+  const description = describeProvider(fixtureProvider());
+  assert.equal(description.name, "fixture");
+  assert.equal(description.tools[0].handler, undefined);
+  assert.equal(description.tools[0].effect, "read");
+});
+
+test("persistent messages preserve protocol and integer ids", async () => {
+  const provider = fixtureProvider();
+  const response = await handleProviderMessage(provider, {
+    protocol: "maelys-provider/1",
+    id: 7,
+    method: "provider/call",
+    params: { name: "fixture.echo", arguments: { message: "hello" } },
+  });
+  assert.deepEqual(response, { protocol: "maelys-provider/1", id: 7, result: { message: "hello" } });
+  await assert.rejects(() => handleProviderMessage(provider, {
+    protocol: "wrong",
+    id: 8,
+    method: "provider/describe",
+    params: {},
+  }), /unsupported provider protocol/);
+});
+
+test("unknown tools fail without invoking a handler", async () => {
+  await assert.rejects(() => handleProviderMessage(fixtureProvider(), {
+    protocol: "maelys-provider/1",
+    id: 9,
+    method: "provider/call",
+    params: { name: "fixture.missing", arguments: {} },
+  }), /unknown provider tool/);
+});
+
+test("schema validation rejects unsupported keywords and drift-prone required fields", () => {
+  assert.throws(() => validateSchemaDefinition({ type: "object", oneOf: [] }), /unsupported key/);
+  assert.throws(() => validateSchemaDefinition({ type: "object", required: ["missing"] }), /undeclared property/);
+  assert.throws(() => validateSchemaDefinition({ type: "integer", minLength: 1 }), /length keywords/);
+  assert.throws(() => validateSchemaDefinition({ type: "string", minimum: 1 }), /numeric bounds/);
+  assert.throws(() => validateSchemaDefinition({ type: "string", enum: [1] }), /does not match/);
+  assert.throws(() => createProvider({
+    name: "duplicate",
+    version: "1",
+    tools: [fixtureProvider().tools[0], fixtureProvider().tools[0]],
+  }), /duplicate provider tool/);
+});

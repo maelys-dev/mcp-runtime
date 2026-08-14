@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maelys-mcp-provider-sdk"
+version = "0.1.0"
+description = "Dependency-free Python SDK for maelys-provider/1 providers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+maelys_mcp_provider = ["py.typed"]

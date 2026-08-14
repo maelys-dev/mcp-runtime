@@ -1,0 +1,14 @@
+{
+  "calls": [
+    {
+      "tool": "example.echo",
+      "arguments": { "message": "conformance" },
+      "expect": "success"
+    },
+    {
+      "tool": "example.echo",
+      "arguments": {},
+      "expect": "error"
+    }
+  ]
+}

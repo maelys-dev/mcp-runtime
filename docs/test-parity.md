@@ -19,6 +19,7 @@ stdio, CLI, and Maelys L0/L1 suites.
 | stdio and CLI | end-to-end requests, parse errors, stdout isolation, `FD_CLOEXEC`, simulated third-party `printf()` contamination |
 | Memory safety | native ASan/UBSan and pinned Linux Docker ASan/UBSan/LSan |
 | Parser robustness | libFuzzer targets and seed corpora for JSON Lines, Content-Length, and schema definition/value pairs |
+| Polyglot providers | black-box lifecycle and call scenarios for C, TypeScript and Python, including structured failures and stdout contamination |
 
 The standalone runtime adds checks that the original integrated server did not make
 at this boundary: unsupported JSON Schema keywords are rejected at registration,
@@ -46,6 +47,7 @@ Before a release, run:
 ```sh
 make clean
 make check
+make check-all
 make analyze
 make test-asan-linux
 ```
