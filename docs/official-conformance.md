@@ -25,7 +25,7 @@ HTTP adapter cannot model a long-lived listen stream. Subscription messages are
 therefore validated by native protocol contract tests. The runtime does not
 claim complete MCP 2026-07-28 conformance.
 
-The private `maelys-provider/2` protocol has a separate black-box runner in
+The private `maelys-provider/3` protocol has a separate black-box runner in
 `conformance/provider_conformance.py`. The TypeScript and Python packages under `sdk/`
 are provider SDKs only; they are not general MCP client or server SDKs.
 

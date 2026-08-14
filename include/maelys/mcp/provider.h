@@ -12,7 +12,7 @@ extern "C" {
 
 typedef struct maelys_mcp_provider maelys_mcp_provider_t;
 
-#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/2"
+#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/3"
 #define MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS 5000u
 #define MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS 300000u
 #define MAELYS_MCP_DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS 2000u
@@ -25,6 +25,22 @@ typedef enum maelys_mcp_tool_effect {
     MAELYS_MCP_EFFECT_COMMIT = 4,
     MAELYS_MCP_EFFECT_EXECUTE = 5
 } maelys_mcp_tool_effect_t;
+
+typedef enum maelys_mcp_provider_event_kind {
+    MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED = 1,
+    MAELYS_MCP_PROVIDER_EVENT_RESOURCES_LIST_CHANGED = 2,
+    MAELYS_MCP_PROVIDER_EVENT_TOOLS_LIST_CHANGED = 3
+} maelys_mcp_provider_event_kind_t;
+
+typedef struct maelys_mcp_provider_event {
+    maelys_mcp_provider_event_kind_t kind;
+    const char *resource_uri;
+} maelys_mcp_provider_event_t;
+
+/* Thread-safe after the provider has been registered with a runtime. */
+maelys_mcp_result_t maelys_mcp_provider_emit_event(
+    maelys_mcp_provider_t *provider,
+    const maelys_mcp_provider_event_t *event);
 
 const char *maelys_mcp_tool_effect_string(maelys_mcp_tool_effect_t effect);
 maelys_mcp_result_t maelys_mcp_tool_effect_parse(

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maelys-mcp-provider-sdk"
-version = "0.2.0"
-description = "Dependency-free Python SDK for maelys-provider/2 providers."
+version = "0.3.0"
+description = "Dependency-free Python SDK for maelys-provider/3 providers."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box conformance runner for persistent maelys-provider/2 executables."""
+"""Black-box conformance runner for persistent maelys-provider/3 executables."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PROTOCOL = "maelys-provider/2"
+PROTOCOL = "maelys-provider/3"
 EFFECTS = {"read", "preview", "apply", "commit", "execute"}
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -135,6 +135,25 @@ def validate_envelope(response: Any, request_id: int, expect_error: bool) -> Any
     return response["result"]
 
 
+def validate_event(message: Any) -> None:
+    if not isinstance(message, dict) or message.get("protocol") != PROTOCOL or "id" in message:
+        raise ConformanceError("provider event must be an id-less provider/3 envelope")
+    method = message.get("method")
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        raise ConformanceError("provider event params must be an object")
+    if method == "provider/notifications/resources/updated":
+        if not isinstance(params.get("uri"), str) or not params["uri"]:
+            raise ConformanceError("resource update event requires a non-empty uri")
+        return
+    if method in {
+        "provider/notifications/resources/list_changed",
+        "provider/notifications/tools/list_changed",
+    } and not params:
+        return
+    raise ConformanceError(f"unsupported or malformed provider event: {method}")
+
+
 def validate_call_result(result: Any) -> None:
     if not isinstance(result, dict):
         raise ConformanceError("provider call result must be an object")
@@ -215,14 +234,14 @@ def read_cases(path: Path | None) -> list[dict[str, Any]]:
 def run_conformance(executable: Path, cases: list[dict[str, Any]], timeout: float) -> dict[str, Any]:
     if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise ConformanceError("provider must be an absolute executable file")
-    requests = [request(1, "provider/describe")]
-    expectations: list[bool] = [False]
-    requests.append(request(2, "provider/call", {
+    requests = [request(1, "provider/describe"), request(2, "provider/activate")]
+    expectations: list[bool] = [False, False]
+    requests.append(request(3, "provider/call", {
         "name": "org.maelys.conformance.unknown-tool",
         "arguments": {},
     }))
     expectations.append(True)
-    next_id = 3
+    next_id = 4
     for case in cases:
         requests.append(request(next_id, "provider/call", {
             "name": case["tool"],
@@ -247,14 +266,24 @@ def run_conformance(executable: Path, cases: list[dict[str, Any]], timeout: floa
     if completed.returncode != 0:
         raise ConformanceError(f"provider exited with {completed.returncode}: {completed.stderr.strip()}")
     lines = completed.stdout.splitlines()
-    if len(lines) != len(requests):
+    try:
+        messages = [load_json(line, f"stdout line {index + 1}")
+            for index, line in enumerate(lines)]
+    except ConformanceError as error:
+        raise ConformanceError(f"provider stdout protocol contamination: {error}") from error
+    events = [message for message in messages if isinstance(message, dict) and "id" not in message]
+    responses = [message for message in messages if not (isinstance(message, dict) and "id" not in message)]
+    for event in events:
+        validate_event(event)
+    if len(responses) != len(requests):
         raise ConformanceError(
-            f"provider stdout contains {len(lines)} line(s), expected {len(requests)}; protocol contamination or missing response"
+            f"provider stdout contains {len(responses)} response(s), expected {len(requests)}; protocol contamination or missing response"
         )
-    responses = [load_json(line, f"stdout line {index + 1}") for index, line in enumerate(lines)]
     results = [validate_envelope(response, item["id"], expected) for response, item, expected in zip(responses, requests, expectations)]
     catalog = validate_description(results[0])
-    for offset, case in enumerate(cases, start=2):
+    if results[1] != {}:
+        raise ConformanceError("provider/activate must return an empty object")
+    for offset, case in enumerate(cases, start=3):
         if case["tool"] not in catalog:
             raise ConformanceError(f"case references an unpublished tool: {case['tool']}")
         if case.get("expect", "success") == "success":
@@ -267,6 +296,7 @@ def run_conformance(executable: Path, cases: list[dict[str, Any]], timeout: floa
         "version": results[0]["version"],
         "toolCount": len(catalog),
         "callCount": len(cases),
+        "eventCount": len(events),
         "stderr": completed.stderr,
     }
 

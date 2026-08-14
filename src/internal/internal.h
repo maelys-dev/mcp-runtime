@@ -69,8 +69,16 @@ struct maelys_mcp_provider {
     size_t resource_template_count;
     maelys_mcp_provider_call_fn call;
     maelys_mcp_provider_read_resource_fn read_resource;
+    maelys_mcp_result_t (*activate)(void *context, char **out_error);
+    int activated;
     maelys_mcp_provider_destroy_fn destroy;
     void *context;
+    pthread_mutex_t event_mutex;
+    int event_mutex_initialized;
+    maelys_mcp_result_t (*event_sink)(
+        void *context,
+        const maelys_mcp_provider_event_t *event);
+    void *event_sink_context;
 };
 
 struct maelys_mcp_runtime {
@@ -92,6 +100,12 @@ struct maelys_mcp_runtime {
     void *policy_context;
     pthread_mutex_t subscriptions_mutex;
     int subscriptions_mutex_initialized;
+    pthread_mutex_t provider_events_mutex;
+    pthread_cond_t provider_events_idle;
+    int provider_events_mutex_initialized;
+    int provider_events_idle_initialized;
+    int provider_events_accepting;
+    size_t provider_events_inflight;
     maelys_mcp_subscription_t *subscriptions;
     size_t subscription_count;
     maelys_mcp_outbox_t *outbox;
@@ -126,6 +140,24 @@ typedef struct maelys_mcp_process_context {
     unsigned int call_timeout_ms;
     unsigned int shutdown_timeout_ms;
     struct maelys_mcp_line_reader *reader;
+    pthread_mutex_t exchange_mutex;
+    pthread_mutex_t state_mutex;
+    pthread_cond_t response_ready;
+    int exchange_mutex_initialized;
+    int state_mutex_initialized;
+    int response_ready_initialized;
+    pthread_t reader_thread;
+    int reader_started;
+    int closing;
+    int failed;
+    int events_enabled;
+    int activation_pending;
+    int waiting;
+    maelys_mcp_result_t failure_status;
+    char *failure_message;
+    unsigned long long expected_id;
+    json_t *pending_response;
+    struct maelys_mcp_provider *owner;
 } maelys_mcp_process_context_t;
 
 typedef struct maelys_mcp_line_reader {
@@ -175,3 +207,9 @@ void maelys_mcp_subscription_clear(maelys_mcp_subscription_t *subscription);
 void maelys_mcp_cancel_subscription(
     maelys_mcp_runtime_t *runtime,
     const json_t *request_id);
+void maelys_mcp_provider_bind_event_sink(
+    maelys_mcp_provider_t *provider,
+    maelys_mcp_result_t (*sink)(
+        void *context,
+        const maelys_mcp_provider_event_t *event),
+    void *context);

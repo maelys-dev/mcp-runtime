@@ -1,13 +1,14 @@
-"""Dependency-free SDK for persistent maelys-provider/2 processes."""
+"""Dependency-free SDK for persistent maelys-provider/3 processes."""
 from __future__ import annotations
 
 import json
 import os
 import sys
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, TextIO
 
-PROTOCOL = "maelys-provider/2"
+PROTOCOL = "maelys-provider/3"
 TOOL_EFFECTS = ("read", "preview", "apply", "commit", "execute")
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -112,6 +113,46 @@ def resource_input_required_result(
 
 ToolHandler = Callable[[JsonObject, CallContext], ProviderResult]
 ResourceHandler = Callable[[str, CallContext], ResourceResult]
+
+
+class ProviderEvents:
+    """Thread-safe provider/3 event facade, active only after host activation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._writer: Callable[[JsonObject], None] | None = None
+        self._active = False
+
+    def _bind(self, writer: Callable[[JsonObject], None]) -> None:
+        with self._lock:
+            self._writer = writer
+
+    def _activate(self) -> None:
+        with self._lock:
+            self._active = True
+
+    def _deactivate(self) -> None:
+        with self._lock:
+            self._active = False
+            self._writer = None
+
+    def _emit(self, method: str, params: JsonObject | None = None) -> None:
+        with self._lock:
+            if not self._active or self._writer is None:
+                raise RuntimeError(
+                    "provider events are unavailable before activation or after shutdown")
+            self._writer({"protocol": PROTOCOL, "method": method,
+                "params": params or {}})
+
+    def resource_updated(self, uri: str) -> None:
+        self._emit("provider/notifications/resources/updated",
+            {"uri": _string(uri, "resource event uri")})
+
+    def resources_list_changed(self) -> None:
+        self._emit("provider/notifications/resources/list_changed")
+
+    def tools_list_changed(self) -> None:
+        self._emit("provider/notifications/tools/list_changed")
 
 
 class DuplicateKeyError(ValueError):
@@ -285,6 +326,7 @@ class Provider:
     resources: tuple[Resource, ...] = ()
     resource_templates: tuple[ResourceTemplate, ...] = ()
     read_resource: ResourceHandler | None = None
+    events: ProviderEvents = field(default_factory=ProviderEvents, compare=False)
 
     def description(self) -> JsonObject:
         result: JsonObject = {"name": self.name, "version": self.version,
@@ -353,7 +395,7 @@ def create_provider(
         raise TypeError("read_resource is required when resources are declared")
     return Provider(name=name, version=version, tools=prepared,
         resources=prepared_resources, resource_templates=prepared_templates,
-        read_resource=read_resource)
+        read_resource=read_resource, events=ProviderEvents())
 
 
 def handle_message(provider: Provider, message: Any) -> JsonObject:
@@ -367,6 +409,8 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
     method = request.get("method")
     if method == "provider/describe":
         result: Any = provider.description()
+    elif method == "provider/activate":
+        result = {}
     elif method == "provider/call":
         name = _string(params.get("name"), "provider/call name")
         arguments = _object(params.get("arguments", {}), "provider/call arguments")
@@ -428,6 +472,15 @@ def serve_provider(
     source = input_stream or sys.stdin
     owns_transport = transport_stream is None and isolate_stdout
     transport = transport_stream or (_isolated_transport() if isolate_stdout else sys.stdout)
+    write_lock = threading.Lock()
+
+    def write_message(message: JsonObject) -> None:
+        encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with write_lock:
+            transport.write(encoded)
+            transport.flush()
+
+    provider.events._bind(write_message)
     try:
         for line in source:
             message: Any = None
@@ -440,18 +493,22 @@ def serve_provider(
                 code = "not_found" if isinstance(error, ProviderNotFoundError) else "provider_error"
                 response = {"protocol": PROTOCOL, "id": request_id,
                     "error": {"code": code, "message": str(error) or type(error).__name__}}
-            transport.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
-            transport.flush()
+            write_message(response)
+            if (isinstance(message, dict) and
+                    message.get("method") == "provider/activate" and
+                    "result" in response):
+                provider.events._activate()
             if isinstance(message, dict) and message.get("method") == "provider/shutdown":
                 break
     finally:
+        provider.events._deactivate()
         if owns_transport:
             transport.close()
     return 0
 
 
 __all__ = [
-    "PROTOCOL", "TOOL_EFFECTS", "CallContext", "Provider", "ProviderNotFoundError", "ProviderResult", "ResourceResult",
+    "PROTOCOL", "TOOL_EFFECTS", "CallContext", "Provider", "ProviderEvents", "ProviderNotFoundError", "ProviderResult", "ResourceResult",
     "Resource", "ResourceTemplate", "Tool", "complete_result", "create_provider", "handle_message",
     "input_required_result", "resource_input_required_result", "resource_result", "serve_provider",
     "validate_schema_definition",

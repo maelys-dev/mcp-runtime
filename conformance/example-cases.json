@@ -9,6 +9,11 @@
       "tool": "example.echo",
       "arguments": {},
       "expect": "error"
+    },
+    {
+      "tool": "example.events",
+      "arguments": {},
+      "expect": "success"
     }
   ]
 }

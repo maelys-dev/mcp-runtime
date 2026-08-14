@@ -87,6 +87,40 @@ void maelys_mcp_provider_result_clear(maelys_mcp_provider_result_t *result) {
     maelys_mcp_provider_result_init(result);
 }
 
+void maelys_mcp_provider_bind_event_sink(
+    maelys_mcp_provider_t *provider,
+    maelys_mcp_result_t (*sink)(
+        void *context,
+        const maelys_mcp_provider_event_t *event),
+    void *context) {
+    if (!provider || !provider->event_mutex_initialized) return;
+    pthread_mutex_lock(&provider->event_mutex);
+    provider->event_sink = sink;
+    provider->event_sink_context = sink ? context : NULL;
+    pthread_mutex_unlock(&provider->event_mutex);
+}
+
+maelys_mcp_result_t maelys_mcp_provider_emit_event(
+    maelys_mcp_provider_t *provider,
+    const maelys_mcp_provider_event_t *event) {
+    if (!provider || !event || !provider->event_mutex_initialized ||
+        (event->kind != MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED &&
+         event->kind != MAELYS_MCP_PROVIDER_EVENT_RESOURCES_LIST_CHANGED &&
+         event->kind != MAELYS_MCP_PROVIDER_EVENT_TOOLS_LIST_CHANGED) ||
+        (event->kind == MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED &&
+         (!event->resource_uri || !*event->resource_uri)) ||
+        (event->kind != MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED &&
+         event->resource_uri)) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    pthread_mutex_lock(&provider->event_mutex);
+    maelys_mcp_result_t (*sink)(
+        void *, const maelys_mcp_provider_event_t *) = provider->event_sink;
+    void *context = provider->event_sink_context;
+    pthread_mutex_unlock(&provider->event_mutex);
+    return sink ? sink(context, event) : MAELYS_MCP_ERR_NOT_FOUND;
+}
+
 maelys_mcp_result_t maelys_mcp_provider_create(
     const maelys_mcp_provider_config_t *config,
     maelys_mcp_provider_t **out_provider) {
@@ -101,10 +135,16 @@ maelys_mcp_result_t maelys_mcp_provider_create(
     *out_provider = NULL;
     maelys_mcp_provider_t *provider = calloc(1u, sizeof(*provider));
     if (!provider) return MAELYS_MCP_ERR_MEMORY;
+    if (pthread_mutex_init(&provider->event_mutex, NULL) != 0) {
+        free(provider);
+        return MAELYS_MCP_ERR_IO;
+    }
+    provider->event_mutex_initialized = 1;
     provider->name = maelys_mcp_strdup(config->name);
     provider->version = maelys_mcp_strdup(config->version);
     provider->call = config->call;
     provider->read_resource = config->read_resource;
+    provider->activated = 1;
     provider->destroy = config->destroy;
     provider->context = config->context;
     provider->tool_count = config->tool_count;
@@ -206,6 +246,7 @@ argument_error:
     clear_resource_templates(provider->resource_templates, provider->resource_template_count);
     free(provider->name);
     free(provider->version);
+    pthread_mutex_destroy(&provider->event_mutex);
     free(provider);
     return MAELYS_MCP_ERR_ARGUMENT;
 memory_error:
@@ -214,6 +255,7 @@ memory_error:
     clear_resource_templates(provider->resource_templates, provider->resource_template_count);
     free(provider->name);
     free(provider->version);
+    pthread_mutex_destroy(&provider->event_mutex);
     free(provider);
     return MAELYS_MCP_ERR_MEMORY;
 }
@@ -221,10 +263,14 @@ memory_error:
 void maelys_mcp_provider_destroy(maelys_mcp_provider_t *provider) {
     if (!provider) return;
     if (provider->destroy) provider->destroy(provider->context);
+    maelys_mcp_provider_bind_event_sink(provider, NULL, NULL);
     clear_tools(provider->tools, provider->tool_count);
     clear_resources(provider->resources, provider->resource_count);
     clear_resource_templates(provider->resource_templates, provider->resource_template_count);
     free(provider->name);
     free(provider->version);
+    if (provider->event_mutex_initialized) {
+        pthread_mutex_destroy(&provider->event_mutex);
+    }
     free(provider);
 }

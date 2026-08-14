@@ -31,6 +31,9 @@
 - Resource contents require exactly one of text/blob, valid bounded base64, and a
   canonical URI. Parsing never grants filesystem or network access by itself.
 - Provider descriptors are close-on-exec and provider termination is bounded.
+- Process-provider output has one dedicated reader. Event envelopes require protocol
+  v3, no id, a known method and strictly typed parameters; response ids must match the
+  single outstanding exchange.
 
 ## Trust boundary
 
@@ -55,3 +58,5 @@ fragment from an MCP request.
   runtime effect policy or the provider's own invariants.
 - resolve resource URIs inside an application-specific allowlisted root; the generic
   URI facade deliberately does not turn a syntactically valid URI into an I/O right.
+- emit events only after `provider/activate`; event delivery is an invalidation signal,
+  not proof that a mutation was authorized or completed.

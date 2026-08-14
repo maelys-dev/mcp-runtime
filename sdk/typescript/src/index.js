@@ -1,7 +1,8 @@
 import readline from "node:readline";
 
-export const PROTOCOL = "maelys-provider/2";
+export const PROTOCOL = "maelys-provider/3";
 export const TOOL_EFFECTS = Object.freeze(["read", "preview", "apply", "commit", "execute"]);
+const EVENT_CONTROL = Symbol("maelys-provider-event-control");
 
 export class ProviderNotFoundError extends Error {
   constructor(message = "resource not found") {
@@ -34,6 +35,35 @@ function objectValue(value, label) {
 function stringValue(value, label) {
   if (typeof value !== "string" || value.length === 0) throw new TypeError(`${label} must be a non-empty string`);
   return value;
+}
+
+function createEventControl() {
+  let writeMessage;
+  let active = false;
+  const emit = async (method, params = {}) => {
+    if (!active || typeof writeMessage !== "function") {
+      throw new Error("provider events are unavailable before activation or after shutdown");
+    }
+    await writeMessage({ protocol: PROTOCOL, method, params });
+  };
+  return {
+    public: Object.freeze({
+      resourceUpdated(uri) {
+        return emit("provider/notifications/resources/updated", {
+          uri: stringValue(uri, "resource event uri"),
+        });
+      },
+      resourcesListChanged() {
+        return emit("provider/notifications/resources/list_changed");
+      },
+      toolsListChanged() {
+        return emit("provider/notifications/tools/list_changed");
+      },
+    }),
+    bind(writer) { writeMessage = writer; },
+    activate() { active = true; },
+    deactivate() { active = false; writeMessage = undefined; },
+  };
 }
 
 export function validateSchemaDefinition(schema, label = "schema") {
@@ -141,8 +171,10 @@ export function createProvider(configuration) {
   if ((preparedResources.length || preparedTemplates.length) && typeof value.readResource !== "function") {
     throw new TypeError("provider.readResource is required when resources are declared");
   }
+  const eventControl = createEventControl();
   return { name, version, tools, resources: preparedResources,
-    resourceTemplates: preparedTemplates, readResource: value.readResource };
+    resourceTemplates: preparedTemplates, readResource: value.readResource,
+    events: eventControl.public, [EVENT_CONTROL]: eventControl };
 }
 
 export function describeProvider(provider) {
@@ -213,6 +245,8 @@ export async function handleProviderMessage(provider, message) {
   let result;
   if (request.method === "provider/describe") {
     result = describeProvider(provider);
+  } else if (request.method === "provider/activate") {
+    result = {};
   } else if (request.method === "provider/call") {
     const name = stringValue(params.name, "provider/call name");
     const arguments_ = objectValue(params.arguments ?? {}, "provider/call arguments");
@@ -256,6 +290,16 @@ function diagnostic(values) {
 export async function serveProvider(provider, options = {}) {
   const input = options.input ?? process.stdin;
   const writeLine = options.writeLine ?? ((line) => process.stdout.write(`${line}\n`));
+  const eventControl = provider?.[EVENT_CONTROL];
+  if (!eventControl) throw new TypeError("provider was not created by createProvider");
+  let writeTail = Promise.resolve();
+  const writeMessage = (message) => {
+    const encoded = JSON.stringify(message);
+    const pending = writeTail.then(() => writeLine(encoded));
+    writeTail = pending.catch(() => undefined);
+    return pending;
+  };
+  eventControl.bind(writeMessage);
   const originalConsole = { log: console.log, info: console.info, warn: console.warn };
   if (options.redirectConsole !== false) {
     console.log = (...values) => diagnostic(values);
@@ -278,11 +322,17 @@ export async function serveProvider(provider, options = {}) {
           message: error instanceof Error ? error.message : String(error),
         } };
       }
-      await writeLine(JSON.stringify(response));
+      await writeMessage(response);
+      if (message && typeof message === "object" && !Array.isArray(message) &&
+          message.method === "provider/activate" && response.result) {
+        eventControl.activate();
+      }
       if (message && typeof message === "object" && !Array.isArray(message) && message.method === "provider/shutdown") break;
     }
   } finally {
     lines.close();
+    eventControl.deactivate();
+    await writeTail;
     if (options.redirectConsole !== false) Object.assign(console, originalConsole);
   }
   return 0;

@@ -29,7 +29,11 @@ response. URI filters are canonicalized and match the exact resource or a descen
 Prompt list-change filters are syntactically checked but not accepted because Prompts
 is not implemented.
 
-Prompts, Tasks, progress, provider-originated asynchronous events, Streamable HTTP,
+Process providers may originate resource updates and Tools/Resources list changes
+through the private `maelys-provider/3` protocol. These events enter the same filtered,
+bounded subscription and Outbox path as native producers.
+
+Prompts, Tasks, progress, Streamable HTTP,
 HTTP header routing, and authorization transports are not implemented. Resource *content blocks* returned
 by a tool remain distinct from the independently enabled MCP Resources capability.
 

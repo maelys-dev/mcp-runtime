@@ -38,6 +38,25 @@ class ProviderConformanceTest(unittest.TestCase):
         with self.assertRaisesRegex(provider_conformance.ConformanceError, "duplicate JSON key"):
             provider_conformance.load_json('{"id":1,"id":2}', "message")
 
+    def test_provider_3_event_shapes_are_strict(self):
+        provider_conformance.validate_event({
+            "protocol": "maelys-provider/3",
+            "method": "provider/notifications/resources/updated",
+            "params": {"uri": "fixture://course"},
+        })
+        with self.assertRaisesRegex(provider_conformance.ConformanceError, "non-empty uri"):
+            provider_conformance.validate_event({
+                "protocol": "maelys-provider/3",
+                "method": "provider/notifications/resources/updated",
+                "params": {},
+            })
+        with self.assertRaisesRegex(provider_conformance.ConformanceError, "unsupported"):
+            provider_conformance.validate_event({
+                "protocol": "maelys-provider/3",
+                "method": "provider/notifications/unknown",
+                "params": {},
+            })
+
     def test_runner_detects_stdout_contamination(self):
         with tempfile.TemporaryDirectory() as directory:
             provider = Path(directory) / "provider"
@@ -45,7 +64,7 @@ class ProviderConformanceTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "while IFS= read -r line; do\n"
                 "  echo diagnostic\n"
-                "  echo '{\"protocol\":\"maelys-provider/2\",\"id\":1,\"result\":{}}'\n"
+                "  echo '{\"protocol\":\"maelys-provider/3\",\"id\":1,\"result\":{}}'\n"
                 "done\n",
                 encoding="utf-8",
             )

@@ -1,6 +1,6 @@
 import type { Readable } from "node:stream";
 
-export const PROTOCOL: "maelys-provider/2";
+export const PROTOCOL: "maelys-provider/3";
 export const TOOL_EFFECTS: readonly ["read", "preview", "apply", "commit", "execute"];
 export class ProviderNotFoundError extends Error {}
 
@@ -25,6 +25,11 @@ export type ResourceContents = { uri: string; mimeType?: string; _meta?: JsonObj
 export type CompleteResourceResult = { resultType: "complete"; contents: ResourceContents[] };
 export type ResourceResult = CompleteResourceResult | InputRequiredResult;
 export type ResourceContext = CallContext;
+export type ProviderEvents = {
+  resourceUpdated(uri: string): Promise<void>;
+  resourcesListChanged(): Promise<void>;
+  toolsListChanged(): Promise<void>;
+};
 
 export type ProviderTool = {
   name: string;
@@ -42,9 +47,10 @@ export type Provider = {
   tools: ProviderTool[];
   resources: ResourceDescriptor[];
   resourceTemplates: ResourceTemplateDescriptor[];
+  events: ProviderEvents;
   readResource?: (uri: string, context: ResourceContext) => ResourceResult | Promise<ResourceResult>;
 };
-export type ProviderConfiguration = Omit<Provider, "tools" | "resources" | "resourceTemplates"> & {
+export type ProviderConfiguration = Omit<Provider, "tools" | "resources" | "resourceTemplates" | "events"> & {
   tools?: ProviderTool[];
   resources?: ResourceDescriptor[];
   resourceTemplates?: ResourceTemplateDescriptor[];
