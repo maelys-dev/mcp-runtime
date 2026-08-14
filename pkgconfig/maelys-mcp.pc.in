@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: maelys-mcp
+Description: Native policy-enforced MCP runtime and provider host
+Version: @VERSION@
+Requires.private: jansson
+Libs: -L${libdir} -lmaelys_mcp
+Cflags: -I${includedir}
