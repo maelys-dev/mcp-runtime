@@ -1,9 +1,27 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(int argc, char **argv) {
     (void)argc;
     char request[4096];
+    if (strstr(argv[0], "environment")) {
+        const char *path = getenv("PATH");
+        if (!path || strcmp(path, "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin") != 0) return 4;
+        while (fgets(request, sizeof(request), stdin)) {
+            if (strstr(request, "provider/describe")) {
+                puts("{\"protocol\":\"maelys-provider/1\",\"id\":1,\"result\":{"
+                    "\"name\":\"environment\",\"version\":\"1\",\"tools\":[]}}");
+            } else if (strstr(request, "provider/shutdown")) {
+                puts("{\"protocol\":\"maelys-provider/1\",\"id\":2,\"result\":{}}");
+                return fflush(stdout) == 0 ? 0 : 3;
+            } else {
+                return 5;
+            }
+            if (fflush(stdout) != 0) return 3;
+        }
+        return 0;
+    }
     if (!fgets(request, sizeof(request), stdin)) return 1;
     if (strstr(argv[0], "bad-json")) {
         puts("not-json");

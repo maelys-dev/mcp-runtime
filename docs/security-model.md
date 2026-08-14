@@ -22,9 +22,12 @@
 
 ## Trust boundary
 
-Configured provider binaries are trusted local code. The minimal environment prevents
+Configured provider binaries are trusted local code. The fixed environment prevents
 accidental credential inheritance but does not sandbox filesystem, network, CPU, or
-memory access. A later sandbox adapter may use OS facilities or containers.
+memory access. Its non-inherited `PATH` contains only standard Linux, Intel macOS and
+Apple Silicon Homebrew locations, allowing portable `#!/usr/bin/env node` and Python
+launchers to resolve their interpreter. A later sandbox adapter may use OS facilities
+or containers.
 
 The runtime never accepts an executable path, argv, environment variable, or shell
 fragment from an MCP request.

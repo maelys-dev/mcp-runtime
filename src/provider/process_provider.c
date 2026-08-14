@@ -137,7 +137,7 @@ static maelys_mcp_result_t spawn_process(
         if (sockets[1] != STDIN_FILENO && sockets[1] != STDOUT_FILENO) close(sockets[1]);
         char *const argv[] = {(char *)path, (char *)"--provider", NULL};
         char *const environment[] = {
-            (char *)"PATH=/usr/bin:/bin",
+            (char *)"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
             (char *)"LANG=C",
             (char *)"LC_ALL=C",
             NULL
