@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box conformance runner for persistent maelys-provider/1 executables."""
+"""Black-box conformance runner for persistent maelys-provider/2 executables."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PROTOCOL = "maelys-provider/1"
+PROTOCOL = "maelys-provider/2"
 EFFECTS = {"read", "preview", "apply", "commit", "execute"}
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -135,6 +135,23 @@ def validate_envelope(response: Any, request_id: int, expect_error: bool) -> Any
     return response["result"]
 
 
+def validate_call_result(result: Any) -> None:
+    if not isinstance(result, dict):
+        raise ConformanceError("provider call result must be an object")
+    result_type = result.get("resultType")
+    if result_type == "complete":
+        if "content" not in result and "structuredContent" not in result:
+            raise ConformanceError("complete result requires content or structuredContent")
+        if "content" in result and (not isinstance(result["content"], list) or not result["content"]):
+            raise ConformanceError("complete result content must be a non-empty array")
+        return
+    if result_type == "input_required":
+        if "inputRequests" not in result and "requestState" not in result:
+            raise ConformanceError("input_required result requires inputRequests or requestState")
+        return
+    raise ConformanceError("provider call resultType must be complete or input_required")
+
+
 def validate_description(description: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(description, dict):
         raise ConformanceError("provider description must be an object")
@@ -237,9 +254,11 @@ def run_conformance(executable: Path, cases: list[dict[str, Any]], timeout: floa
     responses = [load_json(line, f"stdout line {index + 1}") for index, line in enumerate(lines)]
     results = [validate_envelope(response, item["id"], expected) for response, item, expected in zip(responses, requests, expectations)]
     catalog = validate_description(results[0])
-    for case in cases:
+    for offset, case in enumerate(cases, start=2):
         if case["tool"] not in catalog:
             raise ConformanceError(f"case references an unpublished tool: {case['tool']}")
+        if case.get("expect", "success") == "success":
+            validate_call_result(results[offset])
     if results[-1] != {}:
         raise ConformanceError("provider/shutdown must return an empty object")
     return {

@@ -13,9 +13,15 @@ release-candidate wire shape. Primary references:
 - <https://blog.modelcontextprotocol.io/posts/2026-07-28/>
 - <https://ts.sdk.modelcontextprotocol.io/v2/migration/support-2026-07-28>
 
-The current milestone exposes tools only. Prompts, resources, subscriptions,
-Multi Round-Trip Requests, Tasks, HTTP header routing, and authorization transports
-are not yet implemented.
+The current milestone exposes a modular Tools facade and tool-scoped Multi Round-Trip
+Requests. Complete tool results support text, image, audio, resource links, embedded
+resources and structured content. MRTR supports `elicitation/create`,
+`sampling/createMessage`, and `roots/list` input requests with client-capability
+enforcement and provider-owned opaque state.
+
+Prompts, resource methods, subscriptions, Tasks, Streamable HTTP, HTTP header routing,
+and authorization transports are not implemented. Resource *content blocks* returned
+by a tool do not imply the MCP Resources capability.
 
 The upstream conformance runner currently requires an HTTP server and its complete
 2026-07-28 requirement set covers capabilities beyond this milestone. The repository

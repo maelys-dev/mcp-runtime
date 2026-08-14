@@ -64,7 +64,8 @@ static maelys_mcp_result_t validate_definition(
         }
     }
     json_t *type_value = json_object_get(schema, "type");
-    if (!json_is_string(type_value) || !known_type(json_string_value(type_value))) {
+    if (!json_is_string(type_value) || maelys_mcp_json_string_has_nul(type_value) ||
+        !known_type(json_string_value(type_value))) {
         schema_error(out_error, "%s.type must name one supported JSON type", path);
         return MAELYS_MCP_ERR_PROTOCOL;
     }
@@ -100,7 +101,8 @@ static maelys_mcp_result_t validate_definition(
         size_t index;
         json_t *name;
         json_array_foreach(required, index, name) {
-            if (!json_is_string(name) || !*json_string_value(name)) {
+            if (!json_is_string(name) || json_string_length(name) == 0u ||
+                maelys_mcp_json_string_has_nul(name)) {
                 schema_error(out_error, "%s.required[%zu] must be a non-empty string", path, index);
                 return MAELYS_MCP_ERR_PROTOCOL;
             }

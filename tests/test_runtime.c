@@ -18,21 +18,19 @@ typedef struct test_context {
 
 static maelys_mcp_result_t call_tool(
     void *context,
-    const char *tool_name,
-    json_t *arguments,
-    json_t **out_result,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
     char **out_error) {
     (void)out_error;
     test_context_t *state = context;
     state->calls++;
-    if (strcmp(tool_name, "test.null") == 0) {
-        *out_result = NULL;
+    if (strcmp(request->tool_name, "test.null") == 0) {
         return MAELYS_MCP_OK;
     }
-    json_t *message = json_object_get(arguments, "message");
-    *out_result = json_pack("{s:s,s:s}", "tool", tool_name,
+    json_t *message = json_object_get(request->arguments, "message");
+    out_result->structured_content = json_pack("{s:s,s:s}", "tool", request->tool_name,
         "message", json_is_string(message) ? json_string_value(message) : "mutated");
-    return *out_result ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+    return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
 static int authorize(void *context, const maelys_mcp_request_context_t *request) {
@@ -156,6 +154,8 @@ int main(void) {
     };
     maelys_mcp_runtime_t *runtime = NULL;
     ASSERT_TRUE(maelys_mcp_runtime_create(&runtime_config, &runtime) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) == MAELYS_MCP_OK);
 
     json_t *notification_params = modern_params();

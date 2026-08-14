@@ -19,7 +19,17 @@ from pathlib import Path
 from typing import BinaryIO
 
 
-SCENARIOS = ("tools-list", "tools-call-simple-text", "tools-call-error")
+SCENARIOS = (
+    "tools-list",
+    "tools-call-simple-text",
+    "tools-call-image",
+    "tools-call-audio",
+    "tools-call-embedded-resource",
+    "tools-call-mixed-content",
+    "tools-call-error",
+    "input-required-result-basic-elicitation",
+    "input-required-result-capability-check",
+)
 MAX_BODY_BYTES = 4 * 1024 * 1024
 
 

@@ -47,11 +47,25 @@ static void clear_tools(maelys_mcp_owned_tool_t *tools, size_t count) {
     free(tools);
 }
 
+void maelys_mcp_provider_result_init(maelys_mcp_provider_result_t *result) {
+    if (result) memset(result, 0, sizeof(*result));
+}
+
+void maelys_mcp_provider_result_clear(maelys_mcp_provider_result_t *result) {
+    if (!result) return;
+    if (result->content) json_decref(result->content);
+    if (result->structured_content) json_decref(result->structured_content);
+    if (result->input_requests) json_decref(result->input_requests);
+    if (result->request_state) json_decref(result->request_state);
+    maelys_mcp_provider_result_init(result);
+}
+
 maelys_mcp_result_t maelys_mcp_provider_create(
     const maelys_mcp_provider_config_t *config,
     maelys_mcp_provider_t **out_provider) {
     if (!config || !out_provider || !config->name || !*config->name ||
-        !config->version || !config->call || (config->tool_count && !config->tools)) {
+        !config->version || !*config->version || !config->call ||
+        (config->tool_count && !config->tools)) {
         return MAELYS_MCP_ERR_ARGUMENT;
     }
     *out_provider = NULL;

@@ -1,11 +1,11 @@
 # `@maelys/mcp-provider-sdk`
 
-Dependency-free Node.js SDK for persistent `maelys-provider/1` providers. It owns the
+Dependency-free Node.js SDK for persistent `maelys-provider/2` providers. It owns the
 protocol loop, envelopes, structured errors, shutdown and descriptor validation while
 domain code supplies tool handlers.
 
 ```js
-import { createProvider, serveProvider } from "@maelys/mcp-provider-sdk";
+import { completeResult, createProvider, serveProvider } from "@maelys/mcp-provider-sdk";
 
 const provider = createProvider({
   name: "example",
@@ -16,7 +16,7 @@ const provider = createProvider({
     inputSchema: { type: "object", additionalProperties: false },
     outputSchema: { type: "object" },
     effect: "read",
-    handler: async () => ({ ready: true }),
+    handler: async () => completeResult({ structuredContent: { ready: true } }),
   }],
 });
 
@@ -26,3 +26,7 @@ await serveProvider(provider);
 The SDK redirects `console.log`, `console.info` and `console.warn` to stderr while
 serving. Libraries must still avoid writing directly to `process.stdout`, which is the
 private provider protocol channel.
+
+Handlers receive `(arguments, context)`. `context` carries client capabilities and,
+on MRTR retries, `inputResponses` and `requestState`. Return `completeResult(...)` or
+`inputRequiredResult(...)`; arbitrary JSON results are intentionally rejected.

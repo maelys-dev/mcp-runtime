@@ -1,4 +1,4 @@
-"""Dependency-free SDK for persistent maelys-provider/1 processes."""
+"""Dependency-free SDK for persistent maelys-provider/2 processes."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, TextIO
 
-PROTOCOL = "maelys-provider/1"
+PROTOCOL = "maelys-provider/2"
 TOOL_EFFECTS = ("read", "preview", "apply", "commit", "execute")
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -17,7 +17,70 @@ SUPPORTED_SCHEMA_KEYS = {
 SCHEMA_TYPES = {"object", "array", "string", "number", "integer", "boolean", "null"}
 
 JsonObject = dict[str, Any]
-ToolHandler = Callable[[JsonObject], Any]
+_UNSET = object()
+@dataclass(frozen=True)
+class CallContext:
+    input_responses: JsonObject | None = None
+    request_state: str | None = None
+    client_capabilities: JsonObject | None = None
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    result_type: str
+    content: list[JsonObject] | None = None
+    structured_content: Any = _UNSET
+    input_requests: JsonObject | None = None
+    request_state: str | None = None
+    is_error: bool = False
+
+    def payload(self) -> JsonObject:
+        if self.result_type == "complete":
+            if self.content is None and self.structured_content is _UNSET:
+                raise TypeError("complete result requires content or structured_content")
+            result: JsonObject = {"resultType": "complete"}
+            if self.content is not None:
+                if not isinstance(self.content, list) or not self.content:
+                    raise TypeError("complete result content must be a non-empty list")
+                result["content"] = self.content
+            if self.structured_content is not _UNSET:
+                result["structuredContent"] = self.structured_content
+            if self.is_error:
+                result["isError"] = True
+            return result
+        if self.result_type == "input_required":
+            if self.input_requests is None and self.request_state is None:
+                raise TypeError("input_required result requires input_requests or request_state")
+            result = {"resultType": "input_required"}
+            if self.input_requests is not None:
+                requests = _object(self.input_requests, "input_requests")
+                if not requests:
+                    raise TypeError("input_requests must not be empty")
+                result["inputRequests"] = requests
+            if self.request_state is not None:
+                result["requestState"] = _string(self.request_state, "request_state")
+            return result
+        raise TypeError("provider result_type must be complete or input_required")
+
+
+def complete_result(
+    *, content: list[JsonObject] | None = None,
+    structured_content: Any = _UNSET,
+    is_error: bool = False,
+) -> ProviderResult:
+    return ProviderResult("complete", content=content,
+        structured_content=structured_content, is_error=is_error)
+
+
+def input_required_result(
+    *, input_requests: JsonObject | None = None,
+    request_state: str | None = None,
+) -> ProviderResult:
+    return ProviderResult("input_required", input_requests=input_requests,
+        request_state=request_state)
+
+
+ToolHandler = Callable[[JsonObject, CallContext], ProviderResult]
 
 
 class DuplicateKeyError(ValueError):
@@ -190,7 +253,20 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
         tool = next((candidate for candidate in provider.tools if candidate.name == name), None)
         if tool is None:
             raise ValueError(f"unknown provider tool: {name}")
-        result = tool.handler(arguments)
+        input_responses = params.get("inputResponses")
+        request_state = params.get("requestState")
+        context = CallContext(
+            input_responses=None if input_responses is None else
+                _object(input_responses, "provider/call inputResponses"),
+            request_state=None if request_state is None else
+                _string(request_state, "provider/call requestState"),
+            client_capabilities=None if params.get("clientCapabilities") is None else
+                _object(params["clientCapabilities"], "provider/call clientCapabilities"),
+        )
+        provider_result = tool.handler(arguments, context)
+        if not isinstance(provider_result, ProviderResult):
+            raise TypeError("tool handler must return ProviderResult")
+        result = provider_result.payload()
     elif method == "provider/shutdown":
         result = {}
     else:
@@ -235,6 +311,7 @@ def serve_provider(
 
 
 __all__ = [
-    "PROTOCOL", "TOOL_EFFECTS", "Provider", "Tool", "create_provider",
-    "handle_message", "serve_provider", "validate_schema_definition",
+    "PROTOCOL", "TOOL_EFFECTS", "CallContext", "Provider", "ProviderResult",
+    "Tool", "complete_result", "create_provider", "handle_message",
+    "input_required_result", "serve_provider", "validate_schema_definition",
 ]

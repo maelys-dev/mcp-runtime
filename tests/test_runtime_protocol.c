@@ -11,7 +11,13 @@ static maelys_mcp_runtime_t *new_runtime(void) {
         .max_providers = 2
     };
     maelys_mcp_runtime_t *runtime = NULL;
-    return maelys_mcp_runtime_create(&config, &runtime) == MAELYS_MCP_OK ? runtime : NULL;
+    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK ||
+        maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK ||
+        maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR) != MAELYS_MCP_OK) {
+        maelys_mcp_runtime_destroy(runtime);
+        return NULL;
+    }
+    return runtime;
 }
 
 static json_t *modern_params(void) {
@@ -66,6 +72,15 @@ static int test_invalid_envelopes_and_ids(void) {
         json_decref(response);
         json_decref(invalid[index]);
     }
+    const char hostile_method[] = {'t', 'o', 'o', 'l', 's', '/', 'l', 'i', 's', 't', '\0', 'x'};
+    json_t *nul_method = json_pack("{s:s,s:i,s:o,s:o}",
+        "jsonrpc", "2.0", "id", 7, "method",
+        json_stringn(hostile_method, sizeof(hostile_method)), "params", modern_params());
+    ASSERT_TRUE(nul_method != NULL);
+    response = maelys_mcp_runtime_handle(runtime, nul_method);
+    ASSERT_TRUE(error_code(response) == -32600);
+    json_decref(response);
+    json_decref(nul_method);
     maelys_mcp_runtime_destroy(runtime);
     return 0;
 }
@@ -147,13 +162,12 @@ static int test_legacy_lifecycle_and_unknown_method(void) {
 
 static maelys_mcp_result_t invalid_output_call(
     void *context,
-    const char *tool_name,
-    json_t *arguments,
-    json_t **out_result,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
     char **out_error) {
-    (void)context; (void)tool_name; (void)arguments; (void)out_error;
-    *out_result = json_pack("{s:s}", "ok", "not-a-boolean");
-    return *out_result ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+    (void)context; (void)request; (void)out_error;
+    out_result->structured_content = json_pack("{s:s}", "ok", "not-a-boolean");
+    return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
 static int test_output_schema_failure_is_fail_closed(void) {

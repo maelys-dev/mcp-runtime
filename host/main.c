@@ -1,6 +1,8 @@
 #include "maelys/mcp.h"
 #include "src/internal/internal.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +26,20 @@ static int authorize(void *context, const maelys_mcp_request_context_t *request)
 static void usage(FILE *stream) {
     fprintf(stream,
         "Usage: maelys-mcp --provider /absolute/path [--provider /absolute/path ...]\n"
-        "                  [--allow-effect apply|commit|execute ...]\n");
+        "                  [--allow-effect apply|commit|execute ...]\n"
+        "                  [--provider-describe-timeout-ms N]\n"
+        "                  [--provider-call-timeout-ms N]\n"
+        "                  [--provider-shutdown-timeout-ms N]\n");
+}
+
+static int parse_timeout(const char *value, unsigned int *out) {
+    if (!value || !*value || !out || *value == '-') return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno || !end || *end || parsed == 0 || parsed > UINT_MAX) return -1;
+    *out = (unsigned int)parsed;
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -32,6 +47,9 @@ int main(int argc, char **argv) {
     if (!provider_paths) return 1;
     size_t provider_count = 0;
     host_policy_t policy = {0};
+    unsigned int describe_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS;
+    unsigned int call_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS;
+    unsigned int shutdown_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS;
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--provider") == 0 && index + 1 < argc) {
             provider_paths[provider_count++] = argv[++index];
@@ -44,6 +62,12 @@ int main(int argc, char **argv) {
                 return 2;
             }
             policy.allowed_effects |= 1u << (unsigned int)effect;
+        } else if (strcmp(argv[index], "--provider-describe-timeout-ms") == 0 &&
+            index + 1 < argc && parse_timeout(argv[++index], &describe_timeout_ms) == 0) {
+        } else if (strcmp(argv[index], "--provider-call-timeout-ms") == 0 &&
+            index + 1 < argc && parse_timeout(argv[++index], &call_timeout_ms) == 0) {
+        } else if (strcmp(argv[index], "--provider-shutdown-timeout-ms") == 0 &&
+            index + 1 < argc && parse_timeout(argv[++index], &shutdown_timeout_ms) == 0) {
         } else if (strcmp(argv[index], "--help") == 0) {
             usage(stdout);
             free(provider_paths);
@@ -86,11 +110,30 @@ int main(int argc, char **argv) {
         free(provider_paths);
         return 1;
     }
+    status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS);
+    if (status == MAELYS_MCP_OK) {
+        status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR);
+    }
+    if (status != MAELYS_MCP_OK) {
+        fprintf(stderr, "Cannot enable MCP modules: %s\n",
+            maelys_mcp_result_string(status));
+        maelys_mcp_runtime_destroy(runtime);
+        close(transport_fd);
+        free(provider_paths);
+        return 1;
+    }
     for (size_t index = 0; index < provider_count; ++index) {
         maelys_mcp_provider_t *provider = NULL;
         char *error = NULL;
-        status = maelys_mcp_provider_spawn(
-            provider_paths[index], config.max_message_bytes, &provider, &error);
+        maelys_mcp_provider_process_options_t options = {
+            .executable_path = provider_paths[index],
+            .max_message_bytes = config.max_message_bytes,
+            .describe_timeout_ms = describe_timeout_ms,
+            .call_timeout_ms = call_timeout_ms,
+            .shutdown_timeout_ms = shutdown_timeout_ms
+        };
+        status = maelys_mcp_provider_spawn_with_options(
+            &options, &provider, &error);
         if (status == MAELYS_MCP_OK) {
             status = maelys_mcp_runtime_add_provider(runtime, provider, &error);
         }

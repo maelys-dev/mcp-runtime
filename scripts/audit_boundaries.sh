@@ -27,4 +27,9 @@ if search_c '^#include[[:space:]]+"src/' include; then
   exit 1
 fi
 
+if search_c '"tools/(list|call)"' src/core; then
+  echo "Tools dispatch leaked back into the protocol core" >&2
+  exit 1
+fi
+
 echo "audit_boundaries: OK"

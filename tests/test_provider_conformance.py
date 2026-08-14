@@ -45,7 +45,7 @@ class ProviderConformanceTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "while IFS= read -r line; do\n"
                 "  echo diagnostic\n"
-                "  echo '{\"protocol\":\"maelys-provider/1\",\"id\":1,\"result\":{}}'\n"
+                "  echo '{\"protocol\":\"maelys-provider/2\",\"id\":1,\"result\":{}}'\n"
                 "done\n",
                 encoding="utf-8",
             )

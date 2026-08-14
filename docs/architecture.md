@@ -12,7 +12,9 @@ MCP client
 maelys-mcp host
     |- JSON-RPC and MCP validation
     |- policy and audit hooks
-    |- tool catalog and routing
+    |- module registry
+    |   |- Tools
+    |   `- MRTR
     |
     +--> in-process C provider
     +--> persistent Python provider
@@ -38,8 +40,9 @@ client-specific adapter belongs in this library.
 - `maelys_mcp_runtime_add_provider` transfers provider ownership on success.
 - The caller retains ownership when registration fails.
 - Provider descriptors are deep-copied by `maelys_mcp_provider_create`.
-- Provider callbacks return a newly owned `json_t` result and an optional allocated
-  error string. The runtime releases both.
+- Provider callbacks fill one initialized `maelys_mcp_provider_result_t`. Every JSON
+  field placed in it is a newly owned Jansson reference. The runtime releases all
+  fields with `maelys_mcp_provider_result_clear`.
 - `maelys_mcp_runtime_handle` borrows the request and returns a newly owned response.
 
 ## Protocol eras
@@ -52,8 +55,23 @@ The same dispatcher supports:
 Modern behavior is selected by
 `params._meta["io.modelcontextprotocol/protocolVersion"]`.
 Modern final results carry `resultType: "complete"`, server identity metadata, and
-conservative cache hints on cacheable list/discovery operations. Multi-round-trip
-`input_required` results are intentionally deferred to a later milestone.
+conservative cache hints on cacheable list/discovery operations. When the MRTR module
+is enabled, a provider may instead return `input_required`; the retry's
+`inputResponses`, opaque `requestState`, and client capabilities are passed back to
+the same provider.
+
+## Module boundary
+
+The core owns lifecycle, version negotiation, discovery and generic JSON-RPC routing.
+It does not contain method-name branches for `tools/list` or `tools/call`. Active
+modules publish their capabilities and claim their methods through the internal
+registry. A newly created runtime has no application capability; the host explicitly
+enables Tools and MRTR. Adding a provider before enabling Tools fails closed.
+
+MRTR deliberately remains separate from Tools even though the first supported use is
+`tools/call`: Tools owns catalog and execution semantics; MRTR owns permission for
+multi-round results and retry fields. Future Prompts or Resources modules can reuse
+MRTR without copying it.
 
 ## Current JSON Schema subset
 

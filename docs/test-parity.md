@@ -14,12 +14,15 @@ stdio, CLI, and Maelys L0/L1 suites.
 | JSON-RPC envelopes | integer and string ids, invalid id types, invalid version/method, notifications, error ownership and callback propagation |
 | MCP lifecycle | modern metadata, unsupported versions, legacy initialization, duplicate initialization, initialized notification, pre-initialization rejection |
 | MCP tools | list/call, unknown tools, input validation, output validation, effects, policy denial, audit, provider failure |
+| MCP modules | empty core, explicit/idempotent activation, capability derivation, method isolation, Tools-before-provider invariant |
+| Rich results | text, image, audio, embedded resources, mixed content, base64/MIME validation and structured output |
+| MRTR | input-required/complete rounds, retry context, opaque state validation, capability enforcement and official elicitation scenario |
 | Provider registry | mandatory effects, duplicate names within and across providers, capacity, exact schema retention |
 | Process providers | absolute paths, direct execution, minimal environment, describe/call/shutdown, premature exit, bounded messages and timeout plumbing |
 | stdio and CLI | end-to-end requests, parse errors, stdout isolation, `FD_CLOEXEC`, simulated third-party `printf()` contamination |
 | Memory safety | native ASan/UBSan and pinned Linux Docker ASan/UBSan/LSan |
-| Parser robustness | libFuzzer targets and seed corpora for JSON Lines, Content-Length, and schema definition/value pairs |
-| Polyglot providers | black-box lifecycle and call scenarios for C, TypeScript and Python, including structured failures and stdout contamination |
+| Parser robustness | libFuzzer targets and seed corpora for JSON Lines, Content-Length, schema definition/value pairs, and rich content blocks |
+| Polyglot providers | version 2 black-box lifecycle and explicit complete/input-required results for C, TypeScript and Python, including structured failures and stdout contamination |
 
 The standalone runtime adds checks that the original integrated server did not make
 at this boundary: unsupported JSON Schema keywords are rejected at registration,

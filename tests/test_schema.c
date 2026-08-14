@@ -6,16 +6,14 @@
 
 static maelys_mcp_result_t unused_call(
     void *context,
-    const char *tool_name,
-    json_t *arguments,
-    json_t **out_result,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
     char **out_error) {
     (void)context;
-    (void)tool_name;
-    (void)arguments;
+    (void)request;
     (void)out_error;
-    *out_result = json_object();
-    return *out_result ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+    out_result->structured_content = json_object();
+    return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
 static json_t *parse(const char *text) {

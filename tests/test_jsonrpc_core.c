@@ -1,8 +1,10 @@
 #include "src/jsonrpc/core.h"
+#include "src/internal/internal.h"
 #include "tests/test_support.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct recorder {
     int count;
@@ -36,6 +38,28 @@ static void clear(maelys_mcp_jsonrpc_core_t *core, recorder_t *recorder) {
     maelys_mcp_jsonrpc_core_clear(core);
     if (recorder->last) json_decref(recorder->last);
     recorder->last = NULL;
+}
+
+static int test_buffered_line_reader_preserves_frames(void) {
+    int fds[2];
+    ASSERT_TRUE(pipe(fds) == 0);
+    const char frames[] = "{\"id\":1}\n{\"id\":2}\n";
+    ASSERT_TRUE(write(fds[1], frames, sizeof(frames) - 1u) == (ssize_t)(sizeof(frames) - 1u));
+    close(fds[1]);
+    maelys_mcp_line_reader_t reader;
+    ASSERT_TRUE(maelys_mcp_line_reader_init(&reader, 128u) == MAELYS_MCP_OK);
+    json_t *value = NULL;
+    ASSERT_TRUE(maelys_mcp_line_reader_read(&reader, fds[0], &value, NULL) == MAELYS_MCP_OK);
+    ASSERT_TRUE(json_integer_value(json_object_get(value, "id")) == 1);
+    json_decref(value);
+    value = NULL;
+    ASSERT_TRUE(maelys_mcp_line_reader_read(&reader, fds[0], &value, NULL) == MAELYS_MCP_OK);
+    ASSERT_TRUE(json_integer_value(json_object_get(value, "id")) == 2);
+    json_decref(value);
+    ASSERT_TRUE(maelys_mcp_line_reader_read(&reader, fds[0], &value, NULL) == MAELYS_MCP_ERR_NOT_FOUND);
+    maelys_mcp_line_reader_clear(&reader);
+    close(fds[0]);
+    return 0;
 }
 
 static int test_init_contract(void) {
@@ -242,6 +266,7 @@ static int test_feed_and_serialize_arguments(void) {
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"init contract", test_init_contract},
+        {"buffered line reader preserves frames", test_buffered_line_reader_preserves_frames},
         {"JSON Lines fragmented, multiple, CRLF", test_lines_fragmented_multiple_and_crlf},
         {"JSON Lines protocol errors and duplicate keys", test_lines_protocol_errors},
         {"JSON Lines limits and EOF", test_lines_limits_and_finish},

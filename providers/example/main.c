@@ -66,13 +66,16 @@ static json_t *call_tool(json_t *params, const char **out_error) {
     if (strcmp(json_string_value(name), "example.echo") == 0) {
         json_t *message = json_object_get(arguments, "message");
         if (!json_is_string(message)) { *out_error = "message is required"; return NULL; }
-        return json_pack("{s:s,s:s}", "message", json_string_value(message), "provider", "example");
+        return json_pack("{s:s,s:{s:s,s:s}}",
+            "resultType", "complete", "structuredContent",
+            "message", json_string_value(message), "provider", "example");
     }
     if (strcmp(json_string_value(name), "example.sum") == 0) {
         json_t *left = json_object_get(arguments, "left");
         json_t *right = json_object_get(arguments, "right");
         if (!json_is_number(left) || !json_is_number(right)) { *out_error = "left and right are required"; return NULL; }
-        return json_pack("{s:f}", "value", json_number_value(left) + json_number_value(right));
+        return json_pack("{s:s,s:{s:f}}", "resultType", "complete",
+            "structuredContent", "value", json_number_value(left) + json_number_value(right));
     }
     *out_error = "unknown tool";
     return NULL;
@@ -88,7 +91,7 @@ int main(void) {
         json_t *id = json_object_get(request, "id");
         json_t *method = json_object_get(request, "method");
         json_t *params = json_object_get(request, "params");
-        json_t *response = json_pack("{s:s,s:O}", "protocol", "maelys-provider/1", "id", id);
+        json_t *response = json_pack("{s:s,s:O}", "protocol", "maelys-provider/2", "id", id);
         int should_exit = 0;
         if (json_is_string(method) && strcmp(json_string_value(method), "provider/describe") == 0) {
             json_object_set_new(response, "result", description());

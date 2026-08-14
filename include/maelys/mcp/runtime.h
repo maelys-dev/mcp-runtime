@@ -4,6 +4,7 @@
 #include <jansson.h>
 
 #include "maelys/mcp/error.h"
+#include "maelys/mcp/module.h"
 #include "maelys/mcp/provider.h"
 
 #ifdef __cplusplus

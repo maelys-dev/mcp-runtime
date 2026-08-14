@@ -9,10 +9,12 @@ The first milestone provides:
 - a static C library, `libmaelys_mcp.a`;
 - the `maelys-mcp` stdio host;
 - injectable in-process providers;
-- persistent out-of-process providers using `maelys-provider/1`;
+- persistent out-of-process providers using the explicit `maelys-provider/2` result contract;
 - MCP `2026-07-28` stateless requests and `server/discover`;
 - legacy MCP `2025-11-25` initialization for compatibility;
-- `tools/list` and `tools/call`;
+- an explicit module registry with independently enabled Tools and MRTR modules;
+- `tools/list`, `tools/call`, rich text/image/audio/resource content, and
+  multi-round `input_required` tool calls;
 - input and output validation for a documented JSON Schema subset;
 - registration-time rejection of unsupported or ambiguous schema definitions;
 - explicit `read`/`preview`/`apply`/`commit`/`execute` authorization classes;
@@ -44,7 +46,7 @@ It is not a claim of complete MCP 2026-07-28 conformance.
 
 `make test-asan-linux` is the reproducible release gate. It uses a digest-pinned
 Ubuntu 24.04/Clang image, enables ASan, UBSan and leak detection, then runs smoke
-campaigns for the JSON Lines, Content-Length and schema fuzzers. `make fuzz-smoke`
+campaigns for the JSON Lines, Content-Length, schema and rich-content fuzzers. `make fuzz-smoke`
 can also be run directly on a Linux host with Clang/libFuzzer.
 
 For a staged installation or system package build:
@@ -63,6 +65,16 @@ build/bin/maelys-mcp \
   --provider "$PWD/build/bin/example-provider"
 ```
 
+Provider deadlines can be tuned without changing the provider contract:
+
+```sh
+build/bin/maelys-mcp \
+  --provider "$PWD/build/bin/example-provider" \
+  --provider-describe-timeout-ms 5000 \
+  --provider-call-timeout-ms 300000 \
+  --provider-shutdown-timeout-ms 2000
+```
+
 `read` and `preview` tools are enabled by default. Higher-risk classes are opt-in and
 independent, for example `--allow-effect apply`; enabling `apply` does not implicitly
 enable `commit` or `execute`.
@@ -76,12 +88,13 @@ library writes diagnostics with `printf()`.
 
 ```text
 include/maelys/mcp/  public C API
-src/core/            MCP dispatch, registry and schema validation
+src/core/            MCP core, content and schema validation
+src/modules/         capability registry, Tools and MRTR modules
 src/provider/        in-process and process-provider adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
 providers/example/   independent reference provider
-conformance/          black-box maelys-provider/1 runner and call scenarios
+conformance/          black-box maelys-provider/2 runner and official MCP adapter
 sdk/typescript/       dependency-free TypeScript/JavaScript provider SDK
 sdk/python/           dependency-free Python provider SDK
 tests/               unit and end-to-end tests
@@ -97,6 +110,7 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.2.0 establishes the tested local stdio and polyglot provider boundary. Streamable
-HTTP, cancellation, subscriptions, MRTR, dynamic provider reload, full JSON Schema
+Version 0.3.0 is a breaking provider-contract release prepared locally. It establishes
+modular Tools/MRTR dispatch and rich tool results. Streamable HTTP, cancellation,
+subscriptions, prompts, resource methods, dynamic provider reload, full JSON Schema
 2020-12, Windows support and stable ABI guarantees are not implemented yet.

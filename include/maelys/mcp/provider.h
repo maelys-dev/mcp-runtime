@@ -11,6 +11,11 @@ extern "C" {
 
 typedef struct maelys_mcp_provider maelys_mcp_provider_t;
 
+#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/2"
+#define MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS 5000u
+#define MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS 300000u
+#define MAELYS_MCP_DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS 2000u
+
 typedef enum maelys_mcp_tool_effect {
     MAELYS_MCP_EFFECT_UNSPECIFIED = 0,
     MAELYS_MCP_EFFECT_READ = 1,
@@ -34,11 +39,35 @@ typedef struct maelys_mcp_tool {
     maelys_mcp_tool_effect_t effect;
 } maelys_mcp_tool_t;
 
+typedef enum maelys_mcp_provider_result_type {
+    MAELYS_MCP_PROVIDER_RESULT_COMPLETE = 0,
+    MAELYS_MCP_PROVIDER_RESULT_INPUT_REQUIRED = 1
+} maelys_mcp_provider_result_type_t;
+
+typedef struct maelys_mcp_provider_request {
+    const char *tool_name;
+    json_t *arguments;
+    json_t *input_responses;
+    json_t *request_state;
+    json_t *client_capabilities;
+} maelys_mcp_provider_request_t;
+
+typedef struct maelys_mcp_provider_result {
+    maelys_mcp_provider_result_type_t type;
+    json_t *content;
+    json_t *structured_content;
+    json_t *input_requests;
+    json_t *request_state;
+    int is_error;
+} maelys_mcp_provider_result_t;
+
+void maelys_mcp_provider_result_init(maelys_mcp_provider_result_t *result);
+void maelys_mcp_provider_result_clear(maelys_mcp_provider_result_t *result);
+
 typedef maelys_mcp_result_t (*maelys_mcp_provider_call_fn)(
     void *context,
-    const char *tool_name,
-    json_t *arguments,
-    json_t **out_result,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
     char **out_error);
 
 typedef void (*maelys_mcp_provider_destroy_fn)(void *context);
@@ -60,6 +89,19 @@ maelys_mcp_result_t maelys_mcp_provider_create(
 maelys_mcp_result_t maelys_mcp_provider_spawn(
     const char *executable_path,
     size_t max_message_bytes,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error);
+
+typedef struct maelys_mcp_provider_process_options {
+    const char *executable_path;
+    size_t max_message_bytes;
+    unsigned int describe_timeout_ms;
+    unsigned int call_timeout_ms;
+    unsigned int shutdown_timeout_ms;
+} maelys_mcp_provider_process_options_t;
+
+maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
+    const maelys_mcp_provider_process_options_t *options,
     maelys_mcp_provider_t **out_provider,
     char **out_error);
 

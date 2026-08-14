@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-from maelys_mcp_provider import Tool, create_provider, serve_provider
+from maelys_mcp_provider import Tool, complete_result, create_provider, serve_provider
 
 
-def echo(arguments):
+def echo(arguments, _context):
     print("simulated third-party diagnostic")
     if not isinstance(arguments.get("message"), str):
         raise ValueError("message is required")
-    return {"message": arguments["message"]}
+    return complete_result(structured_content={"message": arguments["message"]})
 
 
 provider = create_provider("python-fixture", "1.0.0", [Tool(

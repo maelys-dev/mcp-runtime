@@ -1,91 +1,102 @@
-# Provider protocol `maelys-provider/1`
+# Provider protocol `maelys-provider/2`
 
 External providers are persistent child processes connected through a private
-bidirectional socket mapped to their stdin and stdout. Messages are UTF-8 JSON Lines.
-Provider stdout is reserved exclusively for the protocol; diagnostics use stderr.
+bidirectional socket mapped to stdin and stdout. Messages are UTF-8 JSON Lines.
+Provider stdout is protocol-only; diagnostics use stderr. Version 2 intentionally
+removes the ambiguous version 1 convention where any JSON value meant a completed
+result.
 
-The host launches an absolute executable directly with the `--provider` argument.
-No shell performs expansion or interpretation.
-The reference process adapter applies a five-second socket I/O timeout so a silent
-provider cannot block the host indefinitely.
+The host launches an absolute executable directly with `--provider`, without a shell.
+Describe, call and shutdown deadlines are independently configurable. Defaults are
+5 seconds for discovery, 300 seconds for calls and 2 seconds for shutdown.
 
 ## Envelope
 
 ```json
 {
-  "protocol": "maelys-provider/1",
+  "protocol": "maelys-provider/2",
   "id": 1,
   "method": "provider/describe",
   "params": {}
 }
 ```
 
-A response contains the same `protocol` and `id`, plus either `result` or `error`.
+A response preserves `protocol` and `id` and contains exactly one of `result` or
+`error`.
 
 ## `provider/describe`
 
-Returns the provider identity and its complete tool catalog:
-
-```json
-{
-  "name": "hermes",
-  "version": "1.0.0",
-  "tools": [{
-    "name": "hermes.content.preview",
-    "title": "Preview an editorial plan",
-    "description": "Validates and previews a plan without writing files.",
-    "inputSchema": {"type": "object"},
-    "outputSchema": {"type": "object"},
-    "effect": "preview"
-  }]
-}
-```
-
-Tool names are globally unique. Registration rejects collisions across providers.
-It also rejects duplicate names inside one provider description.
-`effect` is mandatory and must be `read`, `preview`, `apply`, `commit`, or `execute`.
-It is part of the authorization contract, not descriptive documentation.
-
-The runtime accepts only its documented JSON Schema subset and validates every schema
-definition before exposing the tool. Unknown keywords fail registration instead of
-being advertised and silently ignored.
+The result contains `name`, `version`, and the complete `tools` array. Each tool has a
+globally unique name, description, object-root `inputSchema`, optional `outputSchema`,
+and mandatory `effect`: `read`, `preview`, `apply`, `commit`, or `execute`. Invalid or
+unsupported schema definitions fail provider registration.
 
 ## `provider/call`
 
+Initial call:
+
 ```json
 {
-  "name": "hermes.content.preview",
-  "arguments": {}
+  "name": "hermes.content.apply",
+  "arguments": {"plan": "..."},
+  "clientCapabilities": {"elicitation": {}}
 }
 ```
 
-The result may be any JSON value accepted by the declared output schema.
+A completed provider result is explicit. `content` may mix text, image, audio,
+resource-link and embedded-resource blocks; `structuredContent` carries the value
+validated against `outputSchema`.
 
-## Conformance
-
-`conformance/provider_conformance.py` treats a provider as a black box. It checks the
-persistent lifecycle, exact envelopes and ids, structured unknown-tool errors, schema
-definitions, declared call scenarios, graceful shutdown and exclusive stdout usage.
-
-```sh
-python3 conformance/provider_conformance.py /absolute/provider \
-  --cases /absolute/provider-cases.json
+```json
+{
+  "resultType": "complete",
+  "content": [{"type": "text", "text": "Plan applied."}],
+  "structuredContent": {"changed": 3}
+}
 ```
 
-Case files contain a `calls` array. An argument value that is exactly `${VARIABLE}` is
-resolved from the runner environment, which permits repository-specific integration
-tests without storing machine paths in source control.
+For a multi-round request, the provider returns an `input_required` result:
 
-The language SDKs under `sdk/typescript` and `sdk/python` implement this lifecycle so
-application adapters only define descriptors and handlers.
+```json
+{
+  "resultType": "input_required",
+  "inputRequests": {
+    "confirmation": {
+      "method": "elicitation/create",
+      "params": {
+        "message": "Apply these changes?",
+        "requestedSchema": {
+          "type": "object",
+          "properties": {"accept": {"type": "boolean"}},
+          "required": ["accept"]
+        }
+      }
+    }
+  },
+  "requestState": "opaque-provider-owned-state"
+}
+```
 
-## `provider/shutdown`
+The client retries `tools/call`; the runtime forwards `inputResponses`, echoed
+`requestState`, and `clientCapabilities` to the provider. Providers must authenticate
+opaque state against the operation, arguments and expected round before mutating.
+The runtime rejects input requests for capabilities the client did not declare with
+MCP error `-32021`.
 
-The host requests graceful shutdown before closing the socket. Providers should return
-an empty result and terminate. The host sends `SIGTERM` if the process remains alive.
+## Content validation
 
-## Evolution
+The runtime validates the shape of every content block, MIME family for image/audio,
+base64 syntax and the configured message-size bound. Embedded resources require a URI
+and exactly one of text or base64 blob. Validation is structural: providers remain
+responsible for media authenticity, malware scanning, URI policy and domain semantics.
 
-Protocol version `1` is intentionally smaller than MCP. It is an internal provider ABI,
-not another public tool protocol. Future changes must remain backward-compatible within
-the major version or introduce a new version string.
+## Conformance and shutdown
+
+`conformance/provider_conformance.py` checks the persistent lifecycle, envelopes,
+ids, errors, schemas, explicit result variants, declared call cases, graceful
+shutdown and stdout isolation. `provider/shutdown` returns `{}`; a process that does
+not terminate within its deadline receives `SIGTERM`, then `SIGKILL` after one final
+bounded grace period.
+
+Version 2 is a private provider ABI, not another public MCP protocol. Version 1 is not
+accepted by the 0.3 runtime; providers must upgrade atomically with the host.

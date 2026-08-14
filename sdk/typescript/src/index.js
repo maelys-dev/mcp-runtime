@@ -1,6 +1,6 @@
 import readline from "node:readline";
 
-export const PROTOCOL = "maelys-provider/1";
+export const PROTOCOL = "maelys-provider/2";
 export const TOOL_EFFECTS = Object.freeze(["read", "preview", "apply", "commit", "execute"]);
 
 const schemaKeys = new Set([
@@ -115,6 +115,48 @@ export function describeProvider(provider) {
   };
 }
 
+export function completeResult({ content, structuredContent, isError = false }) {
+  if (content === undefined && structuredContent === undefined) {
+    throw new TypeError("complete result requires content or structuredContent");
+  }
+  if (content !== undefined && (!Array.isArray(content) || content.length === 0)) {
+    throw new TypeError("complete result content must be a non-empty array");
+  }
+  return {
+    resultType: "complete",
+    ...(content === undefined ? {} : { content }),
+    ...(structuredContent === undefined ? {} : { structuredContent }),
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+export function inputRequiredResult({ inputRequests, requestState }) {
+  if (inputRequests === undefined && requestState === undefined) {
+    throw new TypeError("input_required result requires inputRequests or requestState");
+  }
+  if (inputRequests !== undefined) {
+    objectValue(inputRequests, "inputRequests");
+    if (Object.keys(inputRequests).length === 0) throw new TypeError("inputRequests must not be empty");
+  }
+  if (requestState !== undefined) stringValue(requestState, "requestState");
+  return {
+    resultType: "input_required",
+    ...(inputRequests === undefined ? {} : { inputRequests }),
+    ...(requestState === undefined ? {} : { requestState }),
+  };
+}
+
+function validateProviderResult(result) {
+  const value = objectValue(result, "provider result");
+  if (value.resultType === "complete") {
+    return completeResult(value);
+  }
+  if (value.resultType === "input_required") {
+    return inputRequiredResult(value);
+  }
+  throw new TypeError("provider resultType must be complete or input_required");
+}
+
 export async function handleProviderMessage(provider, message) {
   const request = objectValue(message, "provider request");
   if (typeof request.id !== "number" || !Number.isInteger(request.id)) throw new TypeError("provider request id must be an integer");
@@ -128,7 +170,15 @@ export async function handleProviderMessage(provider, message) {
     const arguments_ = objectValue(params.arguments ?? {}, "provider/call arguments");
     const tool = provider.tools.find((candidate) => candidate.name === name);
     if (!tool) throw new Error(`unknown provider tool: ${name}`);
-    result = await tool.handler(arguments_);
+    const context = {
+      inputResponses: params.inputResponses === undefined ? undefined :
+        objectValue(params.inputResponses, "provider/call inputResponses"),
+      requestState: params.requestState === undefined ? undefined :
+        stringValue(params.requestState, "provider/call requestState"),
+      clientCapabilities: params.clientCapabilities === undefined ? undefined :
+        objectValue(params.clientCapabilities, "provider/call clientCapabilities"),
+    };
+    result = validateProviderResult(await tool.handler(arguments_, context));
   } else if (request.method === "provider/shutdown") {
     result = {};
   } else {

@@ -5,7 +5,8 @@
 - Only explicitly configured provider executables are launched.
 - Provider paths must be absolute.
 - Providers are executed directly, never through a shell.
-- Provider children receive only `PATH=/usr/bin:/bin`, `LANG=C`, and `LC_ALL=C`.
+- Provider children receive only a fixed platform-specific system `PATH`, `LANG=C`,
+  and `LC_ALL=C`; the caller's environment is never inherited.
 - Tool name collisions fail closed.
 - Unknown tools and malformed arguments are rejected before provider invocation.
 - Tools declare one mandatory effect: `read`, `preview`, `apply`, `commit`, or `execute`.
@@ -18,7 +19,14 @@
 - Schemas with unsupported keywords or inconsistent constraints fail registration.
 - Provider output that violates its announced schema is discarded and returned only
   as an MCP tool error.
+- Rich content is shape-checked; image/audio and resource blobs must be bounded valid
+  base64 and use the matching MIME family.
+- MRTR input requests are rejected when the client omitted their required capability.
+- `requestState` is opaque to the runtime. A mutating provider must authenticate and
+  bind it to the operation, arguments, expected round and expiration before acting.
 - Request and provider message sizes are bounded.
+- Protocol fields that enter length-unaware C APIs reject embedded NUL bytes.
+- Provider descriptors are close-on-exec and provider termination is bounded.
 
 ## Trust boundary
 
@@ -39,3 +47,5 @@ fragment from an MCP request.
 - make mutation opt-in and auditable;
 - return structured errors without secrets;
 - verify optimistic revisions or preview tokens before writes.
+- treat accepted elicitation as an authorization input, not as a replacement for the
+  runtime effect policy or the provider's own invariants.

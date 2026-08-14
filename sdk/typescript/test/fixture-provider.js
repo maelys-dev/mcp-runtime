@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createProvider, serveProvider } from "../src/index.js";
+import { completeResult, createProvider, serveProvider } from "../src/index.js";
 
 const provider = createProvider({
   name: "typescript-fixture",
@@ -18,7 +18,7 @@ const provider = createProvider({
     handler: ({ message }) => {
       console.log("simulated third-party diagnostic");
       if (typeof message !== "string") throw new Error("message is required");
-      return { message };
+      return completeResult({ structuredContent: { message } });
     },
   }],
 });
