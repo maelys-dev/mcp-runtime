@@ -12,6 +12,7 @@ MCP client
 maelys-mcp host
     |- JSON-RPC and MCP validation
     |- policy and audit hooks
+    |- bounded outbox -> unique protocol writer
     |- module registry
     |   |- Tools
     |   |- Resources
@@ -47,6 +48,9 @@ client-specific adapter belongs in this library.
 - `maelys_mcp_runtime_handle` borrows the request and returns a newly owned response.
 - Resource descriptors are deep-copied and normalized at registration. Resource read
   callbacks follow the same ownership rule through `maelys_mcp_resource_result_t`.
+- `maelys_mcp_outbox_enqueue_take` steals a Jansson reference only on success. The
+  unique writer releases it after the write callback returns; producers never write
+  to the protocol descriptor.
 
 ## Protocol eras
 
@@ -88,3 +92,15 @@ input schemas must have an object root. Unsupported validation keywords and malf
 definitions are rejected before a provider is registered, so the schema exposed by
 `tools/list` cannot promise a constraint that runtime validation silently ignores.
 Full JSON Schema 2020-12 is a later milestone.
+
+## Output boundary
+
+The outbox has separate response and notification queues, bounded by message count and
+serialized bytes. It removes a small batch of pointers under the mutex, signals
+producers, then performs every callback and I/O operation without holding the mutex.
+Responses are preferred, but after eight consecutive responses one pending
+notification is selected. Keyed notification replacement moves the event to the tail,
+preserving the most recent causal position rather than its first occurrence.
+
+The bus is ready for multiple producers, but 0.5 keeps request dispatch and provider
+calls synchronous. The asynchronous subscription producers are introduced separately.

@@ -18,6 +18,7 @@ stdio, CLI, and Maelys L0/L1 suites.
 | Rich results | text, image, audio, embedded resources, mixed content, base64/MIME validation and structured output |
 | MRTR | input-required/complete rounds, retry context, opaque state validation, capability enforcement and official elicitation scenario |
 | MCP resources | static catalog, templates, canonical reads, process-provider bridge, optional size, text/blob/base64 validation and URI policy |
+| Async output | single writer, bounded count/bytes, ownership transfer, 8:1 anti-starvation, causal coalescence, multi-producer pressure and write failure |
 | Provider registry | mandatory effects, duplicate names within and across providers, capacity, exact schema retention |
 | Process providers | absolute paths, direct execution, minimal environment, describe/call/shutdown, premature exit, bounded messages and timeout plumbing |
 | stdio and CLI | end-to-end requests, parse errors, stdout isolation, `FD_CLOEXEC`, simulated third-party `printf()` contamination |
@@ -53,6 +54,7 @@ make clean
 make check
 make check-all
 make analyze
+make tsan
 make test-asan-linux
 ```
 

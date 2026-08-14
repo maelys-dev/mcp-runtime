@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 - 2026-08-14
+
+- Add a reusable bounded asynchronous outbox with one writer thread and explicit
+  Jansson ownership transfer.
+- Separate responses and notifications, prioritize responses with configurable 8:1
+  anti-starvation scheduling, and batch pointer removal outside the I/O critical path.
+- Coalesce keyed notifications while moving replacements to their newest causal
+  position; bound both message count and serialized byte budget.
+- Route every stdio response through the outbox so no runtime worker or module writes
+  directly to the protocol descriptor.
+- Add deterministic scheduling, coalescence, writer-failure, bounded-backpressure and
+  multi-producer tests under native and sanitizer gates.
+
 ## 0.4.0 - 2026-08-14
 
 - Add an independently enabled Resources module implementing `resources/list`,

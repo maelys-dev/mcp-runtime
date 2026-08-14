@@ -8,4 +8,5 @@ Description: Native policy-enforced MCP runtime and provider host
 Version: @VERSION@
 Requires.private: jansson liburiparser
 Libs: -L${libdir} -lmaelys_mcp
+Libs.private: -pthread
 Cflags: -I${includedir}

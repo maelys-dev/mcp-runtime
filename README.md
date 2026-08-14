@@ -23,6 +23,8 @@ The first milestone provides:
 - injectable authorization and audit callbacks;
 - an external example provider and conformance tests;
 - isolated protocol stdout that cannot be contaminated by ordinary `printf()` calls;
+- a bounded asynchronous output bus with a single protocol writer, response priority,
+  anti-starvation and causal notification coalescence;
 - Linux sanitizer and libFuzzer release gates.
 
 It is deliberately not a shell-command wrapper. Provider executables are absolute,
@@ -37,6 +39,7 @@ and uriparser.
 make check
 make check-all
 make asan
+make tsan
 make test-asan-linux
 make test-mcp-conformance-official
 ```
@@ -106,14 +109,16 @@ docs/                architecture, security and provider protocol
 
 See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-protocol.md),
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
-[Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
+[Asynchronous outbox](docs/outbox.md), [Test parity](docs/test-parity.md), and
+[Provenance](docs/provenance.md).
 Client setup examples are in [Codex and Claude clients](docs/clients.md).
 The scope and limitations of the upstream test suite are in
 [Official MCP conformance](docs/official-conformance.md).
 
 ## Status
 
-Version 0.4.0 adds the Resources facade and secure URI boundary while preserving the
-private `maelys-provider/2` contract. Streamable HTTP, cancellation, subscriptions,
-prompts, dynamic provider reload, full JSON Schema 2020-12, Windows support and stable
-ABI guarantees are not implemented yet.
+Version 0.5.0 adds the asynchronous single-writer output foundation while preserving
+the private `maelys-provider/2` contract. Provider calls remain synchronous in this
+release; Streamable HTTP, cancellation, subscriptions, prompts, dynamic provider
+reload, full JSON Schema 2020-12, Windows support and stable ABI guarantees are not
+implemented yet.
