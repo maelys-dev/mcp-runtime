@@ -176,12 +176,20 @@ maelys_mcp_result_t maelys_mcp_jsonrpc_core_feed(
     return core->framing == MAELYS_MCP_JSONRPC_JSON_LINES ? parse_lines(core) : parse_frames(core);
 }
 
+maelys_mcp_result_t maelys_mcp_jsonrpc_core_finish(
+    const maelys_mcp_jsonrpc_core_t *core) {
+    if (!core) return MAELYS_MCP_ERR_ARGUMENT;
+    return core->length == 0 ? MAELYS_MCP_OK : MAELYS_MCP_ERR_PROTOCOL;
+}
+
 maelys_mcp_result_t maelys_mcp_jsonrpc_core_serialize(
     const maelys_mcp_jsonrpc_core_t *core,
     json_t *message,
     char **out_bytes,
     size_t *out_length) {
     if (!core || !message || !out_bytes || !out_length) return MAELYS_MCP_ERR_ARGUMENT;
+    if (core->framing != MAELYS_MCP_JSONRPC_JSON_LINES &&
+        core->framing != MAELYS_MCP_JSONRPC_CONTENT_LENGTH) return MAELYS_MCP_ERR_ARGUMENT;
     *out_bytes = NULL;
     *out_length = 0;
     char *json = json_dumps(message, JSON_COMPACT | JSON_SORT_KEYS);

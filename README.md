@@ -14,9 +14,12 @@ The first milestone provides:
 - legacy MCP `2025-11-25` initialization for compatibility;
 - `tools/list` and `tools/call`;
 - input and output validation for a documented JSON Schema subset;
+- registration-time rejection of unsupported or ambiguous schema definitions;
 - explicit `read`/`preview`/`apply`/`commit`/`execute` authorization classes;
 - injectable authorization and audit callbacks;
-- an external example provider and conformance tests.
+- an external example provider and conformance tests;
+- isolated protocol stdout that cannot be contaminated by ordinary `printf()` calls;
+- Linux sanitizer and libFuzzer release gates.
 
 It is deliberately not a shell-command wrapper. Provider executables are absolute,
 explicitly configured paths, launched without a shell and with a minimal environment.
@@ -28,7 +31,13 @@ Requirements: a C11 compiler, POSIX shell utilities, `make`, `pkg-config`, and J
 ```sh
 make check
 make asan
+make test-asan-linux
 ```
+
+`make test-asan-linux` is the reproducible release gate. It uses a digest-pinned
+Ubuntu 24.04/Clang image, enables ASan, UBSan and leak detection, then runs smoke
+campaigns for the JSON Lines, Content-Length and schema fuzzers. `make fuzz-smoke`
+can also be run directly on a Linux host with Clang/libFuzzer.
 
 For a staged installation or system package build:
 
@@ -50,8 +59,10 @@ build/bin/maelys-mcp \
 independent, for example `--allow-effect apply`; enabling `apply` does not implicitly
 enable `commit` or `execute`.
 
-Each MCP request is one JSON object per line on stdin. Responses are written only to
-stdout; diagnostics are written to stderr.
+Each MCP request is one JSON object per line on stdin. The host duplicates the original
+stdout as a private close-on-exec transport descriptor, then redirects process-wide
+stdout to stderr. Consequently, responses alone reach the MCP client even if a linked
+library writes diagnostics with `printf()`.
 
 ## Repository structure
 
@@ -68,10 +79,10 @@ docs/                architecture, security and provider protocol
 
 See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-protocol.md),
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
-and [Provenance](docs/provenance.md).
+[Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
 
 ## Status
 
-This is an early development release. Streamable HTTP, cancellation, subscriptions,
-MRTR, dynamic provider reload, full JSON Schema 2020-12, Windows support and stable ABI
-guarantees are not implemented yet.
+Version 0.1.0 establishes the tested local stdio and provider boundary. Streamable
+HTTP, cancellation, subscriptions, MRTR, dynamic provider reload, full JSON Schema
+2020-12, Windows support and stable ABI guarantees are not implemented yet.

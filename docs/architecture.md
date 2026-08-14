@@ -55,4 +55,9 @@ conservative cache hints on cacheable list/discovery operations. Multi-round-tri
 
 The runtime validates `type`, `properties`, `required`, `additionalProperties`,
 `items`, `enum`, `minLength`, `maxLength`, `minimum`, and `maximum`. Providers remain
-responsible for their domain invariants. Full JSON Schema 2020-12 is a later milestone.
+responsible for their domain invariants. `$schema`, `title`, and `description` are
+accepted as annotations. Every schema node must declare one supported `type`; tool
+input schemas must have an object root. Unsupported validation keywords and malformed
+definitions are rejected before a provider is registered, so the schema exposed by
+`tools/list` cannot promise a constraint that runtime validation silently ignores.
+Full JSON Schema 2020-12 is a later milestone.

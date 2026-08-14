@@ -74,6 +74,14 @@ maelys_mcp_result_t maelys_mcp_provider_create(
         if (!source->name || !*source->name || !source->description ||
             !json_is_object(source->input_schema) ||
             !maelys_mcp_tool_effect_string(source->effect)) goto argument_error;
+        if (maelys_mcp_validate_schema_definition(source->input_schema, 1, NULL) != MAELYS_MCP_OK ||
+            (source->output_schema &&
+             maelys_mcp_validate_schema_definition(source->output_schema, 0, NULL) != MAELYS_MCP_OK)) {
+            goto argument_error;
+        }
+        for (size_t previous = 0; previous < index; ++previous) {
+            if (strcmp(source->name, config->tools[previous].name) == 0) goto argument_error;
+        }
         target->name = maelys_mcp_strdup(source->name);
         target->title = maelys_mcp_strdup(source->title ? source->title : source->name);
         target->description = maelys_mcp_strdup(source->description);

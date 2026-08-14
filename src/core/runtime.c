@@ -365,6 +365,10 @@ static json_t *call_tool(
         }
         free(output_error);
     }
+    if (status != MAELYS_MCP_OK && payload) {
+        json_decref(payload);
+        payload = NULL;
+    }
     audit(runtime, protocol_version, client_name, tool, MAELYS_MCP_OPERATION_CALL, status);
     json_t *response = tool_result(runtime, id, payload, status == MAELYS_MCP_OK ? NULL : provider_error, modern);
     if (payload) json_decref(payload);
@@ -415,9 +419,11 @@ json_t *maelys_mcp_runtime_handle(maelys_mcp_runtime_t *runtime, json_t *request
     json_t *jsonrpc = json_object_get(request, "jsonrpc");
     json_t *method = json_object_get(request, "method");
     json_t *params = json_object_get(request, "params");
+    int valid_id = !id || json_is_integer(id) || json_is_string(id);
     if (!json_is_string(jsonrpc) || strcmp(json_string_value(jsonrpc), "2.0") != 0 ||
-        !json_is_string(method) || (id && !json_is_integer(id) && !json_is_string(id))) {
-        return maelys_mcp_error_response(id, JSONRPC_INVALID_REQUEST, "Invalid Request", NULL);
+        !json_is_string(method) || !valid_id) {
+        return maelys_mcp_error_response(valid_id ? id : NULL,
+            JSONRPC_INVALID_REQUEST, "Invalid Request", NULL);
     }
     const char *method_name = json_string_value(method);
     if (strcmp(method_name, "initialize") == 0) return initialize(runtime, id, params);

@@ -12,13 +12,21 @@
 } while (0)
 
 int main(int argc, char **argv) {
-    ASSERT_TRUE(argc == 2);
+    ASSERT_TRUE(argc == 6);
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
     ASSERT_TRUE(maelys_mcp_provider_spawn("/usr/bin/false", 65536u, &provider, &error) != MAELYS_MCP_OK);
     ASSERT_TRUE(provider == NULL);
     free(error);
     error = NULL;
+    for (int index = 2; index < argc; ++index) {
+        size_t limit = index == 5 ? 256u : 65536u;
+        ASSERT_TRUE(maelys_mcp_provider_spawn(argv[index], limit, &provider, &error) != MAELYS_MCP_OK);
+        ASSERT_TRUE(provider == NULL);
+        ASSERT_TRUE(error != NULL);
+        free(error);
+        error = NULL;
+    }
     ASSERT_TRUE(maelys_mcp_provider_spawn(argv[1], 65536u, &provider, &error) == MAELYS_MCP_OK);
     free(error);
     maelys_mcp_runtime_config_t config = {

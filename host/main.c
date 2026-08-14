@@ -1,4 +1,5 @@
 #include "maelys/mcp.h"
+#include "src/internal/internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +57,14 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    int transport_fd = -1;
+    maelys_mcp_result_t status = maelys_mcp_isolate_stdout(&transport_fd);
+    if (status != MAELYS_MCP_OK) {
+        fprintf(stderr, "Cannot isolate MCP stdout: %s\n", maelys_mcp_result_string(status));
+        free(provider_paths);
+        return 1;
+    }
+
     maelys_mcp_runtime_config_t config = {
         .server_name = "maelys-mcp",
         .server_version = "0.1.0",
@@ -66,9 +75,10 @@ int main(int argc, char **argv) {
         .policy_context = &policy
     };
     maelys_mcp_runtime_t *runtime = NULL;
-    maelys_mcp_result_t status = maelys_mcp_runtime_create(&config, &runtime);
+    status = maelys_mcp_runtime_create(&config, &runtime);
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "Cannot create runtime: %s\n", maelys_mcp_result_string(status));
+        close(transport_fd);
         free(provider_paths);
         return 1;
     }
@@ -87,14 +97,16 @@ int main(int argc, char **argv) {
             if (provider) maelys_mcp_provider_destroy(provider);
             free(error);
             maelys_mcp_runtime_destroy(runtime);
+            close(transport_fd);
             free(provider_paths);
             return 1;
         }
         free(error);
     }
     free(provider_paths);
-    status = maelys_mcp_runtime_serve_stdio(runtime, STDIN_FILENO, STDOUT_FILENO);
+    status = maelys_mcp_runtime_serve_stdio(runtime, STDIN_FILENO, transport_fd);
     maelys_mcp_runtime_destroy(runtime);
+    close(transport_fd);
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "MCP transport failed: %s\n", maelys_mcp_result_string(status));
         return 1;

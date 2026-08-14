@@ -59,3 +59,8 @@ maelys_mcp_result_t maelys_mcp_read_json_line(
 json_t *maelys_mcp_error_response(json_t *id, int code, const char *message, json_t *data);
 json_t *maelys_mcp_success_response(json_t *id, json_t *result);
 maelys_mcp_result_t maelys_mcp_validate_schema(json_t *schema, json_t *value, char **out_error);
+maelys_mcp_result_t maelys_mcp_validate_schema_definition(
+    json_t *schema,
+    int require_object_root,
+    char **out_error);
+maelys_mcp_result_t maelys_mcp_isolate_stdout(int *out_transport_fd);

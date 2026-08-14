@@ -12,7 +12,12 @@
 - `apply`, `commit`, and `execute` are denied by the reference host unless
   each effect is explicitly enabled with `--allow-effect`.
 - Authorization can hide tools from discovery and deny invocation independently.
-- MCP stdout contains protocol messages only.
+- The host retains the original stdout in a private `FD_CLOEXEC` descriptor and
+  redirects process-wide stdout to stderr before provider or runtime initialization.
+  Third-party `printf()` output therefore cannot contaminate MCP responses.
+- Schemas with unsupported keywords or inconsistent constraints fail registration.
+- Provider output that violates its announced schema is discarded and returned only
+  as an MCP tool error.
 - Request and provider message sizes are bounded.
 
 ## Trust boundary

@@ -43,6 +43,8 @@ maelys_mcp_result_t maelys_mcp_jsonrpc_core_feed(
     maelys_mcp_jsonrpc_core_t *core,
     const void *bytes,
     size_t length);
+maelys_mcp_result_t maelys_mcp_jsonrpc_core_finish(
+    const maelys_mcp_jsonrpc_core_t *core);
 maelys_mcp_result_t maelys_mcp_jsonrpc_core_serialize(
     const maelys_mcp_jsonrpc_core_t *core,
     json_t *message,

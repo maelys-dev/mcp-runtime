@@ -236,6 +236,18 @@ maelys_mcp_result_t maelys_mcp_provider_spawn(
             replace_error(out_error, "provider tool description is invalid");
             return MAELYS_MCP_ERR_PROTOCOL;
         }
+        char *schema_error = NULL;
+        if (maelys_mcp_validate_schema_definition(input_schema, 1, &schema_error) != MAELYS_MCP_OK ||
+            (output_schema &&
+             maelys_mcp_validate_schema_definition(output_schema, 0, &schema_error) != MAELYS_MCP_OK)) {
+            free(tools);
+            json_decref(description);
+            process_destroy(process);
+            replace_error(out_error, schema_error ? schema_error : "provider schema is unsupported");
+            free(schema_error);
+            return MAELYS_MCP_ERR_PROTOCOL;
+        }
+        free(schema_error);
         tools[index] = (maelys_mcp_tool_t){
             .name = json_string_value(tool_name),
             .title = json_is_string(title) ? json_string_value(title) : json_string_value(tool_name),

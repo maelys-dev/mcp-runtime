@@ -42,8 +42,13 @@ Returns the provider identity and its complete tool catalog:
 ```
 
 Tool names are globally unique. Registration rejects collisions across providers.
+It also rejects duplicate names inside one provider description.
 `effect` is mandatory and must be `read`, `preview`, `apply`, `commit`, or `execute`.
 It is part of the authorization contract, not descriptive documentation.
+
+The runtime accepts only its documented JSON Schema subset and validates every schema
+definition before exposing the tool. Unknown keywords fail registration instead of
+being advertised and silently ignored.
 
 ## `provider/call`
 

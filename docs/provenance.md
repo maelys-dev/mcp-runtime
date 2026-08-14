@@ -18,9 +18,10 @@ and adapted from `maelys_result_t` and the codexmanager transport configuration 
 
 The JSON-RPC success/error envelope in `src/core/common.c` is also adapted from
 `protocols/mcp/mcp_error.c`; the standalone version adds structured error data. The
-ownership and notification cases from `tests/test_mcp_jsonrpc_binding.c` were retained
-as runtime and stdio regression tests, while the application-specific binding itself
-was replaced by the provider-neutral dispatcher.
+generic ownership, lifecycle, framing, error, stdio, CLI, and notification cases from
+the JSON-RPC and MCP test families were retained as runtime regressions, while the
+application-specific binding itself was replaced by the provider-neutral dispatcher.
+The exact inclusion/exclusion matrix is documented in `docs/test-parity.md`.
 
 The following codexmanager code was intentionally not copied because it crosses an
 application boundary:
