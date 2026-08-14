@@ -28,12 +28,37 @@ typedef struct maelys_mcp_owned_tool {
     struct maelys_mcp_provider *provider;
 } maelys_mcp_owned_tool_t;
 
+typedef struct maelys_mcp_owned_resource {
+    char *uri;
+    char *name;
+    char *title;
+    char *description;
+    char *mime_type;
+    int has_size;
+    long long size;
+    struct maelys_mcp_provider *provider;
+} maelys_mcp_owned_resource_t;
+
+typedef struct maelys_mcp_owned_resource_template {
+    char *uri_template;
+    char *name;
+    char *title;
+    char *description;
+    char *mime_type;
+    struct maelys_mcp_provider *provider;
+} maelys_mcp_owned_resource_template_t;
+
 struct maelys_mcp_provider {
     char *name;
     char *version;
     maelys_mcp_owned_tool_t *tools;
     size_t tool_count;
+    maelys_mcp_owned_resource_t *resources;
+    size_t resource_count;
+    maelys_mcp_owned_resource_template_t *resource_templates;
+    size_t resource_template_count;
     maelys_mcp_provider_call_fn call;
+    maelys_mcp_provider_read_resource_fn read_resource;
     maelys_mcp_provider_destroy_fn destroy;
     void *context;
 };

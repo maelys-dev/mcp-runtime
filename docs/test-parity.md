@@ -17,11 +17,12 @@ stdio, CLI, and Maelys L0/L1 suites.
 | MCP modules | empty core, explicit/idempotent activation, capability derivation, method isolation, Tools-before-provider invariant |
 | Rich results | text, image, audio, embedded resources, mixed content, base64/MIME validation and structured output |
 | MRTR | input-required/complete rounds, retry context, opaque state validation, capability enforcement and official elicitation scenario |
+| MCP resources | static catalog, templates, canonical reads, process-provider bridge, optional size, text/blob/base64 validation and URI policy |
 | Provider registry | mandatory effects, duplicate names within and across providers, capacity, exact schema retention |
 | Process providers | absolute paths, direct execution, minimal environment, describe/call/shutdown, premature exit, bounded messages and timeout plumbing |
 | stdio and CLI | end-to-end requests, parse errors, stdout isolation, `FD_CLOEXEC`, simulated third-party `printf()` contamination |
 | Memory safety | native ASan/UBSan and pinned Linux Docker ASan/UBSan/LSan |
-| Parser robustness | libFuzzer targets and seed corpora for JSON Lines, Content-Length, schema definition/value pairs, and rich content blocks |
+| Parser robustness | libFuzzer targets and seed corpora for JSON Lines, Content-Length, schema definition/value pairs, rich content blocks, URI normalization and URI templates |
 | Polyglot providers | version 2 black-box lifecycle and explicit complete/input-required results for C, TypeScript and Python, including structured failures and stdout contamination |
 
 The standalone runtime adds checks that the original integrated server did not make

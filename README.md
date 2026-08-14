@@ -12,9 +12,11 @@ The first milestone provides:
 - persistent out-of-process providers using the explicit `maelys-provider/2` result contract;
 - MCP `2026-07-28` stateless requests and `server/discover`;
 - legacy MCP `2025-11-25` initialization for compatibility;
-- an explicit module registry with independently enabled Tools and MRTR modules;
+- an explicit module registry with independently enabled Tools, Resources and MRTR modules;
 - `tools/list`, `tools/call`, rich text/image/audio/resource content, and
   multi-round `input_required` tool calls;
+- `resources/list`, `resources/templates/list`, and `resources/read`, backed by
+  static descriptors or bounded URI templates;
 - input and output validation for a documented JSON Schema subset;
 - registration-time rejection of unsupported or ambiguous schema definitions;
 - explicit `read`/`preview`/`apply`/`commit`/`execute` authorization classes;
@@ -28,7 +30,8 @@ explicitly configured paths, launched without a shell and with a minimal environ
 
 ## Build and test
 
-Requirements: a C11 compiler, POSIX shell utilities, `make`, `pkg-config`, and Jansson.
+Requirements: a C11 compiler, POSIX shell utilities, `make`, `pkg-config`, Jansson,
+and uriparser.
 
 ```sh
 make check
@@ -41,12 +44,12 @@ make test-mcp-conformance-official
 `make check` keeps the native C gate dependency-minimal. `make check-all` additionally
 runs the TypeScript and Python SDK tests plus the black-box provider conformance suite.
 The separately invoked official MCP target uses the upstream HTTP-only alpha runner
-through a test adapter and covers only the scenarios matching the tools-only contract.
+through a test adapter and covers only the scenarios matching the implemented modules.
 It is not a claim of complete MCP 2026-07-28 conformance.
 
 `make test-asan-linux` is the reproducible release gate. It uses a digest-pinned
 Ubuntu 24.04/Clang image, enables ASan, UBSan and leak detection, then runs smoke
-campaigns for the JSON Lines, Content-Length, schema and rich-content fuzzers. `make fuzz-smoke`
+campaigns for the JSON Lines, Content-Length, schema, rich-content and URI fuzzers. `make fuzz-smoke`
 can also be run directly on a Linux host with Clang/libFuzzer.
 
 For a staged installation or system package build:
@@ -88,8 +91,8 @@ library writes diagnostics with `printf()`.
 
 ```text
 include/maelys/mcp/  public C API
-src/core/            MCP core, content and schema validation
-src/modules/         capability registry, Tools and MRTR modules
+src/core/            MCP core, content, URI and schema validation
+src/modules/         capability registry, Tools, Resources and MRTR modules
 src/provider/        in-process and process-provider adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
@@ -110,7 +113,7 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.3.0 is a breaking provider-contract release prepared locally. It establishes
-modular Tools/MRTR dispatch and rich tool results. Streamable HTTP, cancellation,
-subscriptions, prompts, resource methods, dynamic provider reload, full JSON Schema
-2020-12, Windows support and stable ABI guarantees are not implemented yet.
+Version 0.4.0 adds the Resources facade and secure URI boundary while preserving the
+private `maelys-provider/2` contract. Streamable HTTP, cancellation, subscriptions,
+prompts, dynamic provider reload, full JSON Schema 2020-12, Windows support and stable
+ABI guarantees are not implemented yet.

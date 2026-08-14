@@ -2,7 +2,7 @@ import io
 import json
 import unittest
 
-from maelys_mcp_provider import Tool, complete_result, create_provider, handle_message, input_required_result, serve_provider, validate_schema_definition
+from maelys_mcp_provider import Resource, ResourceTemplate, Tool, complete_result, create_provider, handle_message, input_required_result, resource_result, serve_provider, validate_schema_definition
 
 
 def fixture_provider():
@@ -97,6 +97,27 @@ class ProviderSdkTest(unittest.TestCase):
         })
         self.assertEqual(second["result"]["resultType"], "complete")
         self.assertEqual(observed[-1].request_state, "opaque")
+
+    def test_resources_are_described_and_read(self):
+        provider = create_provider(
+            "resources", "1",
+            resources=[Resource(uri="fixture://about", name="About", mime_type="text/plain")],
+            resource_templates=[ResourceTemplate(uri_template="fixture://echo/{value}", name="Echo")],
+            read_resource=lambda uri, _context: resource_result([
+                {"uri": uri, "mimeType": "text/plain", "text": f"read {uri}"},
+            ]),
+        )
+        description = provider.description()
+        self.assertNotIn("size", description["resources"][0])
+        self.assertEqual(description["resourceTemplates"][0]["uriTemplate"], "fixture://echo/{value}")
+        response = handle_message(provider, {
+            "protocol": "maelys-provider/2", "id": 10,
+            "method": "provider/readResource", "params": {"uri": "fixture://echo/hello"},
+        })
+        self.assertEqual(response["result"], {"resultType": "complete", "contents": [{
+            "uri": "fixture://echo/hello", "mimeType": "text/plain",
+            "text": "read fixture://echo/hello",
+        }]})
 
 
 if __name__ == "__main__":

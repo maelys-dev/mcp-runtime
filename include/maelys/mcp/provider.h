@@ -4,6 +4,7 @@
 #include <jansson.h>
 
 #include "maelys/mcp/error.h"
+#include "maelys/mcp/resources.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +71,12 @@ typedef maelys_mcp_result_t (*maelys_mcp_provider_call_fn)(
     maelys_mcp_provider_result_t *out_result,
     char **out_error);
 
+typedef maelys_mcp_result_t (*maelys_mcp_provider_read_resource_fn)(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error);
+
 typedef void (*maelys_mcp_provider_destroy_fn)(void *context);
 
 typedef struct maelys_mcp_provider_config {
@@ -77,7 +84,12 @@ typedef struct maelys_mcp_provider_config {
     const char *version;
     const maelys_mcp_tool_t *tools;
     size_t tool_count;
+    const maelys_mcp_resource_t *resources;
+    size_t resource_count;
+    const maelys_mcp_resource_template_t *resource_templates;
+    size_t resource_template_count;
     maelys_mcp_provider_call_fn call;
+    maelys_mcp_provider_read_resource_fn read_resource;
     maelys_mcp_provider_destroy_fn destroy;
     void *context;
 } maelys_mcp_provider_config_t;

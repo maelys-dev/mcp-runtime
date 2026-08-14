@@ -114,6 +114,9 @@ int main(int argc, char **argv) {
     if (status == MAELYS_MCP_OK) {
         status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR);
     }
+    if (status == MAELYS_MCP_OK) {
+        status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES);
+    }
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "Cannot enable MCP modules: %s\n",
             maelys_mcp_result_string(status));

@@ -26,6 +26,10 @@
   bind it to the operation, arguments, expected round and expiration before acting.
 - Request and provider message sizes are bounded.
 - Protocol fields that enter length-unaware C APIs reject embedded NUL bytes.
+- Resource URIs are length-bounded, parsed and normalized behind an opaque uriparser
+  facade; embedded NUL and encoded `%00` are rejected before provider dispatch.
+- Resource contents require exactly one of text/blob, valid bounded base64, and a
+  canonical URI. Parsing never grants filesystem or network access by itself.
 - Provider descriptors are close-on-exec and provider termination is bounded.
 
 ## Trust boundary
@@ -49,3 +53,5 @@ fragment from an MCP request.
 - verify optimistic revisions or preview tokens before writes.
 - treat accepted elicitation as an authorization input, not as a replacement for the
   runtime effect policy or the provider's own invariants.
+- resolve resource URIs inside an application-specific allowlisted root; the generic
+  URI facade deliberately does not turn a syntactically valid URI into an I/O right.

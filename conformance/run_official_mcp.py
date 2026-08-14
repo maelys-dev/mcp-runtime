@@ -27,6 +27,11 @@ SCENARIOS = (
     "tools-call-embedded-resource",
     "tools-call-mixed-content",
     "tools-call-error",
+    "resources-list",
+    "resources-read-text",
+    "resources-read-binary",
+    "resources-templates-read",
+    "sep-2164-resource-not-found",
     "input-required-result-basic-elicitation",
     "input-required-result-capability-check",
 )

@@ -81,11 +81,13 @@ static maelys_mcp_result_t process_exchange(
     }
     if (error) {
         json_t *message = json_object_get(error, "message");
+        json_t *code = json_object_get(error, "code");
         replace_error(out_error, json_is_string(message) &&
             !maelys_mcp_json_string_has_nul(message) ?
             json_string_value(message) : "provider call failed");
+        int not_found = maelys_mcp_json_string_equals(code, "not_found");
         json_decref(response);
-        return MAELYS_MCP_ERR_PROVIDER;
+        return not_found ? MAELYS_MCP_ERR_NOT_FOUND : MAELYS_MCP_ERR_PROVIDER;
     }
     *out_result = json_deep_copy(result);
     json_decref(response);
@@ -160,6 +162,63 @@ static maelys_mcp_result_t process_call(
     }
     json_decref(wire_result);
     return result;
+}
+
+static maelys_mcp_result_t process_read_resource(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error) {
+    maelys_mcp_process_context_t *process = context;
+    json_t *params = json_object();
+    if (!params) return MAELYS_MCP_ERR_MEMORY;
+    if (json_object_set_new(params, "uri", json_string(request->uri)) != 0 ||
+        (request->input_responses && json_object_set(params,
+            "inputResponses", request->input_responses) != 0) ||
+        (request->request_state && json_object_set(params,
+            "requestState", request->request_state) != 0) ||
+        (request->client_capabilities && json_object_set(params,
+            "clientCapabilities", request->client_capabilities) != 0)) {
+        json_decref(params);
+        return MAELYS_MCP_ERR_MEMORY;
+    }
+    json_t *wire = NULL;
+    maelys_mcp_result_t status = process_exchange(process, "provider/readResource",
+        process->call_timeout_ms, params, &wire, out_error);
+    json_decref(params);
+    if (status != MAELYS_MCP_OK) return status;
+    json_t *type = json_is_object(wire) ? json_object_get(wire, "resultType") : NULL;
+    if (maelys_mcp_json_string_equals(type, "complete")) {
+        out_result->type = MAELYS_MCP_RESOURCE_RESULT_COMPLETE;
+        json_t *contents = json_object_get(wire, "contents");
+        if (!json_is_array(contents)) status = MAELYS_MCP_ERR_PROTOCOL;
+        else out_result->contents = json_deep_copy(contents);
+    } else if (maelys_mcp_json_string_equals(type, "input_required")) {
+        out_result->type = MAELYS_MCP_RESOURCE_RESULT_INPUT_REQUIRED;
+        json_t *requests = json_object_get(wire, "inputRequests");
+        json_t *state = json_object_get(wire, "requestState");
+        if ((requests && !json_is_object(requests)) ||
+            (state && (!json_is_string(state) || maelys_mcp_json_string_has_nul(state)))) {
+            status = MAELYS_MCP_ERR_PROTOCOL;
+        } else {
+            out_result->input_requests = requests ? json_deep_copy(requests) : NULL;
+            out_result->request_state = state ? json_deep_copy(state) : NULL;
+        }
+    } else {
+        status = MAELYS_MCP_ERR_PROTOCOL;
+    }
+    if (status == MAELYS_MCP_OK &&
+        ((out_result->type == MAELYS_MCP_RESOURCE_RESULT_COMPLETE && !out_result->contents) ||
+         (json_object_get(wire, "inputRequests") && !out_result->input_requests) ||
+         (json_object_get(wire, "requestState") && !out_result->request_state))) {
+        status = MAELYS_MCP_ERR_MEMORY;
+    }
+    if (status != MAELYS_MCP_OK) {
+        maelys_mcp_resource_result_clear(out_result);
+        replace_error(out_error, "provider returned an invalid resource result");
+    }
+    json_decref(wire);
+    return status;
 }
 
 static long long monotonic_milliseconds(void) {
@@ -308,6 +367,88 @@ maelys_mcp_result_t maelys_mcp_provider_spawn(
     return maelys_mcp_provider_spawn_with_options(&options, out_provider, out_error);
 }
 
+static maelys_mcp_result_t parse_resources(
+    json_t *array,
+    maelys_mcp_resource_t **out_resources,
+    size_t *out_count) {
+    *out_resources = NULL;
+    *out_count = 0;
+    if (!array) return MAELYS_MCP_OK;
+    if (!json_is_array(array)) return MAELYS_MCP_ERR_PROTOCOL;
+    size_t count = json_array_size(array);
+    maelys_mcp_resource_t *resources = count ? calloc(count, sizeof(*resources)) : NULL;
+    if (count && !resources) return MAELYS_MCP_ERR_MEMORY;
+    for (size_t index = 0; index < count; ++index) {
+        json_t *value = json_array_get(array, index);
+        json_t *uri = json_is_object(value) ? json_object_get(value, "uri") : NULL;
+        json_t *name = json_is_object(value) ? json_object_get(value, "name") : NULL;
+        json_t *title = json_is_object(value) ? json_object_get(value, "title") : NULL;
+        json_t *description = json_is_object(value) ? json_object_get(value, "description") : NULL;
+        json_t *mime = json_is_object(value) ? json_object_get(value, "mimeType") : NULL;
+        json_t *size = json_is_object(value) ? json_object_get(value, "size") : NULL;
+        if (!json_is_string(uri) || maelys_mcp_json_string_has_nul(uri) ||
+            !json_is_string(name) || maelys_mcp_json_string_has_nul(name) ||
+            (title && (!json_is_string(title) || maelys_mcp_json_string_has_nul(title))) ||
+            (description && (!json_is_string(description) ||
+                maelys_mcp_json_string_has_nul(description))) ||
+            (mime && (!json_is_string(mime) || maelys_mcp_json_string_has_nul(mime))) ||
+            (size && (!json_is_integer(size) || json_integer_value(size) < 0))) {
+            free(resources);
+            return MAELYS_MCP_ERR_PROTOCOL;
+        }
+        resources[index] = (maelys_mcp_resource_t){
+            .uri = json_string_value(uri), .name = json_string_value(name),
+            .title = title ? json_string_value(title) : NULL,
+            .description = description ? json_string_value(description) : NULL,
+            .mime_type = mime ? json_string_value(mime) : NULL,
+            .has_size = size != NULL,
+            .size = size ? (long long)json_integer_value(size) : 0
+        };
+    }
+    *out_resources = resources;
+    *out_count = count;
+    return MAELYS_MCP_OK;
+}
+
+static maelys_mcp_result_t parse_resource_templates(
+    json_t *array,
+    maelys_mcp_resource_template_t **out_templates,
+    size_t *out_count) {
+    *out_templates = NULL;
+    *out_count = 0;
+    if (!array) return MAELYS_MCP_OK;
+    if (!json_is_array(array)) return MAELYS_MCP_ERR_PROTOCOL;
+    size_t count = json_array_size(array);
+    maelys_mcp_resource_template_t *templates = count ? calloc(count, sizeof(*templates)) : NULL;
+    if (count && !templates) return MAELYS_MCP_ERR_MEMORY;
+    for (size_t index = 0; index < count; ++index) {
+        json_t *value = json_array_get(array, index);
+        json_t *uri = json_is_object(value) ? json_object_get(value, "uriTemplate") : NULL;
+        json_t *name = json_is_object(value) ? json_object_get(value, "name") : NULL;
+        json_t *title = json_is_object(value) ? json_object_get(value, "title") : NULL;
+        json_t *description = json_is_object(value) ? json_object_get(value, "description") : NULL;
+        json_t *mime = json_is_object(value) ? json_object_get(value, "mimeType") : NULL;
+        if (!json_is_string(uri) || maelys_mcp_json_string_has_nul(uri) ||
+            !json_is_string(name) || maelys_mcp_json_string_has_nul(name) ||
+            (title && (!json_is_string(title) || maelys_mcp_json_string_has_nul(title))) ||
+            (description && (!json_is_string(description) ||
+                maelys_mcp_json_string_has_nul(description))) ||
+            (mime && (!json_is_string(mime) || maelys_mcp_json_string_has_nul(mime)))) {
+            free(templates);
+            return MAELYS_MCP_ERR_PROTOCOL;
+        }
+        templates[index] = (maelys_mcp_resource_template_t){
+            .uri_template = json_string_value(uri), .name = json_string_value(name),
+            .title = title ? json_string_value(title) : NULL,
+            .description = description ? json_string_value(description) : NULL,
+            .mime_type = mime ? json_string_value(mime) : NULL
+        };
+    }
+    *out_templates = templates;
+    *out_count = count;
+    return MAELYS_MCP_OK;
+}
+
 maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     const maelys_mcp_provider_process_options_t *options,
     maelys_mcp_provider_t **out_provider,
@@ -346,6 +487,8 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     json_t *name = json_object_get(description, "name");
     json_t *version = json_object_get(description, "version");
     json_t *tools_json = json_object_get(description, "tools");
+    json_t *resources_json = json_object_get(description, "resources");
+    json_t *templates_json = json_object_get(description, "resourceTemplates");
     if (!json_is_string(name) || maelys_mcp_json_string_has_nul(name) ||
         !json_is_string(version) || maelys_mcp_json_string_has_nul(version) ||
         !json_is_array(tools_json)) {
@@ -404,16 +547,40 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
             .effect = parsed_effect
         };
     }
+    maelys_mcp_resource_t *resources = NULL;
+    size_t resource_count = 0;
+    maelys_mcp_resource_template_t *templates = NULL;
+    size_t template_count = 0;
+    status = parse_resources(resources_json, &resources, &resource_count);
+    if (status == MAELYS_MCP_OK) {
+        status = parse_resource_templates(templates_json, &templates, &template_count);
+    }
+    if (status != MAELYS_MCP_OK) {
+        free(resources);
+        free(templates);
+        free(tools);
+        json_decref(description);
+        process_destroy(process);
+        replace_error(out_error, "provider resource description is invalid");
+        return status;
+    }
     maelys_mcp_provider_config_t config = {
         .name = json_string_value(name),
         .version = json_string_value(version),
         .tools = tools,
         .tool_count = count,
+        .resources = resources,
+        .resource_count = resource_count,
+        .resource_templates = templates,
+        .resource_template_count = template_count,
         .call = process_call,
+        .read_resource = (resource_count || template_count) ? process_read_resource : NULL,
         .destroy = process_destroy,
         .context = process
     };
     status = maelys_mcp_provider_create(&config, out_provider);
+    free(resources);
+    free(templates);
     free(tools);
     json_decref(description);
     if (status != MAELYS_MCP_OK) process_destroy(process);

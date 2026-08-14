@@ -4,12 +4,14 @@
 
 extern const maelys_mcp_module_descriptor_t maelys_mcp_tools_module;
 extern const maelys_mcp_module_descriptor_t maelys_mcp_mrtr_module;
+extern const maelys_mcp_module_descriptor_t maelys_mcp_resources_module;
 
 const maelys_mcp_module_descriptor_t *maelys_mcp_module_descriptor(
     maelys_mcp_module_kind_t kind) {
     switch (kind) {
         case MAELYS_MCP_MODULE_TOOLS: return &maelys_mcp_tools_module;
         case MAELYS_MCP_MODULE_MRTR: return &maelys_mcp_mrtr_module;
+        case MAELYS_MCP_MODULE_RESOURCES: return &maelys_mcp_resources_module;
     }
     return NULL;
 }

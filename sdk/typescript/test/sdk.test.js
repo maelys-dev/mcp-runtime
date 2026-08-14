@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { completeResult, createProvider, describeProvider, handleProviderMessage, inputRequiredResult, validateSchemaDefinition } from "../src/index.js";
+import { completeResult, createProvider, describeProvider, handleProviderMessage, inputRequiredResult, resourceResult, validateSchemaDefinition } from "../src/index.js";
 
 function fixtureProvider() {
   return createProvider({
@@ -100,4 +100,25 @@ test("schema validation rejects unsupported keywords and drift-prone required fi
     version: "1",
     tools: [fixtureProvider().tools[0], fixtureProvider().tools[0]],
   }), /duplicate provider tool/);
+});
+
+test("resources are described and read through the private provider contract", async () => {
+  const provider = createProvider({
+    name: "resources",
+    version: "1",
+    resources: [{ uri: "fixture://about", name: "About", mimeType: "text/plain" }],
+    resourceTemplates: [{ uriTemplate: "fixture://echo/{value}", name: "Echo" }],
+    readResource: async (uri) => resourceResult([{ uri, mimeType: "text/plain", text: `read ${uri}` }]),
+  });
+  const description = describeProvider(provider);
+  assert.deepEqual(description.resources, [{ uri: "fixture://about", name: "About", mimeType: "text/plain" }]);
+  assert.equal(description.resources[0].size, undefined);
+  assert.equal(description.resourceTemplates[0].uriTemplate, "fixture://echo/{value}");
+  const response = await handleProviderMessage(provider, {
+    protocol: "maelys-provider/2", id: 10, method: "provider/readResource",
+    params: { uri: "fixture://echo/hello" },
+  });
+  assert.deepEqual(response.result, { resultType: "complete", contents: [{
+    uri: "fixture://echo/hello", mimeType: "text/plain", text: "read fixture://echo/hello",
+  }] });
 });

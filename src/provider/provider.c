@@ -1,4 +1,5 @@
 #include "src/internal/internal.h"
+#include "maelys/mcp/uri.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,32 @@ static void clear_tools(maelys_mcp_owned_tool_t *tools, size_t count) {
     free(tools);
 }
 
+static void clear_resources(maelys_mcp_owned_resource_t *resources, size_t count) {
+    if (!resources) return;
+    for (size_t index = 0; index < count; ++index) {
+        free(resources[index].uri);
+        free(resources[index].name);
+        free(resources[index].title);
+        free(resources[index].description);
+        free(resources[index].mime_type);
+    }
+    free(resources);
+}
+
+static void clear_resource_templates(
+    maelys_mcp_owned_resource_template_t *templates,
+    size_t count) {
+    if (!templates) return;
+    for (size_t index = 0; index < count; ++index) {
+        free(templates[index].uri_template);
+        free(templates[index].name);
+        free(templates[index].title);
+        free(templates[index].description);
+        free(templates[index].mime_type);
+    }
+    free(templates);
+}
+
 void maelys_mcp_provider_result_init(maelys_mcp_provider_result_t *result) {
     if (result) memset(result, 0, sizeof(*result));
 }
@@ -64,8 +91,11 @@ maelys_mcp_result_t maelys_mcp_provider_create(
     const maelys_mcp_provider_config_t *config,
     maelys_mcp_provider_t **out_provider) {
     if (!config || !out_provider || !config->name || !*config->name ||
-        !config->version || !*config->version || !config->call ||
-        (config->tool_count && !config->tools)) {
+        !config->version || !*config->version ||
+        (config->tool_count && (!config->tools || !config->call)) ||
+        (config->resource_count && !config->resources) ||
+        (config->resource_template_count && !config->resource_templates) ||
+        ((config->resource_count || config->resource_template_count) && !config->read_resource)) {
         return MAELYS_MCP_ERR_ARGUMENT;
     }
     *out_provider = NULL;
@@ -74,13 +104,25 @@ maelys_mcp_result_t maelys_mcp_provider_create(
     provider->name = maelys_mcp_strdup(config->name);
     provider->version = maelys_mcp_strdup(config->version);
     provider->call = config->call;
+    provider->read_resource = config->read_resource;
     provider->destroy = config->destroy;
     provider->context = config->context;
     provider->tool_count = config->tool_count;
+    provider->resource_count = config->resource_count;
+    provider->resource_template_count = config->resource_template_count;
     if (!provider->name || !provider->version) goto memory_error;
     if (config->tool_count) {
         provider->tools = calloc(config->tool_count, sizeof(*provider->tools));
         if (!provider->tools) goto memory_error;
+    }
+    if (config->resource_count) {
+        provider->resources = calloc(config->resource_count, sizeof(*provider->resources));
+        if (!provider->resources) goto memory_error;
+    }
+    if (config->resource_template_count) {
+        provider->resource_templates = calloc(config->resource_template_count,
+            sizeof(*provider->resource_templates));
+        if (!provider->resource_templates) goto memory_error;
     }
     for (size_t index = 0; index < config->tool_count; ++index) {
         const maelys_mcp_tool_t *source = &config->tools[index];
@@ -105,17 +147,71 @@ maelys_mcp_result_t maelys_mcp_provider_create(
         target->provider = provider;
         if (!target->name || !target->title || !target->description) goto memory_error;
     }
+    for (size_t index = 0; index < config->resource_count; ++index) {
+        const maelys_mcp_resource_t *source = &config->resources[index];
+        maelys_mcp_owned_resource_t *target = &provider->resources[index];
+        if (!source->uri || !source->name || !*source->name ||
+            (source->has_size && source->size < 0)) {
+            goto argument_error;
+        }
+        maelys_uri_t *uri = NULL;
+        maelys_uri_options_t uri_options = {.max_bytes = 8192u, .require_scheme = 1};
+        if (maelys_uri_parse(source->uri, strlen(source->uri), &uri_options,
+            &uri, NULL) != MAELYS_MCP_OK) goto argument_error;
+        for (size_t previous = 0; previous < index; ++previous) {
+            if (strcmp(maelys_uri_canonical(uri), provider->resources[previous].uri) == 0) {
+                maelys_uri_destroy(uri);
+                goto argument_error;
+            }
+        }
+        target->uri = maelys_mcp_strdup(maelys_uri_canonical(uri));
+        maelys_uri_destroy(uri);
+        target->name = maelys_mcp_strdup(source->name);
+        target->title = maelys_mcp_strdup(source->title);
+        target->description = maelys_mcp_strdup(source->description);
+        target->mime_type = maelys_mcp_strdup(source->mime_type);
+        target->has_size = source->has_size;
+        target->size = source->size;
+        target->provider = provider;
+        if (!target->uri || !target->name || !target->title || !target->description ||
+            !target->mime_type) goto memory_error;
+    }
+    for (size_t index = 0; index < config->resource_template_count; ++index) {
+        const maelys_mcp_resource_template_t *source = &config->resource_templates[index];
+        maelys_mcp_owned_resource_template_t *target = &provider->resource_templates[index];
+        if (!source->uri_template || !source->name || !*source->name ||
+            maelys_uri_template_validate(source->uri_template,
+                strlen(source->uri_template), 8192u, NULL) != MAELYS_MCP_OK) {
+            goto argument_error;
+        }
+        for (size_t previous = 0; previous < index; ++previous) {
+            if (strcmp(source->uri_template,
+                provider->resource_templates[previous].uri_template) == 0) goto argument_error;
+        }
+        target->uri_template = maelys_mcp_strdup(source->uri_template);
+        target->name = maelys_mcp_strdup(source->name);
+        target->title = maelys_mcp_strdup(source->title);
+        target->description = maelys_mcp_strdup(source->description);
+        target->mime_type = maelys_mcp_strdup(source->mime_type);
+        target->provider = provider;
+        if (!target->uri_template || !target->name || !target->title ||
+            !target->description || !target->mime_type) goto memory_error;
+    }
     *out_provider = provider;
     return MAELYS_MCP_OK;
 
 argument_error:
     clear_tools(provider->tools, provider->tool_count);
+    clear_resources(provider->resources, provider->resource_count);
+    clear_resource_templates(provider->resource_templates, provider->resource_template_count);
     free(provider->name);
     free(provider->version);
     free(provider);
     return MAELYS_MCP_ERR_ARGUMENT;
 memory_error:
     clear_tools(provider->tools, provider->tool_count);
+    clear_resources(provider->resources, provider->resource_count);
+    clear_resource_templates(provider->resource_templates, provider->resource_template_count);
     free(provider->name);
     free(provider->version);
     free(provider);
@@ -126,6 +222,8 @@ void maelys_mcp_provider_destroy(maelys_mcp_provider_t *provider) {
     if (!provider) return;
     if (provider->destroy) provider->destroy(provider->context);
     clear_tools(provider->tools, provider->tool_count);
+    clear_resources(provider->resources, provider->resource_count);
+    clear_resource_templates(provider->resource_templates, provider->resource_template_count);
     free(provider->name);
     free(provider->version);
     free(provider);

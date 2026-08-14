@@ -88,8 +88,14 @@ maelys_mcp_result_t maelys_mcp_runtime_add_provider(
     maelys_mcp_provider_t *provider,
     char **out_error) {
     if (!runtime || !provider) return MAELYS_MCP_ERR_ARGUMENT;
-    if (!maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_TOOLS)) {
+    if (provider->tool_count &&
+        !maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_TOOLS)) {
         set_error(out_error, "tools module is not enabled");
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    if ((provider->resource_count || provider->resource_template_count) &&
+        !maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_RESOURCES)) {
+        set_error(out_error, "resources module is not enabled");
         return MAELYS_MCP_ERR_ARGUMENT;
     }
     if (runtime->provider_count == runtime->max_providers) {
@@ -102,6 +108,30 @@ maelys_mcp_result_t maelys_mcp_runtime_add_provider(
             for (size_t tool_index = 0; tool_index < existing->tool_count; ++tool_index) {
                 if (strcmp(provider->tools[candidate].name, existing->tools[tool_index].name) == 0) {
                     set_error(out_error, "duplicate tool name");
+                    return MAELYS_MCP_ERR_ARGUMENT;
+                }
+            }
+        }
+    }
+    for (size_t candidate = 0; candidate < provider->resource_count; ++candidate) {
+        for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
+            maelys_mcp_provider_t *existing = runtime->providers[provider_index];
+            for (size_t index = 0; index < existing->resource_count; ++index) {
+                if (strcmp(provider->resources[candidate].uri,
+                    existing->resources[index].uri) == 0) {
+                    set_error(out_error, "duplicate resource URI");
+                    return MAELYS_MCP_ERR_ARGUMENT;
+                }
+            }
+        }
+    }
+    for (size_t candidate = 0; candidate < provider->resource_template_count; ++candidate) {
+        for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
+            maelys_mcp_provider_t *existing = runtime->providers[provider_index];
+            for (size_t index = 0; index < existing->resource_template_count; ++index) {
+                if (strcmp(provider->resource_templates[candidate].uri_template,
+                    existing->resource_templates[index].uri_template) == 0) {
+                    set_error(out_error, "duplicate resource template");
                     return MAELYS_MCP_ERR_ARGUMENT;
                 }
             }

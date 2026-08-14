@@ -53,7 +53,20 @@ static json_t *description(void) {
     json_object_set_new(sum, "inputSchema", sum_input);
     json_object_set_new(sum, "effect", json_string("read"));
     json_array_append_new(tools, sum);
-    return json_pack("{s:s,s:s,s:o}", "name", "example", "version", "0.1.0", "tools", tools);
+    json_t *resources = json_pack("[{s:s,s:s,s:s,s:i}]",
+        "uri", "example://about", "name", "About example provider",
+        "mimeType", "text/plain", "size", 24);
+    json_t *templates = json_pack("[{s:s,s:s,s:s}]",
+        "uriTemplate", "example://echo/{value}", "name", "Echo resource",
+        "mimeType", "text/plain");
+    if (!resources || !templates) {
+        if (resources) json_decref(resources);
+        if (templates) json_decref(templates);
+        json_decref(tools);
+        return NULL;
+    }
+    return json_pack("{s:s,s:s,s:o,s:o,s:o}", "name", "example", "version", "0.4.0",
+        "tools", tools, "resources", resources, "resourceTemplates", templates);
 }
 
 static json_t *call_tool(json_t *params, const char **out_error) {
@@ -81,6 +94,24 @@ static json_t *call_tool(json_t *params, const char **out_error) {
     return NULL;
 }
 
+static json_t *read_resource(json_t *params, const char **out_error) {
+    json_t *uri = json_is_object(params) ? json_object_get(params, "uri") : NULL;
+    if (!json_is_string(uri)) {
+        *out_error = "resource uri is required";
+        return NULL;
+    }
+    const char *value = json_string_value(uri);
+    if (strcmp(value, "example://about") != 0 &&
+        strncmp(value, "example://echo/", strlen("example://echo/")) != 0) {
+        *out_error = "resource not found";
+        return NULL;
+    }
+    const char *text = strcmp(value, "example://about") == 0 ?
+        "Example resource provider" : value + strlen("example://echo/");
+    return json_pack("{s:s,s:[{s:s,s:s,s:s}]}", "resultType", "complete", "contents",
+        "uri", value, "mimeType", "text/plain", "text", text);
+}
+
 int main(void) {
     char *line = NULL;
     size_t capacity = 0;
@@ -100,6 +131,12 @@ int main(void) {
             json_t *result = call_tool(params, &message);
             if (result) json_object_set_new(response, "result", result);
             else json_object_set_new(response, "error", json_pack("{s:i,s:s}", "code", 1, "message", message));
+        } else if (json_is_string(method) && strcmp(json_string_value(method), "provider/readResource") == 0) {
+            const char *message = NULL;
+            json_t *result = read_resource(params, &message);
+            if (result) json_object_set_new(response, "result", result);
+            else json_object_set_new(response, "error", json_pack("{s:s,s:s}",
+                "code", "not_found", "message", message));
         } else if (json_is_string(method) && strcmp(json_string_value(method), "provider/shutdown") == 0) {
             json_object_set_new(response, "result", json_object());
             should_exit = 1;

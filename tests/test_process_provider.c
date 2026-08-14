@@ -75,6 +75,7 @@ int main(int argc, char **argv) {
     ASSERT_TRUE(maelys_mcp_runtime_create(&config, &runtime) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) == MAELYS_MCP_OK);
 
     json_t *params = json_pack("{s:s,s:{s:s},s:{s:s,s:{s:s,s:s},s:{}}}",
@@ -91,6 +92,39 @@ int main(int argc, char **argv) {
     json_t *structured = json_object_get(result, "structuredContent");
     ASSERT_TRUE(json_is_object(structured));
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(structured, "message")), "external") == 0);
+    json_decref(response);
+    json_decref(request);
+
+    params = json_pack("{s:s,s:{s:s,s:{s:s,s:s},s:{}}}",
+        "uri", "example://missing",
+        "_meta",
+            "io.modelcontextprotocol/protocolVersion", MAELYS_MCP_PROTOCOL_MODERN,
+            "io.modelcontextprotocol/clientInfo", "name", "test", "version", "1",
+            "io.modelcontextprotocol/clientCapabilities");
+    request = json_pack("{s:s,s:i,s:s,s:o}",
+        "jsonrpc", "2.0", "id", 3, "method", "resources/read", "params", params);
+    response = maelys_mcp_runtime_handle(runtime, request);
+    json_t *response_error = json_object_get(response, "error");
+    ASSERT_TRUE(json_integer_value(json_object_get(response_error, "code")) == -32602);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(
+        json_object_get(response_error, "data"), "uri")), "example://missing") == 0);
+    json_decref(response);
+    json_decref(request);
+
+    params = json_pack("{s:s,s:{s:s,s:{s:s,s:s},s:{}}}",
+        "uri", "example://echo/external-resource",
+        "_meta",
+            "io.modelcontextprotocol/protocolVersion", MAELYS_MCP_PROTOCOL_MODERN,
+            "io.modelcontextprotocol/clientInfo", "name", "test", "version", "1",
+            "io.modelcontextprotocol/clientCapabilities");
+    request = json_pack("{s:s,s:i,s:s,s:o}",
+        "jsonrpc", "2.0", "id", 2, "method", "resources/read", "params", params);
+    response = maelys_mcp_runtime_handle(runtime, request);
+    result = json_object_get(response, "result");
+    json_t *contents = json_object_get(result, "contents");
+    ASSERT_TRUE(json_array_size(contents) == 1u);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(json_array_get(contents, 0), "text")),
+        "external-resource") == 0);
     json_decref(response);
     json_decref(request);
     maelys_mcp_runtime_destroy(runtime);

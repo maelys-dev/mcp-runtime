@@ -19,13 +19,17 @@ typedef struct maelys_mcp_runtime maelys_mcp_runtime_t;
 
 typedef enum maelys_mcp_operation {
     MAELYS_MCP_OPERATION_LIST = 0,
-    MAELYS_MCP_OPERATION_CALL = 1
+    MAELYS_MCP_OPERATION_CALL = 1,
+    MAELYS_MCP_OPERATION_RESOURCE_LIST = 2,
+    MAELYS_MCP_OPERATION_RESOURCE_TEMPLATE_LIST = 3,
+    MAELYS_MCP_OPERATION_RESOURCE_READ = 4
 } maelys_mcp_operation_t;
 
 typedef struct maelys_mcp_request_context {
     const char *protocol_version;
     const char *client_name;
     const char *tool_name;
+    const char *resource_uri;
     maelys_mcp_operation_t operation;
     maelys_mcp_tool_effect_t effect;
 } maelys_mcp_request_context_t;

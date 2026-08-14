@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 - 2026-08-14
+
+- Add an independently enabled Resources module implementing `resources/list`,
+  `resources/templates/list`, and `resources/read` for both supported MCP eras.
+- Extend `maelys-provider/2` and the TypeScript/Python provider SDKs with static
+  resources, URI templates, reads, and multi-round resource results.
+- Introduce the opaque `maelys-uri` security facade over uriparser: exact-length
+  input, RFC 3986 normalization, embedded/encoded NUL rejection, and bounded URI
+  template validation.
+- Validate text/blob exclusivity, MIME fields, base64 payloads, canonical URIs, and
+  optional resource sizes before data crosses the provider boundary.
+- Add native, process-provider, SDK, sanitizer, analyzer, and URI fuzz coverage.
+
 ## 0.3.0 - 2026-08-14
 
 - Replace implicit method dispatch with an explicit module registry and derive

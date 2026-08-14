@@ -3,17 +3,17 @@ AR ?= ar
 PKG_CONFIG ?= pkg-config
 ANALYZER ?= clang
 PREFIX ?= /usr/local
-VERSION := 0.3.0
+VERSION := 0.4.0
 DOCKER ?= docker
 DOCKER_PLATFORM ?= linux/arm64
 ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
 FUZZ_CC ?= clang
 MCP_CONFORMANCE_PACKAGE ?= @modelcontextprotocol/conformance@0.2.0-alpha.11
 
-CPPFLAGS += -Iinclude -I. -DMAELYS_MCP_VERSION='"$(VERSION)"' $(shell $(PKG_CONFIG) --cflags jansson)
+CPPFLAGS += -Iinclude -I. -DMAELYS_MCP_VERSION='"$(VERSION)"' $(shell $(PKG_CONFIG) --cflags jansson liburiparser)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L
-LDLIBS += $(shell $(PKG_CONFIG) --libs jansson)
+LDLIBS += $(shell $(PKG_CONFIG) --libs jansson liburiparser)
 
 BUILD := build
 OBJ := $(BUILD)/obj
@@ -32,11 +32,14 @@ LIB_SOURCES := \
 	src/jsonrpc/core.c \
 	src/core/common.c \
 	src/core/content.c \
+	src/core/uri.c \
+	src/core/resources.c \
 	src/core/schema.c \
 	src/core/runtime.c \
 	src/modules/registry.c \
 	src/modules/mrtr.c \
 	src/modules/tools.c \
+	src/modules/resources.c \
 	src/provider/provider.c \
 	src/provider/process_provider.c \
 	src/transport/stdio.c \
@@ -99,15 +102,20 @@ $(BIN)/test-modules-content-mrtr: $(OBJ)/tests/test_modules_content_mrtr.o $(LIB
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
+$(BIN)/test-resources: $(OBJ)/tests/test_resources.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
 $(OBJ)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
 	$(BIN)/test-modules-content-mrtr
+	$(BIN)/test-resources
 	$(BIN)/test-runtime
 	$(BIN)/test-runtime-protocol
 	$(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
@@ -162,11 +170,11 @@ install: all
 asan:
 	$(MAKE) clean
 	ASAN_OPTIONS=$(ASAN_OPTIONS_VALUE) UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-	$(MAKE) check CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -fsanitize=address,undefined -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson) -fsanitize=address,undefined"
+	$(MAKE) check CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -fsanitize=address,undefined -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -fsanitize=address,undefined"
 
 FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
-FUZZ_BINARIES := $(BUILD)/fuzz/json-lines $(BUILD)/fuzz/content-length $(BUILD)/fuzz/schema $(BUILD)/fuzz/content
+FUZZ_BINARIES := $(BUILD)/fuzz/json-lines $(BUILD)/fuzz/content-length $(BUILD)/fuzz/schema $(BUILD)/fuzz/content $(BUILD)/fuzz/uri
 
 $(BUILD)/fuzz/json-lines: fuzz/fuzz_json_lines.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
@@ -184,19 +192,25 @@ $(BUILD)/fuzz/content: fuzz/fuzz_content.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
+$(BUILD)/fuzz/uri: fuzz/fuzz_uri.c $(LIB_SOURCES)
+	@mkdir -p $(@D)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
+
 fuzz-build: $(FUZZ_BINARIES)
 
 fuzz-smoke: fuzz-build
 	rm -rf $(BUILD)/fuzz-corpus
-	mkdir -p $(BUILD)/fuzz-corpus/json-lines $(BUILD)/fuzz-corpus/content-length $(BUILD)/fuzz-corpus/schema $(BUILD)/fuzz-corpus/content
+	mkdir -p $(BUILD)/fuzz-corpus/json-lines $(BUILD)/fuzz-corpus/content-length $(BUILD)/fuzz-corpus/schema $(BUILD)/fuzz-corpus/content $(BUILD)/fuzz-corpus/uri
 	cp fuzz/seeds/json-lines/* $(BUILD)/fuzz-corpus/json-lines/
 	printf 'Content-Length: 2\r\n\r\n{}' >$(BUILD)/fuzz-corpus/content-length/frame
 	cp fuzz/seeds/schema/* $(BUILD)/fuzz-corpus/schema/
 	cp fuzz/seeds/content/* $(BUILD)/fuzz-corpus/content/
+	cp fuzz/seeds/uri/* $(BUILD)/fuzz-corpus/uri/
 	$(BUILD)/fuzz/json-lines -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/json-lines
 	$(BUILD)/fuzz/content-length -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/content-length
 	$(BUILD)/fuzz/schema -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/schema
 	$(BUILD)/fuzz/content -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/content
+	$(BUILD)/fuzz/uri -runs=2000 -max_len=8192 $(BUILD)/fuzz-corpus/uri
 
 asan-linux-image:
 	$(DOCKER) build --platform $(DOCKER_PLATFORM) \

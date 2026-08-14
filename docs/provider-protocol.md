@@ -22,14 +22,22 @@ Describe, call and shutdown deadlines are independently configurable. Defaults a
 ```
 
 A response preserves `protocol` and `id` and contains exactly one of `result` or
-`error`.
+`error`. A resource handler that does not recognize an URI returns the private error
+code `not_found`; the runtime maps it to MCP Invalid Params (`-32602`) without exposing
+the provider protocol.
 
 ## `provider/describe`
 
-The result contains `name`, `version`, and the complete `tools` array. Each tool has a
+The result contains `name`, `version`, and the complete `tools` array. It may also
+contain `resources` and `resourceTemplates`. Each tool has a
 globally unique name, description, object-root `inputSchema`, optional `outputSchema`,
 and mandatory `effect`: `read`, `preview`, `apply`, `commit`, or `execute`. Invalid or
 unsupported schema definitions fail provider registration.
+
+Static resources declare `uri`, `name`, optional presentation fields, MIME type, and
+optional non-negative `size`. Templates declare `uriTemplate` and presentation fields.
+Every URI is normalized behind the runtime's opaque URI facade before publication.
+Declaring either catalog requires a `provider/readResource` handler.
 
 ## `provider/call`
 
@@ -83,6 +91,24 @@ opaque state against the operation, arguments and expected round before mutating
 The runtime rejects input requests for capabilities the client did not declare with
 MCP error `-32021`.
 
+## `provider/readResource`
+
+The request contains a canonical `uri` and the same optional multi-round context as a
+tool call. A complete result contains a non-empty `contents` array. Every item repeats
+its URI and contains exactly one of UTF-8 `text` or base64 `blob`, plus optional
+`mimeType` and `_meta`.
+
+```json
+{
+  "resultType": "complete",
+  "contents": [{
+    "uri": "hermes://repository/course.mdx",
+    "mimeType": "text/markdown",
+    "text": "# Course"
+  }]
+}
+```
+
 ## Content validation
 
 The runtime validates the shape of every content block, MIME family for image/audio,
@@ -99,4 +125,4 @@ not terminate within its deadline receives `SIGTERM`, then `SIGKILL` after one f
 bounded grace period.
 
 Version 2 is a private provider ABI, not another public MCP protocol. Version 1 is not
-accepted by the 0.3 runtime; providers must upgrade atomically with the host.
+accepted; providers must upgrade atomically with the host.

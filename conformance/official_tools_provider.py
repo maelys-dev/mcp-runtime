@@ -8,7 +8,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sdk" / "python" / "src"))
 
 from maelys_mcp_provider import (
-    Tool, complete_result, create_provider, input_required_result, serve_provider,
+    ProviderNotFoundError, Resource, ResourceTemplate, Tool, complete_result,
+    create_provider, input_required_result, resource_result, serve_provider,
 )
 
 
@@ -95,9 +96,25 @@ def intentional_error(_arguments: dict[str, object], _context: object) -> object
     raise RuntimeError("This tool intentionally returns an error for testing")
 
 
+def read_resource(uri: str, _context: object):
+    if uri == "test://static-text":
+        return resource_result([{
+            "uri": uri, "mimeType": "text/plain",
+            "text": "This is the content of the static text resource.",
+        }])
+    if uri == "test://static-binary":
+        return resource_result([{"uri": uri, "mimeType": "image/png", "blob": PNG}])
+    if uri.startswith("test://template/") and uri.endswith("/data"):
+        parameter = uri.removeprefix("test://template/").removesuffix("/data")
+        return resource_result([{
+            "uri": uri, "mimeType": "text/plain", "text": f"Template value: {parameter}",
+        }])
+    raise ProviderNotFoundError(f"resource not found: {uri}")
+
+
 PROVIDER = create_provider(
     "official-conformance",
-    "0.3.0",
+    "0.4.0",
     (
         Tool(
             name="test_simple_text",
@@ -131,6 +148,17 @@ PROVIDER = create_provider(
             handler=intentional_error,
         ),
     ),
+    resources=(
+        Resource(uri="test://static-text", name="Static text",
+            description="Official conformance text resource", mime_type="text/plain"),
+        Resource(uri="test://static-binary", name="Static binary",
+            description="Official conformance binary resource", mime_type="image/png"),
+    ),
+    resource_templates=(ResourceTemplate(
+        uri_template="test://template/{id}/data", name="Template data",
+        description="Official conformance resource template", mime_type="text/plain",
+    ),),
+    read_resource=read_resource,
 )
 
 

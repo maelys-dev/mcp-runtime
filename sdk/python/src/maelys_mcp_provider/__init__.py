@@ -80,11 +80,46 @@ def input_required_result(
         request_state=request_state)
 
 
+@dataclass(frozen=True)
+class ResourceResult:
+    result_type: str
+    contents: list[JsonObject] | None = None
+    input_requests: JsonObject | None = None
+    request_state: str | None = None
+
+    def payload(self) -> JsonObject:
+        if self.result_type == "complete":
+            if not isinstance(self.contents, list) or not self.contents:
+                raise TypeError("resource result contents must be a non-empty list")
+            return {"resultType": "complete", "contents": self.contents}
+        if self.result_type == "input_required":
+            return ProviderResult("input_required", input_requests=self.input_requests,
+                request_state=self.request_state).payload()
+        raise TypeError("resource result_type must be complete or input_required")
+
+
+def resource_result(contents: list[JsonObject]) -> ResourceResult:
+    return ResourceResult("complete", contents=contents)
+
+
+def resource_input_required_result(
+    *, input_requests: JsonObject | None = None,
+    request_state: str | None = None,
+) -> ResourceResult:
+    return ResourceResult("input_required", input_requests=input_requests,
+        request_state=request_state)
+
+
 ToolHandler = Callable[[JsonObject, CallContext], ProviderResult]
+ResourceHandler = Callable[[str, CallContext], ResourceResult]
 
 
 class DuplicateKeyError(ValueError):
     pass
+
+
+class ProviderNotFoundError(LookupError):
+    """Signal that a requested provider resource does not exist."""
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> JsonObject:
@@ -202,16 +237,74 @@ class Tool:
 
 
 @dataclass(frozen=True)
+class Resource:
+    uri: str
+    name: str
+    title: str | None = None
+    description: str | None = None
+    mime_type: str | None = None
+    size: int | None = None
+
+    def descriptor(self) -> JsonObject:
+        result: JsonObject = {"uri": self.uri, "name": self.name}
+        if self.title is not None:
+            result["title"] = self.title
+        if self.description is not None:
+            result["description"] = self.description
+        if self.mime_type is not None:
+            result["mimeType"] = self.mime_type
+        if self.size is not None:
+            result["size"] = self.size
+        return result
+
+
+@dataclass(frozen=True)
+class ResourceTemplate:
+    uri_template: str
+    name: str
+    title: str | None = None
+    description: str | None = None
+    mime_type: str | None = None
+
+    def descriptor(self) -> JsonObject:
+        result: JsonObject = {"uriTemplate": self.uri_template, "name": self.name}
+        if self.title is not None:
+            result["title"] = self.title
+        if self.description is not None:
+            result["description"] = self.description
+        if self.mime_type is not None:
+            result["mimeType"] = self.mime_type
+        return result
+
+
+@dataclass(frozen=True)
 class Provider:
     name: str
     version: str
     tools: tuple[Tool, ...]
+    resources: tuple[Resource, ...] = ()
+    resource_templates: tuple[ResourceTemplate, ...] = ()
+    read_resource: ResourceHandler | None = None
 
     def description(self) -> JsonObject:
-        return {"name": self.name, "version": self.version, "tools": [tool.descriptor() for tool in self.tools]}
+        result: JsonObject = {"name": self.name, "version": self.version,
+            "tools": [tool.descriptor() for tool in self.tools]}
+        if self.resources:
+            result["resources"] = [resource.descriptor() for resource in self.resources]
+        if self.resource_templates:
+            result["resourceTemplates"] = [resource.descriptor() for resource in self.resource_templates]
+        return result
 
 
-def create_provider(name: str, version: str, tools: Iterable[Tool]) -> Provider:
+def create_provider(
+    name: str,
+    version: str,
+    tools: Iterable[Tool] = (),
+    *,
+    resources: Iterable[Resource] = (),
+    resource_templates: Iterable[ResourceTemplate] = (),
+    read_resource: ResourceHandler | None = None,
+) -> Provider:
     _string(name, "provider.name")
     _string(version, "provider.version")
     prepared = tuple(tools)
@@ -233,7 +326,34 @@ def create_provider(name: str, version: str, tools: Iterable[Tool]) -> Provider:
             raise TypeError(f"tools[{index}].inputSchema.type must be object")
         if tool.output_schema is not None:
             validate_schema_definition(tool.output_schema, f"tools[{index}].outputSchema")
-    return Provider(name=name, version=version, tools=prepared)
+    prepared_resources = tuple(resources)
+    prepared_templates = tuple(resource_templates)
+    resource_uris: set[str] = set()
+    for index, resource in enumerate(prepared_resources):
+        if not isinstance(resource, Resource):
+            raise TypeError(f"resources[{index}] must be a Resource")
+        _string(resource.uri, f"resources[{index}].uri")
+        _string(resource.name, f"resources[{index}].name")
+        if resource.uri in resource_uris:
+            raise TypeError(f"duplicate provider resource: {resource.uri}")
+        resource_uris.add(resource.uri)
+        if resource.size is not None and (isinstance(resource.size, bool) or
+                not isinstance(resource.size, int) or resource.size < 0):
+            raise TypeError(f"resources[{index}].size must be a non-negative integer")
+    template_uris: set[str] = set()
+    for index, resource in enumerate(prepared_templates):
+        if not isinstance(resource, ResourceTemplate):
+            raise TypeError(f"resource_templates[{index}] must be a ResourceTemplate")
+        _string(resource.uri_template, f"resource_templates[{index}].uri_template")
+        _string(resource.name, f"resource_templates[{index}].name")
+        if resource.uri_template in template_uris:
+            raise TypeError(f"duplicate provider resource template: {resource.uri_template}")
+        template_uris.add(resource.uri_template)
+    if (prepared_resources or prepared_templates) and not callable(read_resource):
+        raise TypeError("read_resource is required when resources are declared")
+    return Provider(name=name, version=version, tools=prepared,
+        resources=prepared_resources, resource_templates=prepared_templates,
+        read_resource=read_resource)
 
 
 def handle_message(provider: Provider, message: Any) -> JsonObject:
@@ -267,6 +387,24 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
         if not isinstance(provider_result, ProviderResult):
             raise TypeError("tool handler must return ProviderResult")
         result = provider_result.payload()
+    elif method == "provider/readResource":
+        if provider.read_resource is None:
+            raise ValueError("provider does not expose resources")
+        uri = _string(params.get("uri"), "provider/readResource uri")
+        input_responses = params.get("inputResponses")
+        request_state = params.get("requestState")
+        context = CallContext(
+            input_responses=None if input_responses is None else
+                _object(input_responses, "provider/readResource inputResponses"),
+            request_state=None if request_state is None else
+                _string(request_state, "provider/readResource requestState"),
+            client_capabilities=None if params.get("clientCapabilities") is None else
+                _object(params["clientCapabilities"], "provider/readResource clientCapabilities"),
+        )
+        resource_result = provider.read_resource(uri, context)
+        if not isinstance(resource_result, ResourceResult):
+            raise TypeError("resource handler must return ResourceResult")
+        result = resource_result.payload()
     elif method == "provider/shutdown":
         result = {}
     else:
@@ -299,7 +437,9 @@ def serve_provider(
             except Exception as error:
                 candidate = message.get("id") if isinstance(message, dict) else 0
                 request_id = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else 0
-                response = {"protocol": PROTOCOL, "id": request_id, "error": {"message": str(error) or type(error).__name__}}
+                code = "not_found" if isinstance(error, ProviderNotFoundError) else "provider_error"
+                response = {"protocol": PROTOCOL, "id": request_id,
+                    "error": {"code": code, "message": str(error) or type(error).__name__}}
             transport.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
             transport.flush()
             if isinstance(message, dict) and message.get("method") == "provider/shutdown":
@@ -311,7 +451,8 @@ def serve_provider(
 
 
 __all__ = [
-    "PROTOCOL", "TOOL_EFFECTS", "CallContext", "Provider", "ProviderResult",
-    "Tool", "complete_result", "create_provider", "handle_message",
-    "input_required_result", "serve_provider", "validate_schema_definition",
+    "PROTOCOL", "TOOL_EFFECTS", "CallContext", "Provider", "ProviderNotFoundError", "ProviderResult", "ResourceResult",
+    "Resource", "ResourceTemplate", "Tool", "complete_result", "create_provider", "handle_message",
+    "input_required_result", "resource_input_required_result", "resource_result", "serve_provider",
+    "validate_schema_definition",
 ]

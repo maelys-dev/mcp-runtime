@@ -3,6 +3,13 @@ import readline from "node:readline";
 export const PROTOCOL = "maelys-provider/2";
 export const TOOL_EFFECTS = Object.freeze(["read", "preview", "apply", "commit", "execute"]);
 
+export class ProviderNotFoundError extends Error {
+  constructor(message = "resource not found") {
+    super(message);
+    this.name = "ProviderNotFoundError";
+  }
+}
+
 const schemaKeys = new Set([
   "$schema", "title", "description", "type", "properties", "required",
   "additionalProperties", "items", "enum", "minLength", "maxLength", "minimum", "maximum",
@@ -89,9 +96,10 @@ export function createProvider(configuration) {
   const value = objectValue(configuration, "provider");
   const name = stringValue(value.name, "provider.name");
   const version = stringValue(value.version, "provider.version");
-  if (!Array.isArray(value.tools)) throw new TypeError("provider.tools must be an array");
+  const configuredTools = value.tools ?? [];
+  if (!Array.isArray(configuredTools)) throw new TypeError("provider.tools must be an array");
   const names = new Set();
-  const tools = value.tools.map((tool, index) => {
+  const tools = configuredTools.map((tool, index) => {
     const candidate = objectValue(tool, `tools[${index}]`);
     const toolName = stringValue(candidate.name, `tools[${index}].name`);
     if (names.has(toolName)) throw new TypeError(`duplicate provider tool: ${toolName}`);
@@ -104,15 +112,48 @@ export function createProvider(configuration) {
     if (typeof candidate.handler !== "function") throw new TypeError(`tools[${index}].handler must be a function`);
     return { ...candidate };
   });
-  return { name, version, tools };
+  const resources = value.resources ?? [];
+  const resourceTemplates = value.resourceTemplates ?? [];
+  if (!Array.isArray(resources) || !Array.isArray(resourceTemplates)) {
+    throw new TypeError("provider resources and resourceTemplates must be arrays");
+  }
+  const resourceUris = new Set();
+  const preparedResources = resources.map((entry, index) => {
+    const resource = objectValue(entry, `resources[${index}]`);
+    const uri = stringValue(resource.uri, `resources[${index}].uri`);
+    stringValue(resource.name, `resources[${index}].name`);
+    if (resourceUris.has(uri)) throw new TypeError(`duplicate provider resource: ${uri}`);
+    resourceUris.add(uri);
+    if (resource.size !== undefined && (!Number.isSafeInteger(resource.size) || resource.size < 0)) {
+      throw new TypeError(`resources[${index}].size must be a non-negative integer`);
+    }
+    return { ...resource };
+  });
+  const templateUris = new Set();
+  const preparedTemplates = resourceTemplates.map((entry, index) => {
+    const resource = objectValue(entry, `resourceTemplates[${index}]`);
+    const uriTemplate = stringValue(resource.uriTemplate, `resourceTemplates[${index}].uriTemplate`);
+    stringValue(resource.name, `resourceTemplates[${index}].name`);
+    if (templateUris.has(uriTemplate)) throw new TypeError(`duplicate provider resource template: ${uriTemplate}`);
+    templateUris.add(uriTemplate);
+    return { ...resource };
+  });
+  if ((preparedResources.length || preparedTemplates.length) && typeof value.readResource !== "function") {
+    throw new TypeError("provider.readResource is required when resources are declared");
+  }
+  return { name, version, tools, resources: preparedResources,
+    resourceTemplates: preparedTemplates, readResource: value.readResource };
 }
 
 export function describeProvider(provider) {
-  return {
+  const description = {
     name: provider.name,
     version: provider.version,
     tools: provider.tools.map(({ handler: _handler, ...descriptor }) => descriptor),
   };
+  if (provider.resources.length) description.resources = provider.resources;
+  if (provider.resourceTemplates.length) description.resourceTemplates = provider.resourceTemplates;
+  return description;
 }
 
 export function completeResult({ content, structuredContent, isError = false }) {
@@ -144,6 +185,13 @@ export function inputRequiredResult({ inputRequests, requestState }) {
     ...(inputRequests === undefined ? {} : { inputRequests }),
     ...(requestState === undefined ? {} : { requestState }),
   };
+}
+
+export function resourceResult(contents) {
+  if (!Array.isArray(contents) || contents.length === 0) {
+    throw new TypeError("resource result contents must be a non-empty array");
+  }
+  return { resultType: "complete", contents };
 }
 
 function validateProviderResult(result) {
@@ -179,6 +227,20 @@ export async function handleProviderMessage(provider, message) {
         objectValue(params.clientCapabilities, "provider/call clientCapabilities"),
     };
     result = validateProviderResult(await tool.handler(arguments_, context));
+  } else if (request.method === "provider/readResource") {
+    if (typeof provider.readResource !== "function") throw new Error("provider does not expose resources");
+    const uri = stringValue(params.uri, "provider/readResource uri");
+    const context = {
+      inputResponses: params.inputResponses === undefined ? undefined :
+        objectValue(params.inputResponses, "provider/readResource inputResponses"),
+      requestState: params.requestState === undefined ? undefined :
+        stringValue(params.requestState, "provider/readResource requestState"),
+      clientCapabilities: params.clientCapabilities === undefined ? undefined :
+        objectValue(params.clientCapabilities, "provider/readResource clientCapabilities"),
+    };
+    const candidate = await provider.readResource(uri, context);
+    result = candidate?.resultType === "input_required" ?
+      inputRequiredResult(candidate) : resourceResult(candidate?.contents);
   } else if (request.method === "provider/shutdown") {
     result = {};
   } else {
@@ -211,7 +273,10 @@ export async function serveProvider(provider, options = {}) {
       } catch (error) {
         const candidate = message && typeof message === "object" && !Array.isArray(message) ? message.id : 0;
         const id = typeof candidate === "number" && Number.isInteger(candidate) ? candidate : 0;
-        response = { protocol: PROTOCOL, id, error: { message: error instanceof Error ? error.message : String(error) } };
+        response = { protocol: PROTOCOL, id, error: {
+          code: error instanceof ProviderNotFoundError ? "not_found" : "provider_error",
+          message: error instanceof Error ? error.message : String(error),
+        } };
       }
       await writeLine(JSON.stringify(response));
       if (message && typeof message === "object" && !Array.isArray(message) && message.method === "provider/shutdown") break;

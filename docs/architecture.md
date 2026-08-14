@@ -14,6 +14,7 @@ maelys-mcp host
     |- policy and audit hooks
     |- module registry
     |   |- Tools
+    |   |- Resources
     |   `- MRTR
     |
     +--> in-process C provider
@@ -44,6 +45,8 @@ client-specific adapter belongs in this library.
   field placed in it is a newly owned Jansson reference. The runtime releases all
   fields with `maelys_mcp_provider_result_clear`.
 - `maelys_mcp_runtime_handle` borrows the request and returns a newly owned response.
+- Resource descriptors are deep-copied and normalized at registration. Resource read
+  callbacks follow the same ownership rule through `maelys_mcp_resource_result_t`.
 
 ## Protocol eras
 
@@ -66,12 +69,14 @@ The core owns lifecycle, version negotiation, discovery and generic JSON-RPC rou
 It does not contain method-name branches for `tools/list` or `tools/call`. Active
 modules publish their capabilities and claim their methods through the internal
 registry. A newly created runtime has no application capability; the host explicitly
-enables Tools and MRTR. Adding a provider before enabling Tools fails closed.
+enables Tools, Resources and MRTR. A provider may expose tools, resources, or both;
+registration fails unless every required module is enabled.
 
 MRTR deliberately remains separate from Tools even though the first supported use is
 `tools/call`: Tools owns catalog and execution semantics; MRTR owns permission for
 multi-round results and retry fields. Future Prompts or Resources modules can reuse
-MRTR without copying it.
+MRTR without copying it. Resources owns catalog, template and read semantics, while
+the opaque `maelys-uri` facade owns bounded parsing and normalization.
 
 ## Current JSON Schema subset
 
