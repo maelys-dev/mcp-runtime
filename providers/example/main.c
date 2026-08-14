@@ -36,10 +36,11 @@ static json_t *description(void) {
     json_t *tools = json_array();
     json_t *echo = json_object();
     json_t *sum = json_object();
+    json_t *events = json_object();
     json_t *echo_input = tool_schema_message();
     json_t *echo_output = output_schema_message();
     json_t *sum_input = tool_schema_sum();
-    if (!tools || !echo || !sum || !echo_input || !echo_output || !sum_input) return NULL;
+    if (!tools || !echo || !sum || !events || !echo_input || !echo_output || !sum_input) return NULL;
     json_object_set_new(echo, "name", json_string("example.echo"));
     json_object_set_new(echo, "title", json_string("Echo a message"));
     json_object_set_new(echo, "description", json_string("Returns the supplied message through an external provider."));
@@ -53,6 +54,12 @@ static json_t *description(void) {
     json_object_set_new(sum, "inputSchema", sum_input);
     json_object_set_new(sum, "effect", json_string("read"));
     json_array_append_new(tools, sum);
+    json_object_set_new(events, "name", json_string("example.events"));
+    json_object_set_new(events, "title", json_string("Emit provider events"));
+    json_object_set_new(events, "description", json_string("Emits resource and catalog change events before completing."));
+    json_object_set_new(events, "inputSchema", json_pack("{s:s}", "type", "object"));
+    json_object_set_new(events, "effect", json_string("execute"));
+    json_array_append_new(tools, events);
     json_t *resources = json_pack("[{s:s,s:s,s:s,s:i}]",
         "uri", "example://about", "name", "About example provider",
         "mimeType", "text/plain", "size", 24);
@@ -65,7 +72,7 @@ static json_t *description(void) {
         json_decref(tools);
         return NULL;
     }
-    return json_pack("{s:s,s:s,s:o,s:o,s:o}", "name", "example", "version", "0.4.0",
+    return json_pack("{s:s,s:s,s:o,s:o,s:o}", "name", "example", "version", "0.7.0",
         "tools", tools, "resources", resources, "resourceTemplates", templates);
 }
 
@@ -89,6 +96,17 @@ static json_t *call_tool(json_t *params, const char **out_error) {
         if (!json_is_number(left) || !json_is_number(right)) { *out_error = "left and right are required"; return NULL; }
         return json_pack("{s:s,s:{s:f}}", "resultType", "complete",
             "structuredContent", "value", json_number_value(left) + json_number_value(right));
+    }
+    if (strcmp(json_string_value(name), "example.events") == 0) {
+        puts("{\"protocol\":\"maelys-provider/3\",\"method\":\"provider/notifications/resources/updated\",\"params\":{\"uri\":\"example://about\"}}");
+        puts("{\"protocol\":\"maelys-provider/3\",\"method\":\"provider/notifications/resources/list_changed\",\"params\":{}}");
+        puts("{\"protocol\":\"maelys-provider/3\",\"method\":\"provider/notifications/tools/list_changed\",\"params\":{}}");
+        if (fflush(stdout) != 0) {
+            *out_error = "cannot emit provider events";
+            return NULL;
+        }
+        return json_pack("{s:s,s:{s:i}}", "resultType", "complete",
+            "structuredContent", "emitted", 3);
     }
     *out_error = "unknown tool";
     return NULL;
@@ -122,10 +140,12 @@ int main(void) {
         json_t *id = json_object_get(request, "id");
         json_t *method = json_object_get(request, "method");
         json_t *params = json_object_get(request, "params");
-        json_t *response = json_pack("{s:s,s:O}", "protocol", "maelys-provider/2", "id", id);
+        json_t *response = json_pack("{s:s,s:O}", "protocol", "maelys-provider/3", "id", id);
         int should_exit = 0;
         if (json_is_string(method) && strcmp(json_string_value(method), "provider/describe") == 0) {
             json_object_set_new(response, "result", description());
+        } else if (json_is_string(method) && strcmp(json_string_value(method), "provider/activate") == 0) {
+            json_object_set_new(response, "result", json_object());
         } else if (json_is_string(method) && strcmp(json_string_value(method), "provider/call") == 0) {
             const char *message = NULL;
             json_t *result = call_tool(params, &message);

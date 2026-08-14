@@ -30,7 +30,7 @@ class ProviderSdkTest(unittest.TestCase):
 
     def test_call_preserves_protocol_and_integer_id(self):
         response = handle_message(fixture_provider(), {
-            "protocol": "maelys-provider/2",
+            "protocol": "maelys-provider/3",
             "id": 7,
             "method": "provider/call",
             "params": {"name": "fixture.echo", "arguments": {"message": "hello"}},
@@ -45,9 +45,9 @@ class ProviderSdkTest(unittest.TestCase):
 
     def test_stdio_loop_survives_errors_and_rejects_duplicate_keys(self):
         requests = "\n".join([
-            '{"protocol":"maelys-provider/2","id":1,"id":2,"method":"provider/describe","params":{}}',
-            json.dumps({"protocol": "maelys-provider/2", "id": 3, "method": "provider/describe", "params": {}}),
-            json.dumps({"protocol": "maelys-provider/2", "id": 4, "method": "provider/shutdown", "params": {}}),
+            '{"protocol":"maelys-provider/3","id":1,"id":2,"method":"provider/describe","params":{}}',
+            json.dumps({"protocol": "maelys-provider/3", "id": 3, "method": "provider/describe", "params": {}}),
+            json.dumps({"protocol": "maelys-provider/3", "id": 4, "method": "provider/shutdown", "params": {}}),
         ]) + "\n"
         output = io.StringIO()
         self.assertEqual(serve_provider(fixture_provider(), io.StringIO(requests), output), 0)
@@ -86,12 +86,12 @@ class ProviderSdkTest(unittest.TestCase):
             effect="apply", handler=handler,
         )])
         first = handle_message(provider, {
-            "protocol": "maelys-provider/2", "id": 1, "method": "provider/call",
+            "protocol": "maelys-provider/3", "id": 1, "method": "provider/call",
             "params": {"name": "confirm", "arguments": {}},
         })
         self.assertEqual(first["result"]["resultType"], "input_required")
         second = handle_message(provider, {
-            "protocol": "maelys-provider/2", "id": 2, "method": "provider/call",
+            "protocol": "maelys-provider/3", "id": 2, "method": "provider/call",
             "params": {"name": "confirm", "arguments": {},
                 "inputResponses": {"confirm": {"action": "accept"}}, "requestState": "opaque"},
         })
@@ -111,13 +111,56 @@ class ProviderSdkTest(unittest.TestCase):
         self.assertNotIn("size", description["resources"][0])
         self.assertEqual(description["resourceTemplates"][0]["uriTemplate"], "fixture://echo/{value}")
         response = handle_message(provider, {
-            "protocol": "maelys-provider/2", "id": 10,
+            "protocol": "maelys-provider/3", "id": 10,
             "method": "provider/readResource", "params": {"uri": "fixture://echo/hello"},
         })
         self.assertEqual(response["result"], {"resultType": "complete", "contents": [{
             "uri": "fixture://echo/hello", "mimeType": "text/plain",
             "text": "read fixture://echo/hello",
         }]})
+
+    def test_provider_3_serializes_events_with_responses(self):
+        provider = None
+
+        def emit_events(_arguments, _context):
+            provider.events.resource_updated("fixture://course/one")
+            provider.events.resources_list_changed()
+            provider.events.tools_list_changed()
+            return complete_result(structured_content={"emitted": 3})
+
+        provider = create_provider("events", "1", [Tool(
+            name="events.emit", description="Emit all event shapes.",
+            input_schema={"type": "object"}, effect="execute",
+            handler=emit_events,
+        )])
+        with self.assertRaisesRegex(RuntimeError, "before activation"):
+            provider.events.tools_list_changed()
+        requests = "\n".join(json.dumps(message) for message in [
+            {"protocol": "maelys-provider/3", "id": 1,
+                "method": "provider/activate", "params": {}},
+            {"protocol": "maelys-provider/3", "id": 2,
+                "method": "provider/call",
+                "params": {"name": "events.emit", "arguments": {}}},
+            {"protocol": "maelys-provider/3", "id": 3,
+                "method": "provider/shutdown", "params": {}},
+        ]) + "\n"
+        output = io.StringIO()
+        self.assertEqual(serve_provider(provider, io.StringIO(requests), output), 0)
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([
+            message.get("method", f"response:{message.get('id')}")
+            for message in messages
+        ], [
+            "response:1",
+            "provider/notifications/resources/updated",
+            "provider/notifications/resources/list_changed",
+            "provider/notifications/tools/list_changed",
+            "response:2",
+            "response:3",
+        ])
+        self.assertEqual(messages[1]["params"]["uri"], "fixture://course/one")
+        with self.assertRaisesRegex(RuntimeError, "after shutdown"):
+            provider.events.tools_list_changed()
 
 
 if __name__ == "__main__":

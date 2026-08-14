@@ -11,7 +11,9 @@ The first milestone provides:
 - a static C library, `libmaelys_mcp.a`;
 - the `maelys-mcp` stdio host;
 - injectable in-process providers;
-- persistent out-of-process providers using the explicit `maelys-provider/2` result contract;
+- persistent out-of-process providers using the explicit `maelys-provider/3` result contract;
+- provider-originated resource and catalog events over a bidirectional, single-reader
+  process channel;
 - MCP `2026-07-28` stateless requests and `server/discover`;
 - legacy MCP `2025-11-25` initialization for compatibility;
 - an explicit module registry with independently enabled Tools, Resources, MRTR and
@@ -109,7 +111,7 @@ src/provider/        in-process and process-provider adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
 providers/example/   independent reference provider
-conformance/          black-box maelys-provider/2 runner and official MCP adapter
+conformance/          black-box maelys-provider/3 runner and official MCP adapter
 sdk/typescript/       dependency-free TypeScript/JavaScript provider SDK
 sdk/python/           dependency-free Python provider SDK
 tests/               unit and end-to-end tests
@@ -127,12 +129,12 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.6.2 hardens release engineering around the 0.6 subscription milestone:
-isolated build profiles, continuous integration, an explicit native ABI version and a
-published compatibility policy. It also isolates subscription identifiers across the
-producer and single-writer threads. Provider calls remain synchronous in this release;
-provider-originated event transport,
-Streamable HTTP, prompts, Tasks, progress, dynamic provider reload, full JSON Schema
+Version 0.7.0 adds the bidirectional `maelys-provider/3` process protocol. Providers
+activate only after the runtime output bus is ready, then may emit resource updates and
+Tools/Resources list changes independently of normal responses. A dedicated reader
+thread demultiplexes events and the single in-flight response; SDK writers serialize
+all provider output. Provider calls remain synchronous in this release. Streamable
+HTTP, prompts, Tasks, progress, dynamic provider reload, full JSON Schema
 2020-12 and Windows support are not implemented yet. The pre-1.0 ABI policy is
 documented and versioned; same-major ABI stability begins with 1.0.
 

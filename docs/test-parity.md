@@ -25,7 +25,7 @@ stdio, CLI, and Maelys L0/L1 suites.
 | stdio and CLI | end-to-end requests, parse errors, stdout isolation, `FD_CLOEXEC`, simulated third-party `printf()` contamination |
 | Memory safety | native ASan/UBSan and pinned Linux Docker ASan/UBSan/LSan |
 | Parser robustness | libFuzzer targets and seed corpora for JSON Lines, Content-Length, schema definition/value pairs, rich content blocks, URI normalization and URI templates |
-| Polyglot providers | version 2 black-box lifecycle and explicit complete/input-required results for C, TypeScript and Python, including structured failures and stdout contamination |
+| Polyglot providers | version 3 activation, asynchronous event envelopes and explicit complete/input-required results for C, TypeScript and Python, including structured failures and stdout contamination |
 
 The standalone runtime adds checks that the original integrated server did not make
 at this boundary: unsupported JSON Schema keywords are rejected at registration,

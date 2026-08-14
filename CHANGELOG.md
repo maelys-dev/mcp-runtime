@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 - 2026-08-14
+
+- Replace the private process contract with `maelys-provider/3`: an explicit activation
+  barrier followed by id-less resource and catalog change events.
+- Add one permanent reader thread per process provider, serialize exchanges, enforce
+  response deadlines with condition variables, and fail closed on malformed events or
+  unexpected response ids.
+- Route provider events through URI validation, subscription filtering, causal
+  coalescence and the existing single-writer Outbox.
+- Extend the TypeScript and Python provider SDKs with activation-aware, serialized,
+  thread-safe event facades; update the example and black-box conformance runner.
+- Protect `main` with required CI checks and pull requests, enable secret scanning and
+  private vulnerability reporting, and add security and contribution policies.
+- Keep native ABI version 1: the provider handle remains opaque and the C additions are
+  source- and binary-compatible.
+
 ## 0.6.2 - 2026-08-14
 
 - Give queued subscription metadata and completion responses independent Jansson ID

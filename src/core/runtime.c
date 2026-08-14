@@ -1,4 +1,5 @@
 #include "src/internal/internal.h"
+#include "maelys/mcp/subscriptions.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,8 @@ static void set_error(char **out_error, const char *message) {
     free(*out_error);
     *out_error = maelys_mcp_strdup(message);
 }
+
+static void stop_provider_events(maelys_mcp_runtime_t *runtime);
 
 static json_t *server_info(maelys_mcp_runtime_t *runtime) {
     json_t *info = json_object();
@@ -67,18 +70,39 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->subscriptions = calloc(runtime->max_subscriptions,
         sizeof(*runtime->subscriptions));
     if (!runtime->server_name || !runtime->server_version || !runtime->instructions ||
-        !runtime->providers || !runtime->subscriptions ||
-        pthread_mutex_init(&runtime->subscriptions_mutex, NULL) != 0) {
+        !runtime->providers || !runtime->subscriptions) {
+        maelys_mcp_runtime_destroy(runtime);
+        return MAELYS_MCP_ERR_MEMORY;
+    }
+    if (pthread_mutex_init(&runtime->subscriptions_mutex, NULL) != 0) {
         maelys_mcp_runtime_destroy(runtime);
         return MAELYS_MCP_ERR_MEMORY;
     }
     runtime->subscriptions_mutex_initialized = 1;
+    if (pthread_mutex_init(&runtime->provider_events_mutex, NULL) != 0) {
+        maelys_mcp_runtime_destroy(runtime);
+        return MAELYS_MCP_ERR_MEMORY;
+    }
+    runtime->provider_events_mutex_initialized = 1;
+    if (pthread_cond_init(&runtime->provider_events_idle, NULL) != 0) {
+        maelys_mcp_runtime_destroy(runtime);
+        return MAELYS_MCP_ERR_MEMORY;
+    }
+    runtime->provider_events_idle_initialized = 1;
     *out_runtime = runtime;
     return MAELYS_MCP_OK;
 }
 
 void maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     if (!runtime) return;
+    if (runtime->provider_events_mutex_initialized &&
+        runtime->provider_events_idle_initialized) {
+        stop_provider_events(runtime);
+    }
+    for (size_t index = 0; index < runtime->provider_count; ++index) {
+        maelys_mcp_provider_bind_event_sink(runtime->providers[index], NULL, NULL);
+        maelys_mcp_provider_destroy(runtime->providers[index]);
+    }
     if (runtime->subscriptions_mutex_initialized) {
         pthread_mutex_lock(&runtime->subscriptions_mutex);
         runtime->outbox = NULL;
@@ -89,8 +113,11 @@ void maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
         pthread_mutex_unlock(&runtime->subscriptions_mutex);
         pthread_mutex_destroy(&runtime->subscriptions_mutex);
     }
-    for (size_t index = 0; index < runtime->provider_count; ++index) {
-        maelys_mcp_provider_destroy(runtime->providers[index]);
+    if (runtime->provider_events_idle_initialized) {
+        pthread_cond_destroy(&runtime->provider_events_idle);
+    }
+    if (runtime->provider_events_mutex_initialized) {
+        pthread_mutex_destroy(&runtime->provider_events_mutex);
     }
     free(runtime->providers);
     free(runtime->subscriptions);
@@ -98,6 +125,53 @@ void maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     free(runtime->server_version);
     free(runtime->instructions);
     free(runtime);
+}
+
+static maelys_mcp_result_t handle_provider_event(
+    void *context,
+    const maelys_mcp_provider_event_t *event) {
+    maelys_mcp_runtime_t *runtime = context;
+    if (!runtime || !event) return MAELYS_MCP_ERR_ARGUMENT;
+    pthread_mutex_lock(&runtime->provider_events_mutex);
+    if (!runtime->provider_events_accepting) {
+        pthread_mutex_unlock(&runtime->provider_events_mutex);
+        return MAELYS_MCP_ERR_NOT_FOUND;
+    }
+    runtime->provider_events_inflight++;
+    pthread_mutex_unlock(&runtime->provider_events_mutex);
+    maelys_mcp_result_t result;
+    switch (event->kind) {
+        case MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED:
+            result = maelys_mcp_runtime_notify_resource_updated(
+                runtime, event->resource_uri);
+            break;
+        case MAELYS_MCP_PROVIDER_EVENT_RESOURCES_LIST_CHANGED:
+            result = maelys_mcp_runtime_notify_resources_list_changed(runtime);
+            break;
+        case MAELYS_MCP_PROVIDER_EVENT_TOOLS_LIST_CHANGED:
+            result = maelys_mcp_runtime_notify_tools_list_changed(runtime);
+            break;
+        default:
+            result = MAELYS_MCP_ERR_ARGUMENT;
+            break;
+    }
+    pthread_mutex_lock(&runtime->provider_events_mutex);
+    runtime->provider_events_inflight--;
+    if (runtime->provider_events_inflight == 0u) {
+        pthread_cond_broadcast(&runtime->provider_events_idle);
+    }
+    pthread_mutex_unlock(&runtime->provider_events_mutex);
+    return result;
+}
+
+static void stop_provider_events(maelys_mcp_runtime_t *runtime) {
+    pthread_mutex_lock(&runtime->provider_events_mutex);
+    runtime->provider_events_accepting = 0;
+    while (runtime->provider_events_inflight != 0u) {
+        pthread_cond_wait(&runtime->provider_events_idle,
+            &runtime->provider_events_mutex);
+    }
+    pthread_mutex_unlock(&runtime->provider_events_mutex);
 }
 
 maelys_mcp_result_t maelys_mcp_runtime_attach_outbox(
@@ -113,11 +187,30 @@ maelys_mcp_result_t maelys_mcp_runtime_attach_outbox(
     }
     runtime->outbox = outbox;
     pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    pthread_mutex_lock(&runtime->provider_events_mutex);
+    runtime->provider_events_accepting = 1;
+    pthread_mutex_unlock(&runtime->provider_events_mutex);
+    for (size_t index = 0; index < runtime->provider_count; ++index) {
+        maelys_mcp_provider_t *provider = runtime->providers[index];
+        if (provider->activate && !provider->activated) {
+            maelys_mcp_result_t activation = provider->activate(
+                provider->context, NULL);
+            if (activation != MAELYS_MCP_OK) {
+                stop_provider_events(runtime);
+                pthread_mutex_lock(&runtime->subscriptions_mutex);
+                runtime->outbox = NULL;
+                pthread_mutex_unlock(&runtime->subscriptions_mutex);
+                return activation;
+            }
+            provider->activated = 1;
+        }
+    }
     return MAELYS_MCP_OK;
 }
 
 void maelys_mcp_runtime_detach_outbox(maelys_mcp_runtime_t *runtime) {
     if (!runtime || !runtime->subscriptions_mutex_initialized) return;
+    stop_provider_events(runtime);
     pthread_mutex_lock(&runtime->subscriptions_mutex);
     runtime->outbox = NULL;
     pthread_mutex_unlock(&runtime->subscriptions_mutex);
@@ -193,7 +286,21 @@ maelys_mcp_result_t maelys_mcp_runtime_add_provider(
             }
         }
     }
-    runtime->providers[runtime->provider_count++] = provider;
+    maelys_mcp_provider_bind_event_sink(provider, handle_provider_event, runtime);
+    runtime->providers[runtime->provider_count] = provider;
+    pthread_mutex_lock(&runtime->subscriptions_mutex);
+    int has_outbox = runtime->outbox != NULL;
+    pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    if (provider->activate && !provider->activated && has_outbox) {
+        maelys_mcp_result_t activation = provider->activate(provider->context, out_error);
+        if (activation != MAELYS_MCP_OK) {
+            runtime->providers[runtime->provider_count] = NULL;
+            maelys_mcp_provider_bind_event_sink(provider, NULL, NULL);
+            return activation;
+        }
+        provider->activated = 1;
+    }
+    runtime->provider_count++;
     return MAELYS_MCP_OK;
 }
 

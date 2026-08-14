@@ -18,16 +18,145 @@ static void replace_error(char **out_error, const char *message) {
     *out_error = maelys_mcp_strdup(message ? message : "provider error");
 }
 
-static maelys_mcp_result_t configure_timeout(int fd, unsigned int timeout_ms) {
+static maelys_mcp_result_t configure_send_timeout(int fd, unsigned int timeout_ms) {
     struct timeval timeout = {
         .tv_sec = (time_t)(timeout_ms / 1000u),
         .tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u)
     };
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) {
         return MAELYS_MCP_ERR_IO;
     }
     return MAELYS_MCP_OK;
+}
+
+static void set_process_failure_locked(
+    maelys_mcp_process_context_t *process,
+    maelys_mcp_result_t status,
+    const char *message) {
+    if (process->failed) return;
+    process->failed = 1;
+    process->failure_status = status;
+    process->failure_message = maelys_mcp_strdup(
+        message ? message : "provider transport failed");
+    pthread_cond_broadcast(&process->response_ready);
+}
+
+static int provider_event_from_message(
+    json_t *message,
+    maelys_mcp_provider_event_t *out_event) {
+    json_t *method = json_is_object(message) ? json_object_get(message, "method") : NULL;
+    json_t *params = json_is_object(message) ? json_object_get(message, "params") : NULL;
+    if (!json_is_string(method) || maelys_mcp_json_string_has_nul(method) ||
+        (params && !json_is_object(params))) return 0;
+    memset(out_event, 0, sizeof(*out_event));
+    if (maelys_mcp_json_string_equals(method,
+        "provider/notifications/resources/updated")) {
+        json_t *uri = json_is_object(params) ? json_object_get(params, "uri") : NULL;
+        if (!json_is_string(uri) || maelys_mcp_json_string_has_nul(uri)) return 0;
+        out_event->kind = MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED;
+        out_event->resource_uri = json_string_value(uri);
+        return 1;
+    }
+    if (params && json_object_size(params) != 0u) return 0;
+    if (maelys_mcp_json_string_equals(method,
+        "provider/notifications/resources/list_changed")) {
+        out_event->kind = MAELYS_MCP_PROVIDER_EVENT_RESOURCES_LIST_CHANGED;
+        return 1;
+    }
+    if (maelys_mcp_json_string_equals(method,
+        "provider/notifications/tools/list_changed")) {
+        out_event->kind = MAELYS_MCP_PROVIDER_EVENT_TOOLS_LIST_CHANGED;
+        return 1;
+    }
+    return 0;
+}
+
+static void *process_reader_main(void *opaque) {
+    maelys_mcp_process_context_t *process = opaque;
+    for (;;) {
+        json_t *message = NULL;
+        char *error = NULL;
+        maelys_mcp_result_t status = maelys_mcp_line_reader_read(
+            process->reader, process->fd, &message, &error);
+        if (status != MAELYS_MCP_OK) {
+            pthread_mutex_lock(&process->state_mutex);
+            if (!process->closing) {
+                set_process_failure_locked(process,
+                    status == MAELYS_MCP_ERR_NOT_FOUND ?
+                        MAELYS_MCP_ERR_PROVIDER : status,
+                    error ? error : "provider transport closed");
+            }
+            pthread_mutex_unlock(&process->state_mutex);
+            free(error);
+            break;
+        }
+        json_t *protocol = json_is_object(message) ?
+            json_object_get(message, "protocol") : NULL;
+        json_t *id = json_is_object(message) ? json_object_get(message, "id") : NULL;
+        if (!maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL)) {
+            json_decref(message);
+            pthread_mutex_lock(&process->state_mutex);
+            set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
+                "provider returned an invalid protocol envelope");
+            pthread_mutex_unlock(&process->state_mutex);
+            break;
+        }
+        if (json_is_integer(id)) {
+            unsigned long long response_id =
+                (unsigned long long)json_integer_value(id);
+            pthread_mutex_lock(&process->state_mutex);
+            if (!process->waiting || process->pending_response ||
+                response_id != process->expected_id) {
+                set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
+                    "provider returned an unexpected response id");
+                pthread_mutex_unlock(&process->state_mutex);
+                json_decref(message);
+                break;
+            }
+            process->pending_response = message;
+            pthread_cond_broadcast(&process->response_ready);
+            pthread_mutex_unlock(&process->state_mutex);
+            continue;
+        }
+        maelys_mcp_provider_event_t event;
+        if (id || !provider_event_from_message(message, &event)) {
+            json_decref(message);
+            pthread_mutex_lock(&process->state_mutex);
+            set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
+                "provider returned an invalid asynchronous event");
+            pthread_mutex_unlock(&process->state_mutex);
+            break;
+        }
+        pthread_mutex_lock(&process->state_mutex);
+        while (process->activation_pending && !process->events_enabled &&
+            !process->failed && !process->closing) {
+            pthread_cond_wait(&process->response_ready, &process->state_mutex);
+        }
+        maelys_mcp_provider_t *owner = process->owner;
+        int events_enabled = process->events_enabled;
+        pthread_mutex_unlock(&process->state_mutex);
+        if (!owner || !events_enabled) {
+            json_decref(message);
+            pthread_mutex_lock(&process->state_mutex);
+            set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
+                "provider emitted an event before activation");
+            pthread_mutex_unlock(&process->state_mutex);
+            break;
+        }
+        (void)maelys_mcp_provider_emit_event(owner, &event);
+        json_decref(message);
+    }
+    return NULL;
+}
+
+static int response_deadline(unsigned int timeout_ms, struct timespec *out) {
+    if (clock_gettime(CLOCK_REALTIME, out) != 0) return 0;
+    out->tv_sec += (time_t)(timeout_ms / 1000u);
+    long nanoseconds = out->tv_nsec +
+        (long)(timeout_ms % 1000u) * 1000000L;
+    out->tv_sec += nanoseconds / 1000000000L;
+    out->tv_nsec = nanoseconds % 1000000000L;
+    return 1;
 }
 
 static maelys_mcp_result_t process_exchange(
@@ -39,37 +168,107 @@ static maelys_mcp_result_t process_exchange(
     char **out_error) {
     if (!process || process->fd < 0 || !method || !out_result) return MAELYS_MCP_ERR_ARGUMENT;
     *out_result = NULL;
-    if (configure_timeout(process->fd, timeout_ms) != MAELYS_MCP_OK) {
+    pthread_mutex_lock(&process->exchange_mutex);
+    if (configure_send_timeout(process->fd, timeout_ms) != MAELYS_MCP_OK) {
         replace_error(out_error, "cannot configure provider timeout");
+        pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_IO;
     }
+    pthread_mutex_lock(&process->state_mutex);
+    if (process->failed || process->closing) {
+        replace_error(out_error, process->failure_message ?
+            process->failure_message : "provider transport is unavailable");
+        maelys_mcp_result_t failed = process->failure_status ?
+            process->failure_status : MAELYS_MCP_ERR_PROVIDER;
+        pthread_mutex_unlock(&process->state_mutex);
+        pthread_mutex_unlock(&process->exchange_mutex);
+        return failed;
+    }
     unsigned long long id = ++process->next_id;
+    process->expected_id = id;
+    process->waiting = 1;
+    pthread_mutex_unlock(&process->state_mutex);
     json_t *request = json_object();
-    if (!request) return MAELYS_MCP_ERR_MEMORY;
+    if (!request) {
+        pthread_mutex_lock(&process->state_mutex);
+        process->waiting = 0;
+        pthread_mutex_unlock(&process->state_mutex);
+        pthread_mutex_unlock(&process->exchange_mutex);
+        return MAELYS_MCP_ERR_MEMORY;
+    }
     if (json_object_set_new(request, "protocol", json_string(MAELYS_MCP_PROVIDER_PROTOCOL)) != 0 ||
         json_object_set_new(request, "id", json_integer((json_int_t)id)) != 0 ||
         json_object_set_new(request, "method", json_string(method)) != 0 ||
         json_object_set_new(request, "params", params ? json_incref(params) : json_object()) != 0) {
         json_decref(request);
+        pthread_mutex_lock(&process->state_mutex);
+        process->waiting = 0;
+        pthread_mutex_unlock(&process->state_mutex);
+        pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_MEMORY;
     }
     maelys_mcp_result_t status = maelys_mcp_write_json_line(process->fd, request);
     json_decref(request);
     if (status != MAELYS_MCP_OK) {
         replace_error(out_error, "cannot write to provider");
+        pthread_mutex_lock(&process->state_mutex);
+        process->waiting = 0;
+        set_process_failure_locked(process, status, "cannot write to provider");
+        pthread_mutex_unlock(&process->state_mutex);
+        pthread_mutex_unlock(&process->exchange_mutex);
         return status;
     }
 
-    json_t *response = NULL;
-    status = maelys_mcp_line_reader_read(
-        process->reader, process->fd, &response, out_error);
-    if (status != MAELYS_MCP_OK) return status == MAELYS_MCP_ERR_NOT_FOUND ? MAELYS_MCP_ERR_PROVIDER : status;
+    struct timespec deadline;
+    if (!response_deadline(timeout_ms, &deadline)) {
+        pthread_mutex_lock(&process->state_mutex);
+        process->waiting = 0;
+        set_process_failure_locked(process, MAELYS_MCP_ERR_IO,
+            "cannot compute provider deadline");
+        pthread_mutex_unlock(&process->state_mutex);
+        pthread_mutex_unlock(&process->exchange_mutex);
+        return MAELYS_MCP_ERR_IO;
+    }
+    pthread_mutex_lock(&process->state_mutex);
+    while (!process->pending_response && !process->failed) {
+        int waited = pthread_cond_timedwait(
+            &process->response_ready, &process->state_mutex, &deadline);
+        if (waited == ETIMEDOUT) {
+            set_process_failure_locked(process, MAELYS_MCP_ERR_IO,
+                "provider response deadline exceeded");
+            process->closing = 1;
+            break;
+        }
+        if (waited != 0) {
+            set_process_failure_locked(process, MAELYS_MCP_ERR_IO,
+                "cannot wait for provider response");
+            process->closing = 1;
+            break;
+        }
+    }
+    json_t *response = process->pending_response;
+    process->pending_response = NULL;
+    process->waiting = 0;
+    maelys_mcp_result_t failure_status = process->failure_status;
+    char *failure_message = maelys_mcp_strdup(process->failure_message);
+    int closing = process->closing;
+    pthread_mutex_unlock(&process->state_mutex);
+    if (closing) (void)shutdown(process->fd, SHUT_RDWR);
+    if (!response) {
+        replace_error(out_error, failure_message ? failure_message :
+            "provider transport failed");
+        free(failure_message);
+        pthread_mutex_unlock(&process->exchange_mutex);
+        return failure_status ? failure_status : MAELYS_MCP_ERR_PROVIDER;
+    }
+    free(failure_message);
     json_t *response_id = json_object_get(response, "id");
     json_t *protocol = json_object_get(response, "protocol");
     if (!json_is_integer(response_id) || (unsigned long long)json_integer_value(response_id) != id ||
         !maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL)) {
         json_decref(response);
         replace_error(out_error, "provider returned an invalid response envelope");
+        pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_PROTOCOL;
     }
     json_t *error = json_object_get(response, "error");
@@ -77,6 +276,7 @@ static maelys_mcp_result_t process_exchange(
     if (!!error == !!result || (error && !json_is_object(error))) {
         json_decref(response);
         replace_error(out_error, "provider response must contain exactly one result or error");
+        pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_PROTOCOL;
     }
     if (error) {
@@ -87,10 +287,12 @@ static maelys_mcp_result_t process_exchange(
             json_string_value(message) : "provider call failed");
         int not_found = maelys_mcp_json_string_equals(code, "not_found");
         json_decref(response);
+        pthread_mutex_unlock(&process->exchange_mutex);
         return not_found ? MAELYS_MCP_ERR_NOT_FOUND : MAELYS_MCP_ERR_PROVIDER;
     }
     *out_result = json_deep_copy(result);
     json_decref(response);
+    pthread_mutex_unlock(&process->exchange_mutex);
     return *out_result ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
@@ -242,6 +444,27 @@ static int wait_for_child(pid_t pid, unsigned int timeout_ms) {
     }
 }
 
+static maelys_mcp_result_t process_activate(void *context, char **out_error) {
+    maelys_mcp_process_context_t *process = context;
+    pthread_mutex_lock(&process->state_mutex);
+    process->activation_pending = 1;
+    pthread_mutex_unlock(&process->state_mutex);
+    json_t *result = NULL;
+    maelys_mcp_result_t status = process_exchange(process, "provider/activate",
+        process->describe_timeout_ms, NULL, &result, out_error);
+    if (status == MAELYS_MCP_OK && !json_is_object(result)) {
+        replace_error(out_error, "provider activation result must be an object");
+        status = MAELYS_MCP_ERR_PROTOCOL;
+    }
+    pthread_mutex_lock(&process->state_mutex);
+    process->events_enabled = status == MAELYS_MCP_OK;
+    process->activation_pending = 0;
+    pthread_cond_broadcast(&process->response_ready);
+    pthread_mutex_unlock(&process->state_mutex);
+    if (result) json_decref(result);
+    return status;
+}
+
 static void process_destroy(void *context) {
     maelys_mcp_process_context_t *process = context;
     if (!process) return;
@@ -252,6 +475,14 @@ static void process_destroy(void *context) {
             process->shutdown_timeout_ms, NULL, &ignored, &error);
         if (ignored) json_decref(ignored);
         free(error);
+        pthread_mutex_lock(&process->state_mutex);
+        process->closing = 1;
+        pthread_mutex_unlock(&process->state_mutex);
+        (void)shutdown(process->fd, SHUT_RDWR);
+        if (process->reader_started) {
+            (void)pthread_join(process->reader_thread, NULL);
+            process->reader_started = 0;
+        }
         close(process->fd);
         process->fd = -1;
     }
@@ -265,6 +496,17 @@ static void process_destroy(void *context) {
     if (process->reader) {
         maelys_mcp_line_reader_clear(process->reader);
         free(process->reader);
+    }
+    if (process->pending_response) json_decref(process->pending_response);
+    free(process->failure_message);
+    if (process->response_ready_initialized) {
+        pthread_cond_destroy(&process->response_ready);
+    }
+    if (process->state_mutex_initialized) {
+        pthread_mutex_destroy(&process->state_mutex);
+    }
+    if (process->exchange_mutex_initialized) {
+        pthread_mutex_destroy(&process->exchange_mutex);
     }
     free(process);
 }
@@ -342,12 +584,59 @@ static maelys_mcp_result_t spawn_process(
         (void)waitpid(pid, NULL, 0);
         return MAELYS_MCP_ERR_MEMORY;
     }
+    if (pthread_mutex_init(&process->exchange_mutex, NULL) != 0) {
+        maelys_mcp_line_reader_clear(process->reader);
+        free(process->reader);
+        free(process);
+        close(sockets[0]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return MAELYS_MCP_ERR_IO;
+    }
+    process->exchange_mutex_initialized = 1;
+    if (pthread_mutex_init(&process->state_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&process->exchange_mutex);
+        maelys_mcp_line_reader_clear(process->reader);
+        free(process->reader);
+        free(process);
+        close(sockets[0]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return MAELYS_MCP_ERR_IO;
+    }
+    process->state_mutex_initialized = 1;
+    if (pthread_cond_init(&process->response_ready, NULL) != 0) {
+        pthread_mutex_destroy(&process->state_mutex);
+        pthread_mutex_destroy(&process->exchange_mutex);
+        maelys_mcp_line_reader_clear(process->reader);
+        free(process->reader);
+        free(process);
+        close(sockets[0]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return MAELYS_MCP_ERR_IO;
+    }
+    process->response_ready_initialized = 1;
     process->pid = pid;
     process->fd = sockets[0];
     process->max_message_bytes = options->max_message_bytes;
     process->describe_timeout_ms = options->describe_timeout_ms;
     process->call_timeout_ms = options->call_timeout_ms;
     process->shutdown_timeout_ms = options->shutdown_timeout_ms;
+    if (pthread_create(&process->reader_thread, NULL,
+        process_reader_main, process) != 0) {
+        pthread_cond_destroy(&process->response_ready);
+        pthread_mutex_destroy(&process->state_mutex);
+        pthread_mutex_destroy(&process->exchange_mutex);
+        maelys_mcp_line_reader_clear(process->reader);
+        free(process->reader);
+        free(process);
+        close(sockets[0]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return MAELYS_MCP_ERR_IO;
+    }
+    process->reader_started = 1;
     *out_process = process;
     return MAELYS_MCP_OK;
 }
@@ -583,6 +872,14 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     free(templates);
     free(tools);
     json_decref(description);
-    if (status != MAELYS_MCP_OK) process_destroy(process);
+    if (status != MAELYS_MCP_OK) {
+        process_destroy(process);
+    } else {
+        (*out_provider)->activate = process_activate;
+        (*out_provider)->activated = 0;
+        pthread_mutex_lock(&process->state_mutex);
+        process->owner = *out_provider;
+        pthread_mutex_unlock(&process->state_mutex);
+    }
     return status;
 }

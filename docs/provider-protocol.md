@@ -1,10 +1,10 @@
-# Provider protocol `maelys-provider/2`
+# Provider protocol `maelys-provider/3`
 
 External providers are persistent child processes connected through a private
 bidirectional socket mapped to stdin and stdout. Messages are UTF-8 JSON Lines.
-Provider stdout is protocol-only; diagnostics use stderr. Version 2 intentionally
-removes the ambiguous version 1 convention where any JSON value meant a completed
-result.
+Provider stdout is protocol-only; diagnostics use stderr. Version 3 retains the
+explicit version 2 result model and adds activation plus provider-originated
+asynchronous events. Versions 1 and 2 are not accepted.
 
 The host launches an absolute executable directly with `--provider`, without a shell.
 Describe, call and shutdown deadlines are independently configurable. Defaults are
@@ -14,7 +14,7 @@ Describe, call and shutdown deadlines are independently configurable. Defaults a
 
 ```json
 {
-  "protocol": "maelys-provider/2",
+  "protocol": "maelys-provider/3",
   "id": 1,
   "method": "provider/describe",
   "params": {}
@@ -25,6 +25,30 @@ A response preserves `protocol` and `id` and contains exactly one of `result` or
 `error`. A resource handler that does not recognize an URI returns the private error
 code `not_found`; the runtime maps it to MCP Invalid Params (`-32602`) without exposing
 the provider protocol.
+
+## Activation and event ordering
+
+After discovery and runtime registration, the host sends `provider/activate`. The
+provider returns an empty result and must not emit an event before that response. This
+barrier is sent only after the runtime Outbox exists, so no startup event is silently
+lost.
+
+Requests remain serialized with at most one response outstanding. A dedicated host
+reader is nevertheless always active and accepts id-less events between, before or
+during normal responses. Unknown methods, malformed event parameters, duplicate JSON
+keys, an unexpected response id or any non-v3 envelope fail the provider transport.
+
+The supported event envelopes are:
+
+```json
+{"protocol":"maelys-provider/3","method":"provider/notifications/resources/updated","params":{"uri":"hermes://repository/course.mdx"}}
+{"protocol":"maelys-provider/3","method":"provider/notifications/resources/list_changed","params":{}}
+{"protocol":"maelys-provider/3","method":"provider/notifications/tools/list_changed","params":{}}
+```
+
+Resource URIs pass through the same bounded `maelys-uri` normalization as native
+events. The runtime then applies negotiated subscription filters, causal coalescence
+and Outbox backpressure. Events are notifications: they have no private response.
 
 ## `provider/describe`
 
@@ -124,5 +148,5 @@ shutdown and stdout isolation. `provider/shutdown` returns `{}`; a process that 
 not terminate within its deadline receives `SIGTERM`, then `SIGKILL` after one final
 bounded grace period.
 
-Version 2 is a private provider ABI, not another public MCP protocol. Version 1 is not
-accepted; providers must upgrade atomically with the host.
+Version 3 is a private provider ABI, not another public MCP protocol. Older versions
+are not accepted; providers and host must upgrade atomically.

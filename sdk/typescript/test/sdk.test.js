@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { completeResult, createProvider, describeProvider, handleProviderMessage, inputRequiredResult, resourceResult, validateSchemaDefinition } from "../src/index.js";
+import { Readable } from "node:stream";
+import { completeResult, createProvider, describeProvider, handleProviderMessage, inputRequiredResult, resourceResult, serveProvider, validateSchemaDefinition } from "../src/index.js";
 
 function fixtureProvider() {
   return createProvider({
@@ -32,12 +33,12 @@ test("description never exposes handlers", () => {
 test("persistent messages preserve protocol and integer ids", async () => {
   const provider = fixtureProvider();
   const response = await handleProviderMessage(provider, {
-    protocol: "maelys-provider/2",
+    protocol: "maelys-provider/3",
     id: 7,
     method: "provider/call",
     params: { name: "fixture.echo", arguments: { message: "hello" } },
   });
-  assert.deepEqual(response, { protocol: "maelys-provider/2", id: 7, result: {
+  assert.deepEqual(response, { protocol: "maelys-provider/3", id: 7, result: {
     resultType: "complete", structuredContent: { message: "hello" },
   } });
   await assert.rejects(() => handleProviderMessage(provider, {
@@ -50,7 +51,7 @@ test("persistent messages preserve protocol and integer ids", async () => {
 
 test("unknown tools fail without invoking a handler", async () => {
   await assert.rejects(() => handleProviderMessage(fixtureProvider(), {
-    protocol: "maelys-provider/2",
+    protocol: "maelys-provider/3",
     id: 9,
     method: "provider/call",
     params: { name: "fixture.missing", arguments: {} },
@@ -73,12 +74,12 @@ test("MRTR forwards retry context and emits an explicit input_required result", 
     }],
   });
   const first = await handleProviderMessage(provider, {
-    protocol: "maelys-provider/2", id: 1, method: "provider/call",
+    protocol: "maelys-provider/3", id: 1, method: "provider/call",
     params: { name: "confirm", arguments: {} },
   });
   assert.equal(first.result.resultType, "input_required");
   const second = await handleProviderMessage(provider, {
-    protocol: "maelys-provider/2", id: 2, method: "provider/call",
+    protocol: "maelys-provider/3", id: 2, method: "provider/call",
     params: { name: "confirm", arguments: {}, inputResponses: { confirm: { action: "accept" } }, requestState: "opaque" },
   });
   assert.equal(second.result.resultType, "complete");
@@ -115,10 +116,48 @@ test("resources are described and read through the private provider contract", a
   assert.equal(description.resources[0].size, undefined);
   assert.equal(description.resourceTemplates[0].uriTemplate, "fixture://echo/{value}");
   const response = await handleProviderMessage(provider, {
-    protocol: "maelys-provider/2", id: 10, method: "provider/readResource",
+    protocol: "maelys-provider/3", id: 10, method: "provider/readResource",
     params: { uri: "fixture://echo/hello" },
   });
   assert.deepEqual(response.result, { resultType: "complete", contents: [{
     uri: "fixture://echo/hello", mimeType: "text/plain", text: "read fixture://echo/hello",
   }] });
+});
+
+test("provider/3 serializes asynchronous events with normal responses", async () => {
+  let provider;
+  provider = createProvider({
+    name: "events", version: "1", tools: [{
+      name: "events.emit", description: "Emit all event shapes.",
+      inputSchema: { type: "object" }, effect: "execute",
+      handler: async () => {
+        await provider.events.resourceUpdated("fixture://course/one");
+        await provider.events.resourcesListChanged();
+        await provider.events.toolsListChanged();
+        return completeResult({ structuredContent: { emitted: 3 } });
+      },
+    }],
+  });
+  await assert.rejects(() => provider.events.toolsListChanged(), /before activation/);
+  const requests = [
+    { protocol: "maelys-provider/3", id: 1, method: "provider/activate", params: {} },
+    { protocol: "maelys-provider/3", id: 2, method: "provider/call", params: { name: "events.emit", arguments: {} } },
+    { protocol: "maelys-provider/3", id: 3, method: "provider/shutdown", params: {} },
+  ];
+  const output = [];
+  await serveProvider(provider, {
+    input: Readable.from(requests.map((request) => `${JSON.stringify(request)}\n`)),
+    writeLine: (line) => { output.push(JSON.parse(line)); },
+    redirectConsole: false,
+  });
+  assert.deepEqual(output.map((message) => message.method ?? `response:${message.id}`), [
+    "response:1",
+    "provider/notifications/resources/updated",
+    "provider/notifications/resources/list_changed",
+    "provider/notifications/tools/list_changed",
+    "response:2",
+    "response:3",
+  ]);
+  assert.equal(output[1].params.uri, "fixture://course/one");
+  await assert.rejects(() => provider.events.toolsListChanged(), /after shutdown/);
 });

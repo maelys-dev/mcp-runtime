@@ -34,6 +34,12 @@ The TypeScript and Python SDK packages implement that public contract but contai
 application tools. Providers depend on an SDK; the native runtime never depends on an
 SDK or application package.
 
+Concrete providers live with the application that owns their business rules. For
+example, the Hermes provider belongs in the Hermes repository; this repository keeps
+only the protocol, SDKs, reference provider and conformance fixtures. That boundary
+lets Hermes release its tools independently without coupling the runtime to editorial
+code.
+
 Codex and Claude are MCP clients, not provider implementations. Their integration is a
 small launch configuration that starts the same `maelys-mcp` stdio host; no compiled
 client-specific adapter belongs in this library.
@@ -52,9 +58,13 @@ client-specific adapter belongs in this library.
 - `maelys_mcp_outbox_enqueue_take` steals a Jansson reference only on success. The
   unique writer releases it after the write callback returns; producers never write
   to the protocol descriptor.
-- `maelys_mcp_runtime_attach_outbox` borrows the bus. The embedding transport must
-  stop event producers and detach the bus before destroying it. Subscription ids and
-  resource filters are deep-copied by the runtime.
+- `maelys_mcp_runtime_attach_outbox` borrows the bus. Detaching closes the provider
+  event gate and waits for in-flight emissions before returning; the embedding
+  transport may then destroy the Outbox. Subscription ids and resource filters are
+  deep-copied by the runtime.
+- `maelys_mcp_provider_emit_event` borrows the event payload only for the duration of
+  the call. Process providers are activated after the Outbox is attached, preventing
+  startup events from being lost.
 
 ## Protocol eras
 
@@ -113,7 +123,9 @@ Responses are preferred, but after eight consecutive responses one pending
 notification is selected. Keyed notification replacement moves the event to the tail,
 preserving the most recent causal position rather than its first occurrence.
 
-The bus accepts multiple producers. In 0.6, subscription event APIs are asynchronous
-with respect to protocol writes, while request dispatch and provider calls remain
-synchronous. A mandatory subscription acknowledgement uses the priority lane so a
+The bus accepts multiple producers. In 0.7, native and process-provider event APIs are
+asynchronous with respect to protocol writes, while request dispatch and provider calls
+remain synchronous. Each process provider has one reader thread that separates id-less
+events from the one serialized request/response exchange. A mandatory subscription
+acknowledgement uses the priority lane so a
 later completion response cannot overtake the stream's first message.
