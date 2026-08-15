@@ -153,6 +153,60 @@ static int test_stalled_client_fails_within_write_deadline(void) {
     return 0;
 }
 
+static int test_failed_close_still_terminates_writer(void) {
+    static const char request[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"subscriptions/listen\","
+        "\"params\":{\"notifications\":{\"resourceSubscriptions\":[\"test://close\"]},"
+        "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
+        "\"io.modelcontextprotocol/clientInfo\":{\"name\":\"stdio-close\",\"version\":\"1\"},"
+        "\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n";
+    int input[2];
+    int output[2];
+    ASSERT_TRUE(pipe(input) == 0);
+    ASSERT_TRUE(pipe(output) == 0);
+    ASSERT_TRUE(fill_pipe(output[1]) == 0);
+    ASSERT_TRUE(write(input[1], request, sizeof(request) - 1u) ==
+        (ssize_t)(sizeof(request) - 1u));
+    ASSERT_TRUE(close(input[1]) == 0);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(output[0]);
+        maelys_mcp_runtime_config_t config = {
+            .server_name = "stdio-close-timeout",
+            .server_version = "test"
+        };
+        maelys_mcp_runtime_t *runtime = NULL;
+        if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) _exit(30);
+        if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) !=
+                MAELYS_MCP_OK ||
+            maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) !=
+                MAELYS_MCP_OK ||
+            maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS) !=
+                MAELYS_MCP_OK) _exit(31);
+        maelys_mcp_stdio_options_t options = {.write_timeout_ms = 50u};
+        maelys_mcp_result_t status = maelys_mcp_runtime_serve_stdio_with_options(
+            runtime, input[0], output[1], &options);
+        maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+        close(input[0]);
+        close(output[1]);
+        if (destroy_status != MAELYS_MCP_OK) _exit(32);
+        _exit(status == MAELYS_MCP_ERR_TIMEOUT ? 0 : 33);
+    }
+    close(input[0]);
+    close(output[1]);
+    int status = 0;
+    int exited = wait_for_child(pid, &status, 2000u);
+    if (!exited) {
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+    }
+    close(output[0]);
+    ASSERT_TRUE(exited);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
 static int test_stdio_restores_output_descriptor_flags(void) {
     int input[2];
     int output[2];
@@ -183,6 +237,8 @@ int main(void) {
         {"library stdout cannot contaminate MCP transport", test_library_stdout_cannot_contaminate_protocol},
         {"stalled stdio client fails within write deadline",
             test_stalled_client_fails_within_write_deadline},
+        {"failed close still terminates stdio writer",
+            test_failed_close_still_terminates_writer},
         {"stdio restores output descriptor flags",
             test_stdio_restores_output_descriptor_flags}
     };

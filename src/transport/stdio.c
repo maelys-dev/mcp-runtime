@@ -105,8 +105,12 @@ static maelys_mcp_result_t finish_stdio(
     int drain) {
     maelys_mcp_line_reader_clear(reader);
     maelys_mcp_result_t close_status = MAELYS_MCP_OK;
-    if (drain) close_status = maelys_mcp_channel_close(channel, 5000u);
-    else maelys_mcp_channel_abort(channel);
+    if (drain) {
+        close_status = maelys_mcp_channel_close(channel, 0u);
+        if (close_status != MAELYS_MCP_OK) maelys_mcp_channel_abort(channel);
+    } else {
+        maelys_mcp_channel_abort(channel);
+    }
     if (writer_started) pthread_join(writer, NULL);
     maelys_mcp_result_t destroy_status = maelys_mcp_channel_destroy(channel);
     close(wake_pipe[0]);

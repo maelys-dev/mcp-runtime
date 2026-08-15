@@ -78,6 +78,27 @@ static maelys_mcp_result_t activate_providers(maelys_mcp_runtime_t *runtime) {
     return MAELYS_MCP_OK;
 }
 
+static maelys_mcp_result_t begin_channel_create(maelys_mcp_runtime_t *runtime) {
+    pthread_mutex_lock(&runtime->lifecycle_mutex);
+    if (runtime->shutdown_requested ||
+        runtime->lifecycle == MAELYS_MCP_RUNTIME_SHUTTING_DOWN) {
+        pthread_mutex_unlock(&runtime->lifecycle_mutex);
+        return MAELYS_MCP_ERR_STATE;
+    }
+    runtime->channel_creators_inflight++;
+    pthread_mutex_unlock(&runtime->lifecycle_mutex);
+    return MAELYS_MCP_OK;
+}
+
+static void end_channel_create(maelys_mcp_runtime_t *runtime) {
+    pthread_mutex_lock(&runtime->lifecycle_mutex);
+    runtime->channel_creators_inflight--;
+    if (runtime->channel_creators_inflight == 0u) {
+        pthread_cond_broadcast(&runtime->lifecycle_changed);
+    }
+    pthread_mutex_unlock(&runtime->lifecycle_mutex);
+}
+
 static maelys_mcp_result_t publish_channel(
     maelys_mcp_runtime_t *runtime,
     maelys_mcp_channel_t *channel) {
@@ -144,16 +165,17 @@ maelys_mcp_result_t maelys_mcp_channel_create(
     maelys_mcp_channel_t **out_channel) {
     if (!runtime || !out_channel) return MAELYS_MCP_ERR_ARGUMENT;
     *out_channel = NULL;
-    maelys_mcp_channel_t *channel = NULL;
-    maelys_mcp_result_t status = initialize_channel(runtime, config, &channel);
+    maelys_mcp_result_t status = begin_channel_create(runtime);
     if (status != MAELYS_MCP_OK) return status;
-    status = publish_channel(runtime, channel);
-    if (status != MAELYS_MCP_OK) {
-        free_unpublished_channel(channel);
-        return status;
+    maelys_mcp_channel_t *channel = NULL;
+    status = initialize_channel(runtime, config, &channel);
+    if (status == MAELYS_MCP_OK) {
+        status = publish_channel(runtime, channel);
+        if (status != MAELYS_MCP_OK) free_unpublished_channel(channel);
     }
-    *out_channel = channel;
-    return MAELYS_MCP_OK;
+    if (status == MAELYS_MCP_OK) *out_channel = channel;
+    end_channel_create(runtime);
+    return status;
 }
 
 static maelys_mcp_result_t begin_operation(maelys_mcp_channel_t *channel) {
@@ -180,7 +202,7 @@ static void fault_channel(maelys_mcp_channel_t *channel) {
     maelys_mcp_runtime_t *runtime = channel->runtime;
     pthread_mutex_lock(&runtime->channels_mutex);
     pthread_mutex_lock(&channel->mutex);
-    if (channel->state == MAELYS_MCP_CHANNEL_ACTIVE) {
+    if (channel->state != MAELYS_MCP_CHANNEL_CLOSED) {
         channel->state = MAELYS_MCP_CHANNEL_FAULTED;
         channel->targetable = 0;
     }
@@ -204,6 +226,23 @@ maelys_mcp_result_t maelys_mcp_channel_enqueue_take(
     if (!channel || !message) return MAELYS_MCP_ERR_ARGUMENT;
     maelys_mcp_result_t status = maelys_mcp_outbox_enqueue_take(
         channel->outbox, message, message_class, coalesce_key);
+    if (fault_on_timeout &&
+        (status == MAELYS_MCP_ERR_TIMEOUT || status == MAELYS_MCP_ERR_CLOSED)) {
+        fault_channel(channel);
+    }
+    return status;
+}
+
+maelys_mcp_result_t maelys_mcp_channel_enqueue_take_until(
+    maelys_mcp_channel_t *channel,
+    json_t *message,
+    maelys_mcp_outbox_class_t message_class,
+    const char *coalesce_key,
+    int fault_on_timeout,
+    uint64_t deadline_ms) {
+    if (!channel || !message) return MAELYS_MCP_ERR_ARGUMENT;
+    maelys_mcp_result_t status = maelys_mcp_outbox_enqueue_take_until(
+        channel->outbox, message, message_class, coalesce_key, deadline_ms);
     if (fault_on_timeout &&
         (status == MAELYS_MCP_ERR_TIMEOUT || status == MAELYS_MCP_ERR_CLOSED)) {
         fault_channel(channel);
@@ -335,10 +374,13 @@ maelys_mcp_result_t maelys_mcp_channel_close(
     }
     pthread_mutex_unlock(&channel->mutex);
     maelys_mcp_result_t status = MAELYS_MCP_OK;
-    if (!was_faulted) status = maelys_mcp_channel_complete_subscriptions(channel);
+    if (!was_faulted) {
+        status = maelys_mcp_channel_complete_subscriptions_until(
+            channel, deadline_ms);
+    }
     maelys_mcp_result_t closed = maelys_mcp_outbox_close(channel->outbox, 0);
     maelys_mcp_result_t drained = closed == MAELYS_MCP_OK ?
-        maelys_mcp_outbox_wait_drained(channel->outbox, timeout_ms) : closed;
+        maelys_mcp_outbox_wait_drained_until(channel->outbox, deadline_ms) : closed;
     if (status != MAELYS_MCP_OK) return status;
     if (drained != MAELYS_MCP_OK) return drained;
     pthread_mutex_lock(&channel->mutex);

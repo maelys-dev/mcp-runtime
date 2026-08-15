@@ -23,18 +23,31 @@ struct maelys_mcp_outbox {
     pthread_mutex_t mutex;
     pthread_cond_t available;
     pthread_cond_t space;
+    pthread_cond_t idle;
     maelys_mcp_outbox_config_t config;
     outbox_queue_t responses;
     outbox_queue_t notifications;
     size_t queued_messages;
     size_t queued_bytes;
     size_t consecutive_responses;
+    size_t waiters;
     int accepting;
     atomic_ullong enqueued;
     atomic_ullong dequeued;
     atomic_ullong coalesced;
     atomic_ullong rejected;
 };
+
+static int wait_until(
+    maelys_mcp_outbox_t *outbox,
+    pthread_cond_t *condition,
+    uint64_t deadline_ms) {
+    outbox->waiters++;
+    int status = maelys_mcp_cond_wait_until(condition, &outbox->mutex, deadline_ms);
+    outbox->waiters--;
+    if (outbox->waiters == 0u) pthread_cond_broadcast(&outbox->idle);
+    return status;
+}
 
 static char *copy_string(const char *value) {
     if (!value || !*value) return NULL;
@@ -143,9 +156,12 @@ maelys_mcp_result_t maelys_mcp_outbox_create(
     if (pthread_mutex_init(&outbox->mutex, NULL) != 0) goto failed;
     if (maelys_mcp_cond_init_monotonic(&outbox->available) != 0) goto failed_mutex;
     if (maelys_mcp_cond_init_monotonic(&outbox->space) != 0) goto failed_available;
+    if (maelys_mcp_cond_init_monotonic(&outbox->idle) != 0) goto failed_space;
     *out_outbox = outbox;
     return MAELYS_MCP_OK;
 
+failed_space:
+    pthread_cond_destroy(&outbox->space);
 failed_available:
     pthread_cond_destroy(&outbox->available);
 failed_mutex:
@@ -160,6 +176,21 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
     json_t *message,
     maelys_mcp_outbox_class_t message_class,
     const char *coalesce_key) {
+    uint64_t deadline_ms = 0u;
+    if (!outbox || maelys_mcp_monotonic_deadline(
+            outbox->config.admission_timeout_ms, &deadline_ms) != 0) {
+        return outbox ? MAELYS_MCP_ERR_IO : MAELYS_MCP_ERR_ARGUMENT;
+    }
+    return maelys_mcp_outbox_enqueue_take_until(
+        outbox, message, message_class, coalesce_key, deadline_ms);
+}
+
+maelys_mcp_result_t maelys_mcp_outbox_enqueue_take_until(
+    maelys_mcp_outbox_t *outbox,
+    json_t *message,
+    maelys_mcp_outbox_class_t message_class,
+    const char *coalesce_key,
+    uint64_t deadline_ms) {
     if (!outbox || !message ||
         (message_class != MAELYS_MCP_OUTBOX_RESPONSE &&
          message_class != MAELYS_MCP_OUTBOX_NOTIFICATION) ||
@@ -174,18 +205,12 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
     }
     char *key = copy_string(coalesce_key);
     if (coalesce_key && *coalesce_key && !key) return MAELYS_MCP_ERR_MEMORY;
-    uint64_t deadline_ms = 0u;
-    if (maelys_mcp_monotonic_deadline(
-        outbox->config.admission_timeout_ms, &deadline_ms) != 0) {
-        free(key);
-        return MAELYS_MCP_ERR_IO;
-    }
     pthread_mutex_lock(&outbox->mutex);
     for (;;) {
         if (!outbox->accepting) {
+            atomic_fetch_add(&outbox->rejected, 1u);
             pthread_mutex_unlock(&outbox->mutex);
             free(key);
-            atomic_fetch_add(&outbox->rejected, 1u);
             return MAELYS_MCP_ERR_CLOSED;
         }
         outbox_node_t *previous = NULL;
@@ -211,9 +236,9 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
                    outbox->queued_bytes + bytes <= outbox->config.max_bytes) {
             outbox_node_t *created = calloc(1u, sizeof(*created));
             if (!created) {
+                atomic_fetch_add(&outbox->rejected, 1u);
                 pthread_mutex_unlock(&outbox->mutex);
                 free(key);
-                atomic_fetch_add(&outbox->rejected, 1u);
                 return MAELYS_MCP_ERR_MEMORY;
             }
             created->message = message;
@@ -228,18 +253,17 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
             pthread_mutex_unlock(&outbox->mutex);
             return MAELYS_MCP_OK;
         }
-        int waited = maelys_mcp_cond_wait_until(
-            &outbox->space, &outbox->mutex, deadline_ms);
+        int waited = wait_until(outbox, &outbox->space, deadline_ms);
         if (waited == ETIMEDOUT) {
+            atomic_fetch_add(&outbox->rejected, 1u);
             pthread_mutex_unlock(&outbox->mutex);
             free(key);
-            atomic_fetch_add(&outbox->rejected, 1u);
             return MAELYS_MCP_ERR_TIMEOUT;
         }
         if (waited != 0) {
+            atomic_fetch_add(&outbox->rejected, 1u);
             pthread_mutex_unlock(&outbox->mutex);
             free(key);
-            atomic_fetch_add(&outbox->rejected, 1u);
             return MAELYS_MCP_ERR_IO;
         }
     }
@@ -257,8 +281,7 @@ maelys_mcp_result_t maelys_mcp_outbox_next(
     }
     pthread_mutex_lock(&outbox->mutex);
     while (outbox->queued_messages == 0u && outbox->accepting) {
-        int waited = maelys_mcp_cond_wait_until(
-            &outbox->available, &outbox->mutex, deadline_ms);
+        int waited = wait_until(outbox, &outbox->available, deadline_ms);
         if (waited == ETIMEDOUT) {
             pthread_mutex_unlock(&outbox->mutex);
             return MAELYS_MCP_ERR_TIMEOUT;
@@ -309,14 +332,20 @@ maelys_mcp_result_t maelys_mcp_outbox_wait_drained(
     if (maelys_mcp_monotonic_deadline(timeout_ms, &deadline_ms) != 0) {
         return MAELYS_MCP_ERR_IO;
     }
+    return maelys_mcp_outbox_wait_drained_until(outbox, deadline_ms);
+}
+
+maelys_mcp_result_t maelys_mcp_outbox_wait_drained_until(
+    maelys_mcp_outbox_t *outbox,
+    uint64_t deadline_ms) {
+    if (!outbox) return MAELYS_MCP_ERR_ARGUMENT;
     pthread_mutex_lock(&outbox->mutex);
     if (outbox->accepting) {
         pthread_mutex_unlock(&outbox->mutex);
         return MAELYS_MCP_ERR_STATE;
     }
     while (outbox->queued_messages != 0u) {
-        int waited = maelys_mcp_cond_wait_until(
-            &outbox->space, &outbox->mutex, deadline_ms);
+        int waited = wait_until(outbox, &outbox->space, deadline_ms);
         if (waited == ETIMEDOUT) {
             pthread_mutex_unlock(&outbox->mutex);
             return MAELYS_MCP_ERR_TIMEOUT;
@@ -337,12 +366,24 @@ maelys_mcp_result_t maelys_mcp_outbox_destroy(maelys_mcp_outbox_t *outbox) {
         pthread_mutex_unlock(&outbox->mutex);
         return MAELYS_MCP_ERR_STATE;
     }
+    while (outbox->waiters != 0u) {
+        pthread_cond_wait(&outbox->idle, &outbox->mutex);
+    }
     pthread_mutex_unlock(&outbox->mutex);
+    pthread_cond_destroy(&outbox->idle);
     pthread_cond_destroy(&outbox->space);
     pthread_cond_destroy(&outbox->available);
     pthread_mutex_destroy(&outbox->mutex);
     free(outbox);
     return MAELYS_MCP_OK;
+}
+
+size_t maelys_mcp_outbox_waiter_count(maelys_mcp_outbox_t *outbox) {
+    if (!outbox) return 0u;
+    pthread_mutex_lock(&outbox->mutex);
+    size_t count = outbox->waiters;
+    pthread_mutex_unlock(&outbox->mutex);
+    return count;
 }
 
 void maelys_mcp_outbox_stats(

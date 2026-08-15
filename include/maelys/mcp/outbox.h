@@ -64,7 +64,7 @@ maelys_mcp_result_t maelys_mcp_outbox_wait_drained(
     maelys_mcp_outbox_t *outbox,
     unsigned int timeout_ms);
 
-/* Frees a closed and drained queue. */
+/* Frees a closed and drained queue after awakened waiters have returned. */
 maelys_mcp_result_t maelys_mcp_outbox_destroy(
     maelys_mcp_outbox_t *outbox);
 
