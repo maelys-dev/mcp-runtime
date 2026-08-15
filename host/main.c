@@ -29,7 +29,8 @@ static void usage(FILE *stream) {
         "                  [--allow-effect apply|commit|execute ...]\n"
         "                  [--provider-describe-timeout-ms N]\n"
         "                  [--provider-call-timeout-ms N]\n"
-        "                  [--provider-shutdown-timeout-ms N]\n");
+        "                  [--provider-shutdown-timeout-ms N]\n"
+        "                  [--stdio-write-timeout-ms N]\n");
 }
 
 static int parse_timeout(const char *value, unsigned int *out) {
@@ -50,6 +51,7 @@ int main(int argc, char **argv) {
     unsigned int describe_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS;
     unsigned int call_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS;
     unsigned int shutdown_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS;
+    unsigned int stdio_write_timeout_ms = MAELYS_MCP_DEFAULT_STDIO_WRITE_TIMEOUT_MS;
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--provider") == 0 && index + 1 < argc) {
             provider_paths[provider_count++] = argv[++index];
@@ -68,6 +70,8 @@ int main(int argc, char **argv) {
             index + 1 < argc && parse_timeout(argv[++index], &call_timeout_ms) == 0) {
         } else if (strcmp(argv[index], "--provider-shutdown-timeout-ms") == 0 &&
             index + 1 < argc && parse_timeout(argv[++index], &shutdown_timeout_ms) == 0) {
+        } else if (strcmp(argv[index], "--stdio-write-timeout-ms") == 0 &&
+            index + 1 < argc && parse_timeout(argv[++index], &stdio_write_timeout_ms) == 0) {
         } else if (strcmp(argv[index], "--help") == 0) {
             usage(stdout);
             free(provider_paths);
@@ -157,7 +161,11 @@ int main(int argc, char **argv) {
         free(error);
     }
     free(provider_paths);
-    status = maelys_mcp_runtime_serve_stdio(runtime, STDIN_FILENO, transport_fd);
+    maelys_mcp_stdio_options_t stdio_options = {
+        .write_timeout_ms = stdio_write_timeout_ms
+    };
+    status = maelys_mcp_runtime_serve_stdio_with_options(
+        runtime, STDIN_FILENO, transport_fd, &stdio_options);
     maelys_mcp_runtime_destroy(runtime);
     close(transport_fd);
     if (status != MAELYS_MCP_OK) {

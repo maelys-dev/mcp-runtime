@@ -4,6 +4,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -278,6 +279,85 @@ static int test_concurrent_producers_and_cancel(void) {
     return 0;
 }
 
+static int subscription_model_matches(
+    maelys_mcp_runtime_t *runtime,
+    const int active[4]) {
+    size_t expected_count = 0u;
+    for (size_t index = 0; index < 4u; ++index) {
+        if (active[index]) expected_count++;
+    }
+    int seen[4] = {0};
+    int matches = 1;
+    pthread_mutex_lock(&runtime->subscriptions_mutex);
+    if (runtime->subscription_count != expected_count) matches = 0;
+    for (size_t index = 0; matches && index < runtime->subscription_count; ++index) {
+        maelys_mcp_subscription_t *subscription = &runtime->subscriptions[index];
+        if (!subscription->active || !json_is_integer(subscription->id)) {
+            matches = 0;
+            break;
+        }
+        json_int_t id = json_integer_value(subscription->id);
+        if (id < 0 || id >= 4 || !active[(size_t)id] || seen[(size_t)id]) {
+            matches = 0;
+            break;
+        }
+        seen[(size_t)id] = 1;
+    }
+    pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    if (!matches) return 0;
+    for (size_t index = 0; index < 4u; ++index) {
+        if (seen[index] != active[index]) return 0;
+    }
+    return 1;
+}
+
+static int test_randomized_subscription_state_machine(void) {
+    capture_t capture = {0};
+    maelys_mcp_outbox_t *outbox = NULL;
+    maelys_mcp_runtime_t *runtime = runtime_with_outbox(&capture, &outbox);
+    ASSERT_TRUE(runtime != NULL);
+    int active[4] = {0};
+    uint32_t random_state = 0x9e3779b9u;
+    for (size_t iteration = 0; iteration < 512u; ++iteration) {
+        random_state = random_state * 1103515245u + 12345u;
+        size_t id = (size_t)((random_state >> 8u) % 4u);
+        unsigned int action = (random_state >> 16u) % 3u;
+        if (action == 0u) {
+            json_t *request = listen_request(json_integer((json_int_t)id),
+                json_pack("{s:b}", "toolsListChanged", 1));
+            ASSERT_TRUE(request != NULL);
+            json_t *response = maelys_mcp_runtime_handle(runtime, request);
+            json_decref(request);
+            if (active[id]) {
+                ASSERT_TRUE(response != NULL);
+                ASSERT_TRUE(json_integer_value(json_object_get(
+                    json_object_get(response, "error"), "code")) == -32602);
+                json_decref(response);
+            } else {
+                ASSERT_TRUE(response == NULL);
+                active[id] = 1;
+            }
+        } else if (action == 1u) {
+            json_t *request = cancel_notification(json_integer((json_int_t)id));
+            ASSERT_TRUE(request != NULL);
+            ASSERT_TRUE(maelys_mcp_runtime_handle(runtime, request) == NULL);
+            json_decref(request);
+            active[id] = 0;
+        } else {
+            ASSERT_TRUE(maelys_mcp_runtime_notify_tools_list_changed(runtime) ==
+                MAELYS_MCP_OK);
+        }
+        ASSERT_TRUE(subscription_model_matches(runtime, active));
+    }
+    ASSERT_TRUE(maelys_mcp_runtime_complete_subscriptions(runtime) == MAELYS_MCP_OK);
+    maelys_mcp_runtime_detach_outbox(runtime);
+    ASSERT_TRUE(maelys_mcp_outbox_destroy(outbox, 1) == MAELYS_MCP_OK);
+    outbox = NULL;
+    ASSERT_TRUE(capture.count > 0u);
+    cleanup(runtime, NULL, &capture);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"subscription negotiation, event filters and cancellation",
@@ -287,7 +367,9 @@ int main(void) {
         {"subscription-dependent capability advertisement",
             test_capabilities_depend_on_module},
         {"concurrent event producers and cancellation",
-            test_concurrent_producers_and_cancel}
+            test_concurrent_producers_and_cancel},
+        {"randomized subscription state machine",
+            test_randomized_subscription_state_machine}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }

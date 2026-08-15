@@ -25,6 +25,8 @@
 - `requestState` is opaque to the runtime. A mutating provider must authenticate and
   bind it to the operation, arguments, expected round and expiration before acting.
 - Request and provider message sizes are bounded.
+- Stdio output writes have a bounded per-message deadline; a non-draining client closes
+  the output bus and wakes blocked producers instead of freezing the runtime.
 - Protocol fields that enter length-unaware C APIs reject embedded NUL bytes.
 - Resource URIs are length-bounded, parsed and normalized behind an opaque uriparser
   facade; embedded NUL and encoded `%00` are rejected before provider dispatch.

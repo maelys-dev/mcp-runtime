@@ -188,7 +188,7 @@ int main(void) {
     };
     const maelys_mcp_provider_sdk_config_t config = {
         .name = "example",
-        .version = "0.8.0",
+        .version = "0.9.0",
         .tools = tools,
         .tool_count = sizeof(tools) / sizeof(tools[0]),
         .resources = resources,

@@ -3,9 +3,13 @@
 #include "maelys/mcp/version.h"
 
 #include <errno.h>
+#include <limits.h>
+#include <poll.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAELYS_MCP_READ_CHUNK_BYTES 4096u
@@ -81,6 +85,71 @@ static maelys_mcp_result_t write_all(int fd, const char *bytes, size_t length) {
     return MAELYS_MCP_OK;
 }
 
+static int monotonic_milliseconds(uint64_t *out_value) {
+    struct timespec now;
+    if (!out_value || clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    *out_value = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+    return 0;
+}
+
+static maelys_mcp_result_t wait_writable(int fd, uint64_t deadline_ms) {
+    for (;;) {
+        uint64_t now_ms = 0u;
+        if (monotonic_milliseconds(&now_ms) != 0 || now_ms >= deadline_ms) {
+            return MAELYS_MCP_ERR_IO;
+        }
+        uint64_t remaining = deadline_ms - now_ms;
+        int timeout = remaining > (uint64_t)INT_MAX ? INT_MAX : (int)remaining;
+        struct pollfd descriptor = {.fd = fd, .events = POLLOUT};
+        int ready = poll(&descriptor, 1u, timeout);
+        if (ready > 0) {
+            if (descriptor.revents & POLLOUT) return MAELYS_MCP_OK;
+            if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                return MAELYS_MCP_ERR_IO;
+            }
+            continue;
+        }
+        if (ready == 0) return MAELYS_MCP_ERR_IO;
+        if (errno != EINTR) return MAELYS_MCP_ERR_IO;
+    }
+}
+
+static maelys_mcp_result_t write_all_with_timeout(
+    int fd,
+    const char *bytes,
+    size_t length,
+    unsigned int timeout_ms) {
+    uint64_t started_ms = 0u;
+    if (!timeout_ms || monotonic_milliseconds(&started_ms) != 0 ||
+        started_ms > UINT64_MAX - timeout_ms) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    uint64_t deadline_ms = started_ms + timeout_ms;
+    long pipe_limit = fpathconf(fd, _PC_PIPE_BUF);
+    size_t chunk_limit = pipe_limit > 0 ? (size_t)pipe_limit : 512u;
+    if (chunk_limit > 16384u) chunk_limit = 16384u;
+    while (length > 0u) {
+        maelys_mcp_result_t ready = wait_writable(fd, deadline_ms);
+        if (ready != MAELYS_MCP_OK) return ready;
+        size_t chunk = length < chunk_limit ? length : chunk_limit;
+        ssize_t written;
+#ifdef MSG_NOSIGNAL
+        written = send(fd, bytes, chunk, MSG_NOSIGNAL);
+        if (written < 0 && errno == ENOTSOCK) written = write(fd, bytes, chunk);
+#else
+        written = write(fd, bytes, chunk);
+#endif
+        if (written < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return MAELYS_MCP_ERR_IO;
+        }
+        if (written == 0) return MAELYS_MCP_ERR_IO;
+        bytes += (size_t)written;
+        length -= (size_t)written;
+    }
+    return MAELYS_MCP_OK;
+}
+
 maelys_mcp_result_t maelys_mcp_write_json_line(int fd, json_t *value) {
     if (fd < 0 || !value) return MAELYS_MCP_ERR_ARGUMENT;
     maelys_mcp_jsonrpc_core_t core;
@@ -91,6 +160,25 @@ maelys_mcp_result_t maelys_mcp_write_json_line(int fd, json_t *value) {
     maelys_mcp_result_t result = maelys_mcp_jsonrpc_core_serialize(
         &core, value, &encoded, &encoded_length);
     if (result == MAELYS_MCP_OK) result = write_all(fd, encoded, encoded_length);
+    free(encoded);
+    return result;
+}
+
+maelys_mcp_result_t maelys_mcp_write_json_line_with_timeout(
+    int fd,
+    json_t *value,
+    unsigned int timeout_ms) {
+    if (fd < 0 || !value || !timeout_ms) return MAELYS_MCP_ERR_ARGUMENT;
+    maelys_mcp_jsonrpc_core_t core;
+    memset(&core, 0, sizeof(core));
+    core.framing = MAELYS_MCP_JSONRPC_JSON_LINES;
+    char *encoded = NULL;
+    size_t encoded_length = 0u;
+    maelys_mcp_result_t result = maelys_mcp_jsonrpc_core_serialize(
+        &core, value, &encoded, &encoded_length);
+    if (result == MAELYS_MCP_OK) {
+        result = write_all_with_timeout(fd, encoded, encoded_length, timeout_ms);
+    }
     free(encoded);
     return result;
 }
@@ -164,6 +252,64 @@ static maelys_mcp_result_t line_reader_extract(
     return MAELYS_MCP_OK;
 }
 
+maelys_mcp_result_t maelys_mcp_line_reader_next(
+    maelys_mcp_line_reader_t *reader,
+    json_t **out_value,
+    char **out_error) {
+    if (!reader || !out_value || !reader->max_bytes) return MAELYS_MCP_ERR_ARGUMENT;
+    *out_value = NULL;
+    return line_reader_extract(reader, out_value, out_error);
+}
+
+maelys_mcp_result_t maelys_mcp_line_reader_read_once(
+    maelys_mcp_line_reader_t *reader,
+    int fd,
+    json_t **out_value,
+    char **out_error,
+    int *out_eof) {
+    if (!reader || fd < 0 || !out_value || !out_eof || !reader->max_bytes) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    *out_value = NULL;
+    *out_eof = 0;
+    maelys_mcp_result_t extracted = line_reader_extract(reader, out_value, out_error);
+    if (extracted != MAELYS_MCP_ERR_NOT_FOUND) return extracted;
+    if (reader->length > reader->max_bytes) {
+        set_error(out_error, "JSON line exceeds configured limit");
+        return MAELYS_MCP_ERR_PROTOCOL;
+    }
+    size_t target = reader->length + MAELYS_MCP_READ_CHUNK_BYTES;
+    if (target > reader->max_bytes + 1u) target = reader->max_bytes + 1u;
+    maelys_mcp_result_t reserved = line_reader_reserve(reader, target);
+    if (reserved != MAELYS_MCP_OK) return reserved;
+    size_t available = reader->capacity - reader->length;
+    if (!available) {
+        set_error(out_error, "JSON line exceeds configured limit");
+        return MAELYS_MCP_ERR_PROTOCOL;
+    }
+    ssize_t count;
+    do {
+        count = read(fd, reader->buffer + reader->length, available);
+    } while (count < 0 && errno == EINTR);
+    if (count < 0) {
+        set_error(out_error, "read failed");
+        return MAELYS_MCP_ERR_IO;
+    }
+    if (count == 0) {
+        *out_eof = 1;
+        if (!reader->length) return MAELYS_MCP_ERR_NOT_FOUND;
+        set_error(out_error, "unexpected EOF in JSON line");
+        return MAELYS_MCP_ERR_PROTOCOL;
+    }
+    reader->length += (size_t)count;
+    extracted = line_reader_extract(reader, out_value, out_error);
+    if (extracted == MAELYS_MCP_ERR_NOT_FOUND && reader->length > reader->max_bytes) {
+        set_error(out_error, "JSON line exceeds configured limit");
+        return MAELYS_MCP_ERR_PROTOCOL;
+    }
+    return extracted;
+}
+
 maelys_mcp_result_t maelys_mcp_line_reader_read(
     maelys_mcp_line_reader_t *reader,
     int fd,
@@ -172,35 +318,11 @@ maelys_mcp_result_t maelys_mcp_line_reader_read(
     if (!reader || fd < 0 || !out_value || !reader->max_bytes) {
         return MAELYS_MCP_ERR_ARGUMENT;
     }
-    *out_value = NULL;
     for (;;) {
-        maelys_mcp_result_t extracted = line_reader_extract(reader, out_value, out_error);
-        if (extracted != MAELYS_MCP_ERR_NOT_FOUND) return extracted;
-        if (reader->length > reader->max_bytes) {
-            set_error(out_error, "JSON line exceeds configured limit");
-            return MAELYS_MCP_ERR_PROTOCOL;
-        }
-        size_t target = reader->length + MAELYS_MCP_READ_CHUNK_BYTES;
-        if (target > reader->max_bytes + 1u) target = reader->max_bytes + 1u;
-        maelys_mcp_result_t reserved = line_reader_reserve(reader, target);
-        if (reserved != MAELYS_MCP_OK) return reserved;
-        size_t available = reader->capacity - reader->length;
-        if (!available) {
-            set_error(out_error, "JSON line exceeds configured limit");
-            return MAELYS_MCP_ERR_PROTOCOL;
-        }
-        ssize_t count = read(fd, reader->buffer + reader->length, available);
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            set_error(out_error, "read failed");
-            return MAELYS_MCP_ERR_IO;
-        }
-        if (count == 0) {
-            if (!reader->length) return MAELYS_MCP_ERR_NOT_FOUND;
-            set_error(out_error, "unexpected EOF in JSON line");
-            return MAELYS_MCP_ERR_PROTOCOL;
-        }
-        reader->length += (size_t)count;
+        int eof = 0;
+        maelys_mcp_result_t status = maelys_mcp_line_reader_read_once(
+            reader, fd, out_value, out_error, &eof);
+        if (status != MAELYS_MCP_ERR_NOT_FOUND || eof) return status;
     }
 }
 

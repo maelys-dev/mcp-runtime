@@ -239,10 +239,11 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
     pthread_mutex_lock(&outbox->mutex);
     for (;;) {
         if (!outbox->accepting || outbox->writer_status != MAELYS_MCP_OK) {
+            maelys_mcp_result_t status = outbox->writer_status == MAELYS_MCP_OK ?
+                MAELYS_MCP_ERR_IO : outbox->writer_status;
             pthread_mutex_unlock(&outbox->mutex);
             free(key);
-            return outbox->writer_status == MAELYS_MCP_OK ?
-                MAELYS_MCP_ERR_IO : outbox->writer_status;
+            return status;
         }
         outbox_node_t *previous = NULL;
         outbox_node_t *existing = key ? find_notification(

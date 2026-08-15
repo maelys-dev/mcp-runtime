@@ -15,6 +15,7 @@ extern "C" {
 #define MAELYS_MCP_PROTOCOL_MODERN "2026-07-28"
 #define MAELYS_MCP_PROTOCOL_LEGACY "2025-11-25"
 #define MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES (1024u * 1024u)
+#define MAELYS_MCP_DEFAULT_STDIO_WRITE_TIMEOUT_MS 5000u
 
 typedef struct maelys_mcp_runtime maelys_mcp_runtime_t;
 
@@ -56,6 +57,10 @@ typedef struct maelys_mcp_runtime_config {
     void *policy_context;
 } maelys_mcp_runtime_config_t;
 
+typedef struct maelys_mcp_stdio_options {
+    unsigned int write_timeout_ms;
+} maelys_mcp_stdio_options_t;
+
 maelys_mcp_result_t maelys_mcp_runtime_create(
     const maelys_mcp_runtime_config_t *config,
     maelys_mcp_runtime_t **out_runtime);
@@ -82,6 +87,16 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
     maelys_mcp_runtime_t *runtime,
     int read_fd,
     int write_fd);
+
+/*
+ * Serves stdio with bounded output writes. A zero timeout selects
+ * MAELYS_MCP_DEFAULT_STDIO_WRITE_TIMEOUT_MS.
+ */
+maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
+    maelys_mcp_runtime_t *runtime,
+    int read_fd,
+    int write_fd,
+    const maelys_mcp_stdio_options_t *options);
 
 #ifdef __cplusplus
 }
