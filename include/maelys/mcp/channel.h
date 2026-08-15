@@ -54,8 +54,9 @@ maelys_mcp_result_t maelys_mcp_channel_close(
     unsigned int timeout_ms);
 
 /*
- * Closes when needed, unregisters the channel, and frees it. On failure the
- * handle remains valid and must be closed/drained before retrying.
+ * Closes when needed, unregisters the channel, and frees it. The handle is
+ * consumed even if the bounded close reports an error, so it must never be
+ * used or destroyed again after this call returns.
  */
 maelys_mcp_result_t maelys_mcp_channel_destroy(
     maelys_mcp_channel_t *channel);

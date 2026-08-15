@@ -74,6 +74,14 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->lifecycle_mutex_initialized = 1;
     if (maelys_mcp_cond_init_monotonic(&runtime->lifecycle_changed) != 0) goto failed;
     runtime->lifecycle_changed_initialized = 1;
+    if (pthread_mutex_init(&runtime->channel_create_gate_mutex, NULL) != 0) {
+        goto failed;
+    }
+    runtime->channel_create_gate_mutex_initialized = 1;
+    if (maelys_mcp_cond_init_monotonic(&runtime->channel_create_gate_drained) != 0) {
+        goto failed;
+    }
+    runtime->channel_create_gate_drained_initialized = 1;
     if (pthread_mutex_init(&runtime->channels_mutex, NULL) != 0) goto failed;
     runtime->channels_mutex_initialized = 1;
     if (pthread_mutex_init(&runtime->provider_events_mutex, NULL) != 0) {
@@ -84,7 +92,7 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->provider_events_idle_initialized = 1;
     runtime->lifecycle = MAELYS_MCP_RUNTIME_COLD;
     runtime->activation_status = MAELYS_MCP_OK;
-    atomic_init(&runtime->channel_create_gate, UINT64_C(0));
+    runtime->channel_create_accepting = 1;
     *out_runtime = runtime;
     return MAELYS_MCP_OK;
 
@@ -97,6 +105,12 @@ failed:
     }
     if (runtime->channels_mutex_initialized) {
         pthread_mutex_destroy(&runtime->channels_mutex);
+    }
+    if (runtime->channel_create_gate_drained_initialized) {
+        pthread_cond_destroy(&runtime->channel_create_gate_drained);
+    }
+    if (runtime->channel_create_gate_mutex_initialized) {
+        pthread_mutex_destroy(&runtime->channel_create_gate_mutex);
     }
     if (runtime->lifecycle_changed_initialized) {
         pthread_cond_destroy(&runtime->lifecycle_changed);
@@ -114,20 +128,18 @@ failed:
 
 maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     if (!runtime) return MAELYS_MCP_ERR_ARGUMENT;
-    atomic_fetch_or_explicit(&runtime->channel_create_gate,
-        MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED, memory_order_acq_rel);
+    pthread_mutex_lock(&runtime->channel_create_gate_mutex);
+    runtime->channel_create_accepting = 0;
+    while (runtime->channel_creators_admitted != 0u) {
+        pthread_cond_wait(&runtime->channel_create_gate_drained,
+            &runtime->channel_create_gate_mutex);
+    }
+    pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
+
     pthread_mutex_lock(&runtime->lifecycle_mutex);
     runtime->shutdown_requested = 1;
-    if (runtime->lifecycle != MAELYS_MCP_RUNTIME_ACTIVATING) {
-        runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
-    }
-    pthread_cond_broadcast(&runtime->lifecycle_changed);
-    while ((atomic_load_explicit(&runtime->channel_create_gate,
-                memory_order_acquire) &
-            MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) != 0u) {
-        pthread_cond_wait(&runtime->lifecycle_changed, &runtime->lifecycle_mutex);
-    }
     runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
+    pthread_cond_broadcast(&runtime->lifecycle_changed);
     pthread_mutex_lock(&runtime->channels_mutex);
     if (runtime->live_channel_count != 0u) {
         pthread_mutex_unlock(&runtime->channels_mutex);
@@ -144,6 +156,8 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     pthread_cond_destroy(&runtime->provider_events_idle);
     pthread_mutex_destroy(&runtime->provider_events_mutex);
     pthread_mutex_destroy(&runtime->channels_mutex);
+    pthread_cond_destroy(&runtime->channel_create_gate_drained);
+    pthread_mutex_destroy(&runtime->channel_create_gate_mutex);
     pthread_cond_destroy(&runtime->lifecycle_changed);
     pthread_mutex_destroy(&runtime->lifecycle_mutex);
     free(runtime->providers);

@@ -73,6 +73,10 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
 /*
  * Closes channel-create admission, waits for admitted creators, and returns
  * MAELYS_MCP_ERR_STATE without freeing runtime while published channels live.
+ * Once this call begins, callers must not start a new public operation using
+ * runtime or one of its channels. Calls begun after the runtime is freed are
+ * invalid C usage. Draining admitted creators may wait for provider activation
+ * to reach its configured deadline.
  */
 MAELYS_MCP_WARN_UNUSED_RESULT
 maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime);
