@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 - 2026-08-15
+
+- Add a public C SDK for `maelys-provider/3` process providers, including JSONL
+  dispatch, tool and resource callbacks, descriptor validation, and serialized events.
+- Isolate provider stdout by default, preserving the protocol stream when callers
+  provide only partial serving options.
+- Define callback ownership and shutdown semantics so event-producing provider threads
+  stop and join before the SDK is destroyed.
+- Keep native ABI version 1: the new SDK handle remains opaque and the public additions
+  are source- and binary-compatible.
+
 ## 0.7.0 - 2026-08-14
 
 - Replace the private process contract with `maelys-provider/3`: an explicit activation
