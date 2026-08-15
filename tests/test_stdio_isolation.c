@@ -132,7 +132,8 @@ static int test_stalled_client_fails_within_write_deadline(void) {
         maelys_mcp_stdio_options_t options = {.write_timeout_ms = 50u};
         maelys_mcp_result_t status = maelys_mcp_runtime_serve_stdio_with_options(
             runtime, input[0], output[1], &options);
-        maelys_mcp_runtime_destroy(runtime);
+        maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+        if (status == MAELYS_MCP_OK) status = destroy_status;
         close(input[0]);
         close(output[1]);
         _exit(status == MAELYS_MCP_ERR_IO ? 0 : 21);
@@ -169,7 +170,7 @@ static int test_stdio_restores_output_descriptor_flags(void) {
     ASSERT_TRUE(maelys_mcp_runtime_serve_stdio(runtime, input[0], output[1]) ==
         MAELYS_MCP_OK);
     ASSERT_TRUE(fcntl(output[1], F_GETFL) == original_flags);
-    maelys_mcp_runtime_destroy(runtime);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     close(input[0]);
     close(output[0]);
     close(output[1]);

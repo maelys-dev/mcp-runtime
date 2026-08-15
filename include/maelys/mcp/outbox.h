@@ -16,31 +16,23 @@ typedef enum maelys_mcp_outbox_class {
     MAELYS_MCP_OUTBOX_NOTIFICATION = 1
 } maelys_mcp_outbox_class_t;
 
-typedef maelys_mcp_result_t (*maelys_mcp_outbox_write_fn)(
-    void *context,
-    json_t *message);
-
 typedef struct maelys_mcp_outbox_config {
     size_t max_messages;
     size_t max_bytes;
-    size_t batch_size;
     size_t response_burst;
-    maelys_mcp_outbox_write_fn write;
-    void *write_context;
+    unsigned int admission_timeout_ms;
 } maelys_mcp_outbox_config_t;
 
 typedef struct maelys_mcp_outbox_stats {
     unsigned long long enqueued;
-    unsigned long long written;
+    unsigned long long dequeued;
     unsigned long long coalesced;
+    unsigned long long rejected;
     size_t queued_messages;
     size_t queued_bytes;
 } maelys_mcp_outbox_stats_t;
 
-/*
- * Starts the unique writer thread. The write callback is never called while the
- * queue mutex is held.
- */
+/* Creates a passive bounded queue. No thread is created. */
 maelys_mcp_result_t maelys_mcp_outbox_create(
     const maelys_mcp_outbox_config_t *config,
     maelys_mcp_outbox_t **out_outbox);
@@ -56,10 +48,25 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
     maelys_mcp_outbox_class_t message_class,
     const char *coalesce_key);
 
-/* Stops accepting messages, drains when requested, joins the writer and frees it. */
-maelys_mcp_result_t maelys_mcp_outbox_destroy(
+/* Returns one owned message, timeout, or CLOSED after the queue is drained. */
+maelys_mcp_result_t maelys_mcp_outbox_next(
     maelys_mcp_outbox_t *outbox,
-    int drain);
+    unsigned int timeout_ms,
+    json_t **out_message);
+
+/* Stops admission and wakes all producers/consumers. */
+maelys_mcp_result_t maelys_mcp_outbox_close(
+    maelys_mcp_outbox_t *outbox,
+    int discard);
+
+/* Waits until a closed queue is drained, or until the monotonic timeout. */
+maelys_mcp_result_t maelys_mcp_outbox_wait_drained(
+    maelys_mcp_outbox_t *outbox,
+    unsigned int timeout_ms);
+
+/* Frees a closed and drained queue. */
+maelys_mcp_result_t maelys_mcp_outbox_destroy(
+    maelys_mcp_outbox_t *outbox);
 
 void maelys_mcp_outbox_stats(
     maelys_mcp_outbox_t *outbox,

@@ -1,6 +1,4 @@
 #include "src/internal/internal.h"
-#include "maelys/mcp/outbox.h"
-#include "maelys/mcp/subscriptions.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -8,9 +6,11 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 typedef struct stdio_writer_context {
+    maelys_mcp_channel_t *channel;
     int write_fd;
     int wake_fd;
     unsigned int write_timeout_ms;
@@ -26,12 +26,26 @@ static void signal_writer_failure(
     (void)ignored;
 }
 
-static maelys_mcp_result_t write_stdio_message(void *opaque, json_t *message) {
+static void *stdio_writer_main(void *opaque) {
     stdio_writer_context_t *context = opaque;
-    maelys_mcp_result_t status = maelys_mcp_write_json_line_with_timeout(
-        context->write_fd, message, context->write_timeout_ms);
-    if (status != MAELYS_MCP_OK) signal_writer_failure(context, status);
-    return status;
+    for (;;) {
+        json_t *message = NULL;
+        maelys_mcp_result_t status = maelys_mcp_channel_next(
+            context->channel, 1000u, &message);
+        if (status == MAELYS_MCP_ERR_TIMEOUT) continue;
+        if (status == MAELYS_MCP_ERR_CLOSED) return NULL;
+        if (status != MAELYS_MCP_OK) {
+            signal_writer_failure(context, status);
+            return NULL;
+        }
+        status = maelys_mcp_write_json_line_with_timeout(
+            context->write_fd, message, context->write_timeout_ms);
+        json_decref(message);
+        if (status != MAELYS_MCP_OK) {
+            signal_writer_failure(context, status);
+            return NULL;
+        }
+    }
 }
 
 static int set_descriptor_flag(int fd, int command, int flag) {
@@ -80,24 +94,29 @@ static maelys_mcp_result_t wait_for_input_or_writer(
 }
 
 static maelys_mcp_result_t finish_stdio(
-    maelys_mcp_runtime_t *runtime,
     maelys_mcp_line_reader_t *reader,
-    maelys_mcp_outbox_t *outbox,
+    maelys_mcp_channel_t *channel,
+    pthread_t writer,
+    int writer_started,
     int wake_pipe[2],
     int write_fd,
     int write_flags,
     maelys_mcp_result_t status,
     int drain) {
     maelys_mcp_line_reader_clear(reader);
-    maelys_mcp_runtime_detach_outbox(runtime);
-    maelys_mcp_result_t outbox_status = maelys_mcp_outbox_destroy(outbox, drain);
+    maelys_mcp_result_t close_status = MAELYS_MCP_OK;
+    if (drain) close_status = maelys_mcp_channel_close(channel, 5000u);
+    else maelys_mcp_channel_abort(channel);
+    if (writer_started) pthread_join(writer, NULL);
+    maelys_mcp_result_t destroy_status = maelys_mcp_channel_destroy(channel);
     close(wake_pipe[0]);
     close(wake_pipe[1]);
-    if (fcntl(write_fd, F_SETFL, write_flags) != 0 && status == MAELYS_MCP_OK &&
-        outbox_status == MAELYS_MCP_OK) {
-        return MAELYS_MCP_ERR_IO;
-    }
-    return status == MAELYS_MCP_OK ? outbox_status : status;
+    maelys_mcp_result_t flags_status = fcntl(write_fd, F_SETFL, write_flags) == 0 ?
+        MAELYS_MCP_OK : MAELYS_MCP_ERR_IO;
+    if (status != MAELYS_MCP_OK) return status;
+    if (close_status != MAELYS_MCP_OK) return close_status;
+    if (destroy_status != MAELYS_MCP_OK) return destroy_status;
+    return flags_status;
 }
 
 maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
@@ -125,23 +144,16 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         close(wake_pipe[1]);
         return MAELYS_MCP_ERR_IO;
     }
-    stdio_writer_context_t writer_context = {
-        .write_fd = write_fd,
-        .wake_fd = wake_pipe[1],
-        .write_timeout_ms = write_timeout_ms
-    };
-    atomic_init(&writer_context.status, (int)MAELYS_MCP_OK);
-    maelys_mcp_outbox_config_t outbox_config = {
+    maelys_mcp_channel_config_t channel_config = {
         .max_messages = 256u,
         .max_bytes = runtime->max_message_bytes > SIZE_MAX / 4u ?
             SIZE_MAX : runtime->max_message_bytes * 4u,
-        .batch_size = 32u,
         .response_burst = 8u,
-        .write = write_stdio_message,
-        .write_context = &writer_context
+        .admission_timeout_ms = write_timeout_ms,
+        .close_timeout_ms = write_timeout_ms
     };
-    maelys_mcp_outbox_t *outbox = NULL;
-    initialized = maelys_mcp_outbox_create(&outbox_config, &outbox);
+    maelys_mcp_channel_t *channel = NULL;
+    initialized = maelys_mcp_channel_create(runtime, &channel_config, &channel);
     if (initialized != MAELYS_MCP_OK) {
         maelys_mcp_line_reader_clear(&reader);
         close(wake_pipe[0]);
@@ -149,11 +161,21 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         (void)fcntl(write_fd, F_SETFL, write_flags);
         return initialized;
     }
-    initialized = maelys_mcp_runtime_attach_outbox(runtime, outbox);
-    if (initialized != MAELYS_MCP_OK) {
-        return finish_stdio(runtime, &reader, outbox, wake_pipe,
-            write_fd, write_flags, initialized, 0);
+    stdio_writer_context_t writer_context = {
+        .channel = channel,
+        .write_fd = write_fd,
+        .wake_fd = wake_pipe[1],
+        .write_timeout_ms = write_timeout_ms
+    };
+    atomic_init(&writer_context.status, (int)MAELYS_MCP_OK);
+    pthread_t writer;
+    memset(&writer, 0, sizeof(writer));
+    int writer_started = 0;
+    if (pthread_create(&writer, NULL, stdio_writer_main, &writer_context) != 0) {
+        return finish_stdio(&reader, channel, writer, writer_started, wake_pipe,
+            write_fd, write_flags, MAELYS_MCP_ERR_IO, 0);
     }
+    writer_started = 1;
     for (;;) {
         json_t *request = NULL;
         char *error = NULL;
@@ -165,15 +187,15 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
             status = wait_for_input_or_writer(read_fd, wake_pipe[0], &writer_failed);
             if (status != MAELYS_MCP_OK) {
                 free(error);
-                return finish_stdio(runtime, &reader, outbox, wake_pipe,
-                    write_fd, write_flags, status, 0);
+                return finish_stdio(&reader, channel, writer, writer_started,
+                    wake_pipe, write_fd, write_flags, status, 0);
             }
             if (writer_failed) {
                 free(error);
                 status = (maelys_mcp_result_t)atomic_load(&writer_context.status);
                 if (status == MAELYS_MCP_OK) status = MAELYS_MCP_ERR_IO;
-                return finish_stdio(runtime, &reader, outbox, wake_pipe,
-                    write_fd, write_flags, status, 0);
+                return finish_stdio(&reader, channel, writer, writer_started,
+                    wake_pipe, write_fd, write_flags, status, 0);
             }
             status = maelys_mcp_line_reader_read_once(
                 &reader, read_fd, &request, &error, &eof);
@@ -184,37 +206,32 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         }
         if (status == MAELYS_MCP_ERR_NOT_FOUND && eof) {
             free(error);
-            status = maelys_mcp_runtime_complete_subscriptions(runtime);
-            return finish_stdio(runtime, &reader, outbox, wake_pipe,
-                write_fd, write_flags, status, 1);
+            return finish_stdio(&reader, channel, writer, writer_started,
+                wake_pipe, write_fd, write_flags, MAELYS_MCP_OK, 1);
         }
         if (status != MAELYS_MCP_OK) {
             json_t *response = maelys_mcp_error_response(NULL, -32700,
                 error ? error : "Parse error", NULL);
             free(error);
             if (!response) {
-                return finish_stdio(runtime, &reader, outbox, wake_pipe,
-                    write_fd, write_flags, MAELYS_MCP_ERR_MEMORY, 0);
+                return finish_stdio(&reader, channel, writer, writer_started,
+                    wake_pipe, write_fd, write_flags, MAELYS_MCP_ERR_MEMORY, 0);
             }
-            status = maelys_mcp_outbox_enqueue_take(
-                outbox, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL);
+            status = maelys_mcp_channel_enqueue_take(channel, response,
+                MAELYS_MCP_OUTBOX_RESPONSE, NULL, 1);
             if (status != MAELYS_MCP_OK) {
                 json_decref(response);
-                return finish_stdio(runtime, &reader, outbox, wake_pipe,
-                    write_fd, write_flags, status, 0);
+                return finish_stdio(&reader, channel, writer, writer_started,
+                    wake_pipe, write_fd, write_flags, status, 0);
             }
             continue;
         }
         free(error);
-        json_t *response = maelys_mcp_runtime_handle(runtime, request);
+        status = maelys_mcp_channel_handle(channel, request);
         json_decref(request);
-        if (!response) continue;
-        status = maelys_mcp_outbox_enqueue_take(
-            outbox, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL);
         if (status != MAELYS_MCP_OK) {
-            json_decref(response);
-            return finish_stdio(runtime, &reader, outbox, wake_pipe,
-                write_fd, write_flags, status, 0);
+            return finish_stdio(&reader, channel, writer, writer_started,
+                wake_pipe, write_fd, write_flags, status, 0);
         }
     }
 }

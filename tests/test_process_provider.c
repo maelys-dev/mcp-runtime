@@ -1,7 +1,6 @@
 #include "maelys/mcp.h"
 
 #include <stdio.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -13,41 +12,16 @@
     } \
 } while (0)
 
-typedef struct event_capture {
-    pthread_mutex_t mutex;
-    pthread_cond_t ready;
-    json_t *messages[8];
-    size_t count;
-} event_capture_t;
-
-static maelys_mcp_result_t capture_event(void *context, json_t *message) {
-    event_capture_t *capture = context;
-    json_t *copy = json_deep_copy(message);
-    if (!copy) return MAELYS_MCP_ERR_MEMORY;
-    pthread_mutex_lock(&capture->mutex);
-    if (capture->count == sizeof(capture->messages) / sizeof(capture->messages[0])) {
-        pthread_mutex_unlock(&capture->mutex);
-        json_decref(copy);
-        return MAELYS_MCP_ERR_IO;
-    }
-    capture->messages[capture->count++] = copy;
-    pthread_cond_broadcast(&capture->ready);
-    pthread_mutex_unlock(&capture->mutex);
-    return MAELYS_MCP_OK;
+static json_t *next_message(maelys_mcp_channel_t *channel) {
+    json_t *message = NULL;
+    return maelys_mcp_channel_next(channel, 2000u, &message) == MAELYS_MCP_OK ?
+        message : NULL;
 }
 
-static int wait_for_messages(event_capture_t *capture, size_t expected) {
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 0;
-    deadline.tv_sec += 2;
-    pthread_mutex_lock(&capture->mutex);
-    while (capture->count < expected) {
-        if (pthread_cond_timedwait(&capture->ready,
-            &capture->mutex, &deadline) != 0) break;
-    }
-    int ready = capture->count >= expected;
-    pthread_mutex_unlock(&capture->mutex);
-    return ready;
+static json_t *dispatch(maelys_mcp_channel_t *channel, json_t *request) {
+    maelys_mcp_result_t status = maelys_mcp_channel_handle(channel, request);
+    json_decref(request);
+    return status == MAELYS_MCP_OK ? next_message(channel) : NULL;
 }
 
 static long long milliseconds(void) {
@@ -115,17 +89,14 @@ int main(int argc, char **argv) {
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS) == MAELYS_MCP_OK);
-    event_capture_t capture = {0};
-    ASSERT_TRUE(pthread_mutex_init(&capture.mutex, NULL) == 0);
-    ASSERT_TRUE(pthread_cond_init(&capture.ready, NULL) == 0);
-    maelys_mcp_outbox_config_t outbox_config = {
-        .max_messages = 16u, .max_bytes = 65536u, .batch_size = 4u,
-        .response_burst = 2u, .write = capture_event, .write_context = &capture
-    };
-    maelys_mcp_outbox_t *outbox = NULL;
-    ASSERT_TRUE(maelys_mcp_outbox_create(&outbox_config, &outbox) == MAELYS_MCP_OK);
-    ASSERT_TRUE(maelys_mcp_runtime_attach_outbox(runtime, outbox) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) == MAELYS_MCP_OK);
+    maelys_mcp_channel_config_t channel_config = {
+        .max_messages = 16u, .max_bytes = 65536u, .response_burst = 2u,
+        .admission_timeout_ms = 2000u, .close_timeout_ms = 2000u
+    };
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &channel_config, &channel) ==
+        MAELYS_MCP_OK);
 
     json_t *subscription_params = json_pack(
         "{s:{s:b,s:b,s:[s]},s:{s:s,s:{s:s,s:s},s:{}}}",
@@ -140,9 +111,13 @@ int main(int argc, char **argv) {
     json_t *subscription_request = json_pack("{s:s,s:i,s:s,s:o}",
         "jsonrpc", "2.0", "id", 77, "method", "subscriptions/listen",
         "params", subscription_params);
-    ASSERT_TRUE(maelys_mcp_runtime_handle(runtime, subscription_request) == NULL);
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, subscription_request) == MAELYS_MCP_OK);
     json_decref(subscription_request);
-    ASSERT_TRUE(wait_for_messages(&capture, 1u));
+    json_t *acknowledged = next_message(channel);
+    ASSERT_TRUE(acknowledged != NULL);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(acknowledged, "method")),
+        "notifications/subscriptions/acknowledged") == 0);
+    json_decref(acknowledged);
 
     json_t *params = json_pack("{s:s,s:{s:s},s:{s:s,s:{s:s,s:s},s:{}}}",
         "name", "example.echo",
@@ -153,13 +128,12 @@ int main(int argc, char **argv) {
             "io.modelcontextprotocol/clientCapabilities");
     json_t *request = json_pack("{s:s,s:i,s:s,s:o}",
         "jsonrpc", "2.0", "id", 1, "method", "tools/call", "params", params);
-    json_t *response = maelys_mcp_runtime_handle(runtime, request);
+    json_t *response = dispatch(channel, request);
     json_t *result = json_object_get(response, "result");
     json_t *structured = json_object_get(result, "structuredContent");
     ASSERT_TRUE(json_is_object(structured));
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(structured, "message")), "external") == 0);
     json_decref(response);
-    json_decref(request);
 
     params = json_pack("{s:s,s:{s:s,s:{s:s,s:s},s:{}}}",
         "uri", "example://missing",
@@ -169,13 +143,12 @@ int main(int argc, char **argv) {
             "io.modelcontextprotocol/clientCapabilities");
     request = json_pack("{s:s,s:i,s:s,s:o}",
         "jsonrpc", "2.0", "id", 3, "method", "resources/read", "params", params);
-    response = maelys_mcp_runtime_handle(runtime, request);
+    response = dispatch(channel, request);
     json_t *response_error = json_object_get(response, "error");
     ASSERT_TRUE(json_integer_value(json_object_get(response_error, "code")) == -32602);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(
         json_object_get(response_error, "data"), "uri")), "example://missing") == 0);
     json_decref(response);
-    json_decref(request);
 
     params = json_pack("{s:s,s:{s:s,s:{s:s,s:s},s:{}}}",
         "uri", "example://echo/external-resource",
@@ -185,14 +158,13 @@ int main(int argc, char **argv) {
             "io.modelcontextprotocol/clientCapabilities");
     request = json_pack("{s:s,s:i,s:s,s:o}",
         "jsonrpc", "2.0", "id", 2, "method", "resources/read", "params", params);
-    response = maelys_mcp_runtime_handle(runtime, request);
+    response = dispatch(channel, request);
     result = json_object_get(response, "result");
     json_t *contents = json_object_get(result, "contents");
     ASSERT_TRUE(json_array_size(contents) == 1u);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(json_array_get(contents, 0), "text")),
         "external-resource") == 0);
     json_decref(response);
-    json_decref(request);
 
     params = json_pack("{s:s,s:{},s:{s:s,s:{s:s,s:s},s:{}}}",
         "name", "example.events",
@@ -203,28 +175,42 @@ int main(int argc, char **argv) {
             "io.modelcontextprotocol/clientCapabilities");
     request = json_pack("{s:s,s:i,s:s,s:o}",
         "jsonrpc", "2.0", "id", 4, "method", "tools/call", "params", params);
-    response = maelys_mcp_runtime_handle(runtime, request);
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, request) == MAELYS_MCP_OK);
+    json_decref(request);
+    response = NULL;
+    json_t *events[3] = {0};
+    size_t event_count = 0u;
+    for (size_t index = 0; index < 4u; ++index) {
+        json_t *message = next_message(channel);
+        ASSERT_TRUE(message != NULL);
+        if (json_integer_value(json_object_get(message, "id")) == 4) {
+            response = message;
+        } else {
+            ASSERT_TRUE(event_count < 3u);
+            events[event_count++] = message;
+        }
+    }
+    ASSERT_TRUE(response != NULL && event_count == 3u);
     result = json_object_get(response, "result");
     structured = json_object_get(result, "structuredContent");
     ASSERT_TRUE(json_integer_value(json_object_get(structured, "emitted")) == 3);
     json_decref(response);
-    json_decref(request);
-    ASSERT_TRUE(wait_for_messages(&capture, 4u));
-    ASSERT_TRUE(strcmp(json_string_value(json_object_get(capture.messages[1], "method")),
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(events[0], "method")),
         "notifications/resources/updated") == 0);
-    ASSERT_TRUE(strcmp(json_string_value(json_object_get(capture.messages[2], "method")),
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(events[1], "method")),
         "notifications/resources/list_changed") == 0);
-    ASSERT_TRUE(strcmp(json_string_value(json_object_get(capture.messages[3], "method")),
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(events[2], "method")),
         "notifications/tools/list_changed") == 0);
 
-    maelys_mcp_runtime_detach_outbox(runtime);
-    maelys_mcp_runtime_destroy(runtime);
-    ASSERT_TRUE(maelys_mcp_outbox_destroy(outbox, 1) == MAELYS_MCP_OK);
-    for (size_t index = 0; index < capture.count; ++index) {
-        json_decref(capture.messages[index]);
-    }
-    pthread_cond_destroy(&capture.ready);
-    pthread_mutex_destroy(&capture.mutex);
+    for (size_t index = 0; index < 3u; ++index) json_decref(events[index]);
+    ASSERT_TRUE(maelys_mcp_channel_complete_subscriptions(channel) == MAELYS_MCP_OK);
+    json_t *complete = next_message(channel);
+    ASSERT_TRUE(complete != NULL);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(
+        json_object_get(complete, "result"), "resultType")), "complete") == 0);
+    json_decref(complete);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     puts("test_process_provider: OK");
     return 0;
 }

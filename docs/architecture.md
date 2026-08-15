@@ -12,13 +12,15 @@ MCP client
 maelys-mcp host
     |- JSON-RPC and MCP validation
     |- policy and audit hooks
-    |- bounded outbox -> unique protocol writer
+    |- channel registry and provider-event fan-out
     |- module registry
     |   |- Tools
     |   |- Resources
     |   |- Subscriptions
     |   `- MRTR
     |
+    +--> channel A -> passive bounded outbox -> transport pump
+    +--> channel B -> passive bounded outbox -> transport pump
     +--> in-process C provider
     +--> persistent Python provider
     +--> persistent TypeScript provider
@@ -52,19 +54,20 @@ client-specific adapter belongs in this library.
 - Provider callbacks fill one initialized `maelys_mcp_provider_result_t`. Every JSON
   field placed in it is a newly owned Jansson reference. The runtime releases all
   fields with `maelys_mcp_provider_result_clear`.
-- `maelys_mcp_runtime_handle` borrows the request and returns a newly owned response.
+- `maelys_mcp_channel_handle` borrows the request. It returns an operational status;
+  every protocol response is transferred to the channel outbox instead of being
+  returned directly.
 - Resource descriptors are deep-copied and normalized at registration. Resource read
   callbacks follow the same ownership rule through `maelys_mcp_resource_result_t`.
 - `maelys_mcp_outbox_enqueue_take` steals a Jansson reference only on success. The
-  unique writer releases it after the write callback returns; producers never write
-  to the protocol descriptor.
-- `maelys_mcp_runtime_attach_outbox` borrows the bus. Detaching closes the provider
-  event gate and waits for in-flight emissions before returning; the embedding
-  transport may then destroy the Outbox. Subscription ids and resource filters are
-  deep-copied by the runtime.
+  consumer returned by `maelys_mcp_outbox_next` owns that reference. Producers never
+  write to a protocol descriptor.
+- A channel owns its outbox, subscription ids, resource filters and legacy client
+  state. The runtime retains the channel's lifetime entry until `channel_destroy`,
+  even after `channel_close` has removed it from event fan-out.
 - `maelys_mcp_provider_emit_event` borrows the event payload only for the duration of
-  the call. Process providers are activated after the Outbox is attached, preventing
-  startup events from being lost.
+  the call. Process providers activate once when the first channel is created and
+  remain active until runtime destruction.
 
 ## Protocol eras
 
@@ -97,11 +100,13 @@ multi-round results and retry fields. Future Prompts or Resources modules can re
 MRTR without copying it. Resources owns catalog, template and read semantics, while
 the opaque `maelys-uri` facade owns bounded parsing and normalization.
 
-Subscriptions owns long-lived listen requests and accepted event filters, but no
+Subscriptions owns long-lived listen requests and accepted event filters per channel, but no
 provider business logic. Enabling it makes the Tools `listChanged` and Resources
 `listChanged`/`subscribe` capability flags true. Producers publish semantic events
-through the public runtime API; the module snapshots matching subscription ids under
-its mutex and releases that mutex before constructing or enqueueing messages.
+through the public runtime API. Fan-out snapshots targetable channels under the runtime
+registry lock and retains a local operation reference for each. Each channel then
+snapshots matching subscription ids under its own mutex and releases all locks before
+constructing or enqueueing messages.
 
 ## Current JSON Schema subset
 
@@ -116,16 +121,26 @@ Full JSON Schema 2020-12 is a later milestone.
 
 ## Output boundary
 
-The outbox has separate response and notification queues, bounded by message count and
-serialized bytes. It removes a small batch of pointers under the mutex, signals
-producers, then performs every callback and I/O operation without holding the mutex.
+Each channel outbox has separate response and notification queues, bounded by message
+count and serialized bytes. `maelys_mcp_outbox_next` removes one message under the
+mutex and transfers it to a transport-owned pump; no callback or I/O belongs to the
+outbox.
 Responses are preferred, but after eight consecutive responses one pending
 notification is selected. Keyed notification replacement moves the event to the tail,
 preserving the most recent causal position rather than its first occurrence.
 
-The bus accepts multiple producers. In 0.7, native and process-provider event APIs are
+The queues accept multiple producers. Native and process-provider event APIs are
 asynchronous with respect to protocol writes, while request dispatch and provider calls
-remain synchronous. Each process provider has one reader thread that separates id-less
-events from the one serialized request/response exchange. A mandatory subscription
-acknowledgement uses the priority lane so a
+remain synchronous. A slow channel's bounded admission cannot indefinitely block
+another channel, and fan-out continues after a local admission failure.
+The lock hierarchy is provider lifecycle, then runtime channel registry, then channel;
+the global provider-callback inflight gate is never nested. A provider's private event
+mutex stays held while its sink callback runs so sink detachment cannot race callback
+entry; it precedes the inflight gate and is never acquired from that gate. Each process provider has
+one reader thread that separates id-less events from the one serialized
+request/response exchange. A mandatory subscription acknowledgement uses the priority lane so a
 later completion response cannot overtake the stream's first message.
+
+Creating a channel or outbox creates no thread. The stdio transport owns one writer
+thread for its durable channel. Future transports can use an event loop or shared pool
+without changing the channel contract.

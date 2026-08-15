@@ -3,7 +3,7 @@ AR ?= ar
 PKG_CONFIG ?= pkg-config
 ANALYZER ?= clang
 PREFIX ?= /usr/local
-VERSION := 0.9.0
+VERSION := 0.10.0
 DOCKER ?= docker
 DOCKER_PLATFORM ?= linux/arm64
 ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
@@ -26,13 +26,22 @@ PC := $(LIB)/pkgconfig/maelys-mcp.pc
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 ASAN_OPTIONS_VALUE := halt_on_error=1
+NO_THREAD_WRAP :=
 else
 ASAN_OPTIONS_VALUE := detect_leaks=1:halt_on_error=1
+NO_THREAD_WRAP := -Wl,--wrap=pthread_create
 endif
+
+NO_THREAD_BUILD := $(BUILD_ROOT)/no-thread
+NO_THREAD_BIN := $(NO_THREAD_BUILD)/test-channel-no-thread
+NO_THREAD_CFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
+	-D_POSIX_C_SOURCE=200809L -pthread
+NO_THREAD_LDLIBS := $(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread
 
 LIB_SOURCES := \
 	src/jsonrpc/core.c \
 	src/core/common.c \
+	src/core/channel.c \
 	src/core/content.c \
 	src/core/outbox.c \
 	src/core/uri.c \
@@ -57,7 +66,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 -include $(DEPENDENCY_FILES)
 
 .PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
-	asan-linux-image test-asan-linux test-asan-linux-fresh
+	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
 
@@ -128,11 +137,23 @@ $(BIN)/test-subscriptions: $(OBJ)/tests/test_subscriptions.o $(LIB)/libmaelys_mc
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
+$(BIN)/test-channels: $(OBJ)/tests/test_channels.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
 $(OBJ)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+$(NO_THREAD_BIN): tests/test_channel_no_thread.c $(LIB_SOURCES)
+	@mkdir -p $(@D)
+	$(CC) $(CPPFLAGS) $(NO_THREAD_CFLAGS) $^ $(NO_THREAD_LDLIBS) \
+		$(NO_THREAD_WRAP) -o $@
+
+test-channel-no-thread-nosanitize: $(NO_THREAD_BIN)
+	$(NO_THREAD_BIN)
+
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -140,6 +161,7 @@ test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-p
 	$(BIN)/test-resources
 	$(BIN)/test-outbox
 	$(BIN)/test-subscriptions
+	$(BIN)/test-channels
 	$(BIN)/test-runtime
 	$(BIN)/test-runtime-protocol
 	$(BIN)/test-provider-sdk
@@ -200,12 +222,13 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-process-provider $(BIN)/test-provider-sdk \
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-process-provider $(BIN)/test-provider-sdk \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
 		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channels
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-provider-sdk
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/bad-json-provider) $(abspath $(BIN)/bad-envelope-provider) \

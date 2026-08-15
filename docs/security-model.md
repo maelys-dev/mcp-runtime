@@ -27,6 +27,12 @@
 - Request and provider message sizes are bounded.
 - Stdio output writes have a bounded per-message deadline; a non-draining client closes
   the output bus and wakes blocked producers instead of freezing the runtime.
+- Every client channel has an independent bounded queue, subscription registry,
+  cancellation scope and legacy state. Identical JSON-RPC ids on different channels
+  cannot collide or receive each other's events.
+- Provider event fan-out retains each target channel while delivering outside the
+  runtime registry lock. A slow or faulted channel cannot suspend or invalidate its
+  peers.
 - Protocol fields that enter length-unaware C APIs reject embedded NUL bytes.
 - Resource URIs are length-bounded, parsed and normalized behind an opaque uriparser
   facade; embedded NUL and encoded `%00` are rejected before provider dispatch.
@@ -48,6 +54,10 @@ or containers.
 
 The runtime never accepts an executable path, argv, environment variable, or shell
 fragment from an MCP request.
+
+Version 0.10.0 is still a local stdio runtime. It does not expose HTTP, authenticate a
+network principal or apply per-principal effect policy. Those controls are mandatory
+before a network transport can safely expose providers that run with host privileges.
 
 ## Required provider practices
 

@@ -41,13 +41,18 @@ stream's event.
 
 ## Lifecycle and concurrency
 
-The registry is bounded by `runtime_config.max_subscriptions` (64 by default). Duplicate
-active ids are rejected. `notifications/cancelled` removes the matching listen without
-creating a response. Graceful transport EOF calls
-`maelys_mcp_runtime_complete_subscriptions`, which emits one final
-`resultType: "complete"` response per remaining id.
+Each channel registry is bounded by `runtime_config.max_subscriptions` (64 by
+default). Duplicate active ids are rejected only within that channel. The same id may
+be active on another channel without collision. `notifications/cancelled` removes a
+matching listen exclusively from the receiving channel.
 
-The runtime borrows its Outbox. An embedding transport must attach it before accepting
-listen requests, stop event producers, detach it, and only then destroy it. The
-subscription mutex protects registry snapshots only: no JSON construction, queue wait,
-provider callback or protocol I/O runs under that mutex.
+Graceful channel close emits one final `resultType: "complete"` response per remaining
+id, closes admission, and waits for the transport to drain those responses within the
+close deadline. A failed admission faults only that channel and does not claim that an
+unadmitted completion was delivered.
+
+Provider events snapshot targetable channels and retain a local operation reference
+before releasing the runtime registry lock. Each channel then snapshots subscriptions
+under its own mutex. No JSON construction, queue wait, callback or I/O runs under the
+runtime registry or channel mutex. Closing a channel waits only for references already
+retained for that channel; it never stops fan-out to peers.

@@ -33,35 +33,45 @@ static int id_equal(const json_t *left, const json_t *right) {
 }
 
 static ssize_t find_subscription_locked(
-    const maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_channel_t *channel,
     const json_t *id) {
-    for (size_t index = 0; index < runtime->subscription_count; ++index) {
-        if (id_equal(runtime->subscriptions[index].id, id)) return (ssize_t)index;
+    for (size_t index = 0; index < channel->subscription_count; ++index) {
+        if (id_equal(channel->subscriptions[index].id, id)) return (ssize_t)index;
     }
     return -1;
 }
 
 static void remove_subscription_locked(
-    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_channel_t *channel,
     size_t index) {
-    maelys_mcp_subscription_clear(&runtime->subscriptions[index]);
-    if (index + 1u < runtime->subscription_count) {
-        runtime->subscriptions[index] =
-            runtime->subscriptions[runtime->subscription_count - 1u];
-        memset(&runtime->subscriptions[runtime->subscription_count - 1u], 0,
-            sizeof(*runtime->subscriptions));
+    maelys_mcp_subscription_clear(&channel->subscriptions[index]);
+    if (index + 1u < channel->subscription_count) {
+        channel->subscriptions[index] =
+            channel->subscriptions[channel->subscription_count - 1u];
+        memset(&channel->subscriptions[channel->subscription_count - 1u], 0,
+            sizeof(*channel->subscriptions));
     }
-    runtime->subscription_count--;
+    channel->subscription_count--;
 }
 
 void maelys_mcp_cancel_subscription(
-    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_channel_t *channel,
     const json_t *request_id) {
-    if (!runtime || !request_id || !runtime->subscriptions_mutex_initialized) return;
-    pthread_mutex_lock(&runtime->subscriptions_mutex);
-    ssize_t found = find_subscription_locked(runtime, request_id);
-    if (found >= 0) remove_subscription_locked(runtime, (size_t)found);
-    pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    if (!channel || !request_id) return;
+    pthread_mutex_lock(&channel->mutex);
+    ssize_t found = find_subscription_locked(channel, request_id);
+    if (found >= 0) remove_subscription_locked(channel, (size_t)found);
+    pthread_mutex_unlock(&channel->mutex);
+}
+
+void maelys_mcp_activate_subscription(
+    maelys_mcp_channel_t *channel,
+    const json_t *request_id) {
+    if (!channel || !request_id) return;
+    pthread_mutex_lock(&channel->mutex);
+    ssize_t found = find_subscription_locked(channel, request_id);
+    if (found >= 0) channel->subscriptions[found].active = 1;
+    pthread_mutex_unlock(&channel->mutex);
 }
 
 static int append_unique_uri(
@@ -206,6 +216,7 @@ static json_t *acknowledged(
 static json_t *listen(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_module_request_t *request) {
+    maelys_mcp_channel_t *channel = request->channel;
     if (!request->modern) {
         return maelys_mcp_error_response(request->id, JSONRPC_INVALID_PARAMS,
             "Subscriptions require MCP 2026-07-28", NULL);
@@ -254,48 +265,42 @@ static json_t *listen(
             "Cannot build subscription acknowledgement", NULL);
     }
 
-    pthread_mutex_lock(&runtime->subscriptions_mutex);
-    if (!runtime->outbox) {
-        pthread_mutex_unlock(&runtime->subscriptions_mutex);
-        json_decref(ack);
-        maelys_mcp_subscription_clear(&candidate);
-        return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-            "Subscriptions require an attached output bus", NULL);
-    }
-    if (find_subscription_locked(runtime, request->id) >= 0) {
-        pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    pthread_mutex_lock(&channel->mutex);
+    if (find_subscription_locked(channel, request->id) >= 0) {
+        pthread_mutex_unlock(&channel->mutex);
         json_decref(ack);
         maelys_mcp_subscription_clear(&candidate);
         return maelys_mcp_error_response(request->id, JSONRPC_INVALID_PARAMS,
             "Subscription id is already active", NULL);
     }
-    if (runtime->subscription_count == runtime->max_subscriptions) {
-        pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    if (channel->subscription_count == runtime->max_subscriptions) {
+        pthread_mutex_unlock(&channel->mutex);
         json_decref(ack);
         maelys_mcp_subscription_clear(&candidate);
         return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
             "Subscription capacity reached", NULL);
     }
-    size_t slot = runtime->subscription_count++;
-    runtime->subscriptions[slot] = candidate;
-    maelys_mcp_outbox_t *outbox = runtime->outbox;
-    pthread_mutex_unlock(&runtime->subscriptions_mutex);
-
-    /* Protocol-control acknowledgements share the response lane so no later
-       response can overtake the mandatory first subscription message. */
-    maelys_mcp_result_t status = maelys_mcp_outbox_enqueue_take(
-        outbox, ack, MAELYS_MCP_OUTBOX_RESPONSE, NULL);
-    if (status != MAELYS_MCP_OK) {
+    size_t slot = channel->subscription_count++;
+    channel->subscriptions[slot] = candidate;
+    json_t *activation_id = json_deep_copy(request->id);
+    if (!activation_id) {
+        remove_subscription_locked(channel, slot);
+        pthread_mutex_unlock(&channel->mutex);
         json_decref(ack);
-        maelys_mcp_cancel_subscription(runtime, request->id);
         return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-            "Cannot acknowledge subscription", NULL);
+            "Cannot store subscription activation", NULL);
     }
-    pthread_mutex_lock(&runtime->subscriptions_mutex);
-    ssize_t registered = find_subscription_locked(runtime, request->id);
-    if (registered >= 0) runtime->subscriptions[registered].active = 1;
-    pthread_mutex_unlock(&runtime->subscriptions_mutex);
-    return NULL;
+    pthread_mutex_unlock(&channel->mutex);
+    if (request->post_enqueue_subscription_id) {
+        *request->post_enqueue_subscription_id = activation_id;
+    } else {
+        json_decref(activation_id);
+        maelys_mcp_cancel_subscription(channel, request->id);
+        json_decref(ack);
+        return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
+            "Cannot schedule subscription activation", NULL);
+    }
+    return ack;
 }
 
 static int uri_matches(const char *subscription_uri, const char *event_uri) {
@@ -357,34 +362,27 @@ static json_t *event_notification(
     return notification(method, params);
 }
 
-static maelys_mcp_result_t emit_event(
-    maelys_mcp_runtime_t *runtime,
+static maelys_mcp_result_t emit_event_to_channel(
+    maelys_mcp_channel_t *channel,
     subscription_event_kind_t kind,
     const char *uri) {
-    if (!runtime || !runtime->subscriptions_mutex_initialized ||
-        !maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS)) {
-        return MAELYS_MCP_ERR_ARGUMENT;
-    }
+    maelys_mcp_runtime_t *runtime = channel->runtime;
     subscription_target_t *targets = calloc(runtime->max_subscriptions, sizeof(*targets));
     if (!targets) return MAELYS_MCP_ERR_MEMORY;
     size_t count = 0u;
     maelys_mcp_result_t snapshot_status = MAELYS_MCP_OK;
-    pthread_mutex_lock(&runtime->subscriptions_mutex);
-    maelys_mcp_outbox_t *outbox = runtime->outbox;
-    for (size_t index = 0; outbox && index < runtime->subscription_count; ++index) {
-        if (!accepts(&runtime->subscriptions[index], kind, uri)) continue;
-        targets[count].id = json_deep_copy(runtime->subscriptions[index].id);
+    pthread_mutex_lock(&channel->mutex);
+    for (size_t index = 0; index < channel->subscription_count; ++index) {
+        if (!accepts(&channel->subscriptions[index], kind, uri)) continue;
+        /* Each producer owns an independent Jansson refcount after unlock. */
+        targets[count].id = json_deep_copy(channel->subscriptions[index].id);
         if (!targets[count].id) {
             snapshot_status = MAELYS_MCP_ERR_MEMORY;
             break;
         }
         count++;
     }
-    pthread_mutex_unlock(&runtime->subscriptions_mutex);
-    if (!outbox) {
-        free(targets);
-        return MAELYS_MCP_ERR_ARGUMENT;
-    }
+    pthread_mutex_unlock(&channel->mutex);
     maelys_mcp_result_t outcome = snapshot_status;
     const char *method = kind == SUBSCRIPTION_EVENT_RESOURCE_UPDATED ?
         "resources/updated" : (kind == SUBSCRIPTION_EVENT_RESOURCES_LIST_CHANGED ?
@@ -396,8 +394,9 @@ static maelys_mcp_result_t emit_event(
             if (message) json_decref(message);
             outcome = MAELYS_MCP_ERR_MEMORY;
         } else {
-            maelys_mcp_result_t status = maelys_mcp_outbox_enqueue_take(
-                outbox, message, MAELYS_MCP_OUTBOX_NOTIFICATION, targets[index].key);
+            maelys_mcp_result_t status = maelys_mcp_channel_enqueue_take(
+                channel, message, MAELYS_MCP_OUTBOX_NOTIFICATION,
+                targets[index].key, 0);
             if (status != MAELYS_MCP_OK) {
                 json_decref(message);
                 outcome = status;
@@ -416,6 +415,29 @@ static maelys_mcp_result_t emit_event(
         free(targets[index].key);
     }
     free(targets);
+    return outcome;
+}
+
+static maelys_mcp_result_t emit_event(
+    maelys_mcp_runtime_t *runtime,
+    subscription_event_kind_t kind,
+    const char *uri) {
+    if (!runtime ||
+        !maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS)) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    maelys_mcp_channel_t **channels = NULL;
+    size_t count = 0u;
+    maelys_mcp_result_t status = maelys_mcp_runtime_snapshot_channels(
+        runtime, &channels, &count);
+    if (status != MAELYS_MCP_OK) return status;
+    maelys_mcp_result_t outcome = MAELYS_MCP_OK;
+    for (size_t index = 0; index < count; ++index) {
+        maelys_mcp_result_t emitted = emit_event_to_channel(channels[index], kind, uri);
+        if (outcome == MAELYS_MCP_OK && emitted != MAELYS_MCP_OK) outcome = emitted;
+        maelys_mcp_channel_release_operation(channels[index]);
+    }
+    free(channels);
     return outcome;
 }
 
@@ -446,25 +468,23 @@ maelys_mcp_result_t maelys_mcp_runtime_notify_tools_list_changed(
     return emit_event(runtime, SUBSCRIPTION_EVENT_TOOLS_LIST_CHANGED, NULL);
 }
 
-maelys_mcp_result_t maelys_mcp_runtime_complete_subscriptions(
-    maelys_mcp_runtime_t *runtime) {
-    if (!runtime || !runtime->subscriptions_mutex_initialized) {
-        return MAELYS_MCP_ERR_ARGUMENT;
-    }
-    pthread_mutex_lock(&runtime->subscriptions_mutex);
-    maelys_mcp_outbox_t *outbox = runtime->outbox;
-    size_t count = runtime->subscription_count;
+maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions(
+    maelys_mcp_channel_t *channel) {
+    if (!channel) return MAELYS_MCP_ERR_ARGUMENT;
+    pthread_mutex_lock(&channel->mutex);
+    size_t count = channel->subscription_count;
     json_t **ids = calloc(count ? count : 1u, sizeof(*ids));
     if (!ids) {
-        pthread_mutex_unlock(&runtime->subscriptions_mutex);
+        pthread_mutex_unlock(&channel->mutex);
         return MAELYS_MCP_ERR_MEMORY;
     }
     for (size_t index = 0; index < count; ++index) {
-        ids[index] = json_deep_copy(runtime->subscriptions[index].id);
-        maelys_mcp_subscription_clear(&runtime->subscriptions[index]);
+        ids[index] = channel->subscriptions[index].id;
+        json_incref(ids[index]);
+        maelys_mcp_subscription_clear(&channel->subscriptions[index]);
     }
-    runtime->subscription_count = 0u;
-    pthread_mutex_unlock(&runtime->subscriptions_mutex);
+    channel->subscription_count = 0u;
+    pthread_mutex_unlock(&channel->mutex);
     maelys_mcp_result_t outcome = MAELYS_MCP_OK;
     for (size_t index = 0; index < count; ++index) {
         if (!ids[index]) {
@@ -486,12 +506,12 @@ maelys_mcp_result_t maelys_mcp_runtime_complete_subscriptions(
                 maelys_mcp_success_response(response_id, result) : NULL;
             if (!response_id) json_decref(result);
             if (response_id) json_decref(response_id);
-            if (!response || !outbox) {
+            if (!response) {
                 if (response) json_decref(response);
-                outcome = outbox ? MAELYS_MCP_ERR_MEMORY : MAELYS_MCP_ERR_ARGUMENT;
+                outcome = MAELYS_MCP_ERR_MEMORY;
             } else {
-                maelys_mcp_result_t status = maelys_mcp_outbox_enqueue_take(
-                    outbox, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL);
+                maelys_mcp_result_t status = maelys_mcp_channel_enqueue_take(
+                    channel, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL, 0);
                 if (status != MAELYS_MCP_OK) {
                     json_decref(response);
                     outcome = status;

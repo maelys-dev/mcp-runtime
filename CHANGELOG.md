@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.10.0 - 2026-08-15
+
+- Introduce opaque `maelys_mcp_channel_t` handles. Each channel owns its ordered
+  output queue, subscriptions, cancellation scope and legacy client lifecycle.
+- Replace the runtime-wide writer outbox with passive bounded per-channel queues;
+  transports now pump output through deadline-aware `maelys_mcp_channel_next`.
+- Route every response, protocol error, listen acknowledgement, provider event and
+  graceful completion through the channel queue. A response admission timeout faults
+  only that channel; notification coalescence and rejection remain local.
+- Make provider event fan-out multi-channel with stable per-channel references and
+  local close barriers. Identical JSON-RPC subscription ids on different channels no
+  longer collide or permit cross-delivery.
+- Make provider activation runtime-scoped, once-only and fail-closed. Make
+  `maelys_mcp_runtime_destroy` return `MAELYS_MCP_ERR_STATE` while a channel handle
+  remains alive, including a closed handle not yet destroyed.
+- Remove `maelys_mcp_runtime_handle`, `maelys_mcp_runtime_attach_outbox` and
+  `maelys_mcp_runtime_detach_outbox` without compatibility wrappers. Migrate by
+  creating a channel, passing requests to `maelys_mcp_channel_handle`, pumping output
+  with `maelys_mcp_channel_next`, then closing and destroying the channel before the
+  runtime.
+- Increment the native ABI from 1 to 2. The `maelys-provider/3` wire protocol and C,
+  TypeScript and Python provider SDK contracts are unchanged.
+
 ## 0.9.0 - 2026-08-15
 
 - Bound stdio message writes with a configurable monotonic deadline and wake the

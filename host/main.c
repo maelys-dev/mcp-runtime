@@ -127,7 +127,11 @@ int main(int argc, char **argv) {
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "Cannot enable MCP modules: %s\n",
             maelys_mcp_result_string(status));
-        maelys_mcp_runtime_destroy(runtime);
+        maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+        if (destroy_status != MAELYS_MCP_OK) {
+            fprintf(stderr, "Cannot destroy runtime: %s\n",
+                maelys_mcp_result_string(destroy_status));
+        }
         close(transport_fd);
         free(provider_paths);
         return 1;
@@ -153,7 +157,11 @@ int main(int argc, char **argv) {
                 error ? ": " : "", error ? error : "");
             if (provider) maelys_mcp_provider_destroy(provider);
             free(error);
-            maelys_mcp_runtime_destroy(runtime);
+            maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+            if (destroy_status != MAELYS_MCP_OK) {
+                fprintf(stderr, "Cannot destroy runtime: %s\n",
+                    maelys_mcp_result_string(destroy_status));
+            }
             close(transport_fd);
             free(provider_paths);
             return 1;
@@ -166,7 +174,8 @@ int main(int argc, char **argv) {
     };
     status = maelys_mcp_runtime_serve_stdio_with_options(
         runtime, STDIN_FILENO, transport_fd, &stdio_options);
-    maelys_mcp_runtime_destroy(runtime);
+    maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+    if (status == MAELYS_MCP_OK) status = destroy_status;
     close(transport_fd);
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "MCP transport failed: %s\n", maelys_mcp_result_string(status));

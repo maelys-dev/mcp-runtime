@@ -38,13 +38,18 @@ static json_t *modern_params(void) {
 }
 
 static json_t *dispatch(
-    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_channel_t *channel,
     const char *method,
     json_t *params) {
     json_t *request = json_pack("{s:s,s:i,s:s,s:o}",
         "jsonrpc", "2.0", "id", 1, "method", method, "params", params);
-    json_t *response = maelys_mcp_runtime_handle(runtime, request);
+    maelys_mcp_result_t status = maelys_mcp_channel_handle(channel, request);
     json_decref(request);
+    if (status != MAELYS_MCP_OK) return NULL;
+    json_t *response = NULL;
+    if (maelys_mcp_channel_next(channel, 1000u, &response) != MAELYS_MCP_OK) {
+        return NULL;
+    }
     return response;
 }
 
@@ -110,8 +115,10 @@ static int test_resource_module(void) {
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime,
         MAELYS_MCP_MODULE_RESOURCES) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, value, NULL) == MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
 
-    json_t *response = dispatch(runtime, "resources/list", modern_params());
+    json_t *response = dispatch(channel, "resources/list", modern_params());
     json_t *result = json_object_get(response, "result");
     json_t *listed = json_array_get(json_object_get(result, "resources"), 0);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(listed, "uri")),
@@ -120,14 +127,14 @@ static int test_resource_module(void) {
     ASSERT_TRUE(json_integer_value(json_object_get(result, "ttlMs")) == 0);
     json_decref(response);
 
-    response = dispatch(runtime, "resources/templates/list", modern_params());
+    response = dispatch(channel, "resources/templates/list", modern_params());
     result = json_object_get(response, "result");
     ASSERT_TRUE(json_array_size(json_object_get(result, "resourceTemplates")) == 1u);
     json_decref(response);
 
     json_t *params = modern_params();
     json_object_set_new(params, "uri", json_string("HERMES://repository/course.mdx"));
-    response = dispatch(runtime, "resources/read", params);
+    response = dispatch(channel, "resources/read", params);
     result = json_object_get(response, "result");
     json_t *content = json_array_get(json_object_get(result, "contents"), 0);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(content, "text")), "# Course") == 0);
@@ -135,7 +142,7 @@ static int test_resource_module(void) {
 
     params = modern_params();
     json_object_set_new(params, "uri", json_string("hermes://repository/assets/logo.bin"));
-    response = dispatch(runtime, "resources/read", params);
+    response = dispatch(channel, "resources/read", params);
     result = json_object_get(response, "result");
     content = json_array_get(json_object_get(result, "contents"), 0);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(content, "blob")), "aGVsbG8=") == 0);
@@ -144,10 +151,11 @@ static int test_resource_module(void) {
 
     params = modern_params();
     json_object_set_new(params, "uri", json_string("file:///tmp/%00.png"));
-    response = dispatch(runtime, "resources/read", params);
+    response = dispatch(channel, "resources/read", params);
     ASSERT_TRUE(json_integer_value(json_object_get(json_object_get(response, "error"), "code")) == -32602);
     json_decref(response);
-    maelys_mcp_runtime_destroy(runtime);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     return 0;
 }
 
