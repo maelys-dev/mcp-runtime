@@ -12,6 +12,13 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+extern int pthread_cond_timedwait_relative_np(
+    pthread_cond_t *,
+    pthread_mutex_t *,
+    const struct timespec *);
+#endif
+
 #define MAELYS_MCP_READ_CHUNK_BYTES 4096u
 
 const char *maelys_mcp_version_string(void) {
@@ -32,8 +39,66 @@ const char *maelys_mcp_result_string(maelys_mcp_result_t result) {
         case MAELYS_MCP_ERR_PROVIDER: return "provider error";
         case MAELYS_MCP_ERR_NOT_FOUND: return "not found";
         case MAELYS_MCP_ERR_DENIED: return "denied";
-        default: return "unknown error";
+        case MAELYS_MCP_ERR_STATE: return "invalid state";
+        case MAELYS_MCP_ERR_TIMEOUT: return "timeout";
+        case MAELYS_MCP_ERR_CLOSED: return "closed";
     }
+    return "unknown error";
+}
+
+int maelys_mcp_monotonic_deadline(
+    unsigned int timeout_ms,
+    uint64_t *out_deadline_ms) {
+    struct timespec now;
+    if (!timeout_ms || !out_deadline_ms ||
+        clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    uint64_t current = (uint64_t)now.tv_sec * 1000u +
+        (uint64_t)now.tv_nsec / 1000000u;
+    if (current > UINT64_MAX - timeout_ms) return -1;
+    *out_deadline_ms = current + timeout_ms;
+    return 0;
+}
+
+int maelys_mcp_cond_init_monotonic(pthread_cond_t *condition) {
+    if (!condition) return EINVAL;
+#ifdef __APPLE__
+    return pthread_cond_init(condition, NULL);
+#else
+    pthread_condattr_t attributes;
+    int status = pthread_condattr_init(&attributes);
+    if (status != 0) return status;
+    status = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (status == 0) status = pthread_cond_init(condition, &attributes);
+    pthread_condattr_destroy(&attributes);
+    return status;
+#endif
+}
+
+int maelys_mcp_cond_wait_until(
+    pthread_cond_t *condition,
+    pthread_mutex_t *mutex,
+    uint64_t deadline_ms) {
+    struct timespec now;
+    if (!condition || !mutex || clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return EINVAL;
+    }
+    uint64_t current = (uint64_t)now.tv_sec * 1000u +
+        (uint64_t)now.tv_nsec / 1000000u;
+    if (current >= deadline_ms) return ETIMEDOUT;
+#ifdef __APPLE__
+    uint64_t remaining = deadline_ms - current;
+    struct timespec relative = {
+        .tv_sec = (time_t)(remaining / 1000u),
+        .tv_nsec = (long)((remaining % 1000u) * 1000000u)
+    };
+    return pthread_cond_timedwait_relative_np(condition, mutex, &relative);
+#else
+    struct timespec absolute = {
+        .tv_sec = (time_t)(deadline_ms / 1000u),
+        .tv_nsec = (long)((deadline_ms % 1000u) * 1000000u)
+    };
+    return pthread_cond_timedwait(condition, mutex, &absolute);
+#endif
 }
 
 char *maelys_mcp_strdup(const char *value) {

@@ -1,11 +1,14 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <pthread.h>
 #include <jansson.h>
 
 #include "maelys/mcp/content.h"
+#include "maelys/mcp/channel.h"
+#include "maelys/mcp/outbox.h"
 #include "maelys/mcp/runtime.h"
 
 #define MAELYS_MCP_MAX_MODULES 16u
@@ -58,6 +61,31 @@ typedef struct maelys_mcp_subscription {
     int active;
 } maelys_mcp_subscription_t;
 
+typedef enum maelys_mcp_runtime_lifecycle {
+    MAELYS_MCP_RUNTIME_COLD = 0,
+    MAELYS_MCP_RUNTIME_ACTIVATING = 1,
+    MAELYS_MCP_RUNTIME_ACTIVE = 2,
+    MAELYS_MCP_RUNTIME_FAULTED = 3,
+    MAELYS_MCP_RUNTIME_SHUTTING_DOWN = 4
+} maelys_mcp_runtime_lifecycle_t;
+
+typedef enum maelys_mcp_channel_state {
+    MAELYS_MCP_CHANNEL_STARTING = 0,
+    MAELYS_MCP_CHANNEL_ACTIVE = 1,
+    MAELYS_MCP_CHANNEL_CLOSING = 2,
+    MAELYS_MCP_CHANNEL_CLOSED = 3,
+    MAELYS_MCP_CHANNEL_FAULTED = 4
+} maelys_mcp_channel_state_t;
+
+/*
+ * Nested runtime locks follow lifecycle_mutex -> channels_mutex ->
+ * channel->mutex. provider_events_mutex is never nested with those locks.
+ * A provider's event_mutex may wrap a sink callback and therefore precedes
+ * provider_events_mutex, but no runtime path acquires event_mutex while holding
+ * provider_events_mutex. Blocking activation, enqueue, and I/O run without the
+ * lifecycle, registry, or channel metadata locks held.
+ */
+
 struct maelys_mcp_provider {
     char *name;
     char *version;
@@ -92,31 +120,55 @@ struct maelys_mcp_runtime {
     size_t provider_count;
     const struct maelys_mcp_module_descriptor *modules[MAELYS_MCP_MAX_MODULES];
     size_t module_count;
-    int legacy_initialize_received;
-    int legacy_initialized;
-    char legacy_client_name[128];
     maelys_mcp_authorize_fn authorize;
     maelys_mcp_audit_fn audit;
     void *policy_context;
-    pthread_mutex_t subscriptions_mutex;
-    int subscriptions_mutex_initialized;
+    pthread_mutex_t lifecycle_mutex;
+    pthread_cond_t lifecycle_changed;
+    int lifecycle_mutex_initialized;
+    int lifecycle_changed_initialized;
+    maelys_mcp_runtime_lifecycle_t lifecycle;
+    maelys_mcp_result_t activation_status;
+    int shutdown_requested;
+    pthread_mutex_t channels_mutex;
+    int channels_mutex_initialized;
+    struct maelys_mcp_channel *channels;
+    size_t live_channel_count;
     pthread_mutex_t provider_events_mutex;
     pthread_cond_t provider_events_idle;
     int provider_events_mutex_initialized;
     int provider_events_idle_initialized;
     int provider_events_accepting;
     size_t provider_events_inflight;
+};
+
+struct maelys_mcp_channel {
+    maelys_mcp_runtime_t *runtime;
+    struct maelys_mcp_channel *next;
+    maelys_mcp_outbox_t *outbox;
+    maelys_mcp_channel_config_t config;
+    pthread_mutex_t mutex;
+    pthread_cond_t idle;
+    int mutex_initialized;
+    int idle_initialized;
+    maelys_mcp_channel_state_t state;
+    int targetable;
+    size_t operations_inflight;
+    int legacy_initialize_received;
+    int legacy_initialized;
+    char legacy_client_name[128];
     maelys_mcp_subscription_t *subscriptions;
     size_t subscription_count;
-    maelys_mcp_outbox_t *outbox;
 };
 
 typedef struct maelys_mcp_module_request {
+    maelys_mcp_channel_t *channel;
     json_t *id;
     json_t *params;
     const char *protocol_version;
     const char *client_name;
     int modern;
+    json_t **post_enqueue_subscription_id;
 } maelys_mcp_module_request_t;
 
 typedef struct maelys_mcp_module_descriptor {
@@ -168,6 +220,14 @@ typedef struct maelys_mcp_line_reader {
 } maelys_mcp_line_reader_t;
 
 char *maelys_mcp_strdup(const char *value);
+int maelys_mcp_monotonic_deadline(
+    unsigned int timeout_ms,
+    uint64_t *out_deadline_ms);
+int maelys_mcp_cond_init_monotonic(pthread_cond_t *condition);
+int maelys_mcp_cond_wait_until(
+    pthread_cond_t *condition,
+    pthread_mutex_t *mutex,
+    uint64_t deadline_ms);
 int maelys_mcp_json_string_has_nul(const json_t *value);
 int maelys_mcp_json_string_equals(const json_t *value, const char *expected);
 int maelys_mcp_json_string_has_prefix(const json_t *value, const char *prefix);
@@ -219,8 +279,27 @@ int maelys_mcp_add_server_meta(
     const char *result_type);
 void maelys_mcp_subscription_clear(maelys_mcp_subscription_t *subscription);
 void maelys_mcp_cancel_subscription(
-    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_channel_t *channel,
     const json_t *request_id);
+void maelys_mcp_activate_subscription(
+    maelys_mcp_channel_t *channel,
+    const json_t *request_id);
+json_t *maelys_mcp_runtime_dispatch(
+    maelys_mcp_channel_t *channel,
+    json_t *request,
+    json_t **out_post_enqueue_subscription_id);
+maelys_mcp_result_t maelys_mcp_channel_enqueue_take(
+    maelys_mcp_channel_t *channel,
+    json_t *message,
+    maelys_mcp_outbox_class_t message_class,
+    const char *coalesce_key,
+    int fault_on_timeout);
+void maelys_mcp_channel_abort(maelys_mcp_channel_t *channel);
+maelys_mcp_result_t maelys_mcp_runtime_snapshot_channels(
+    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_channel_t ***out_channels,
+    size_t *out_count);
+void maelys_mcp_channel_release_operation(maelys_mcp_channel_t *channel);
 void maelys_mcp_provider_bind_event_sink(
     maelys_mcp_provider_t *provider,
     maelys_mcp_result_t (*sink)(

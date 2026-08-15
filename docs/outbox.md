@@ -1,40 +1,46 @@
-# Asynchronous outbox
+# Passive outbox
 
-`maelys_mcp_outbox_t` is the transport-independent output boundary. Any worker, timer,
-or module can enqueue a complete JSON-RPC message; exactly one writer thread invokes
-the configured callback.
+`maelys_mcp_outbox_t` is a transport-independent passive bounded queue. Producers
+enqueue complete JSON-RPC messages; a transport extracts them with
+`maelys_mcp_outbox_next`. Creating an outbox never creates a thread and the outbox
+never invokes a callback or performs I/O.
 
-## Ownership and locking
+## Ownership and waits
 
 - Enqueue success steals one Jansson reference; failure leaves it with the caller.
-- The writer decrements every stolen reference after its callback, including errors.
-- The queue mutex protects only links, counters and state.
-- No callback, serialization write, or other blocking I/O runs while the mutex is held.
-- Shutdown stops producers first, then either drains or discards pending messages.
+- `next` transfers one owned reference to the consumer.
+- Admission and extraction use monotonic deadlines. A full queue returns
+  `MAELYS_MCP_ERR_TIMEOUT`; an empty closed queue returns
+  `MAELYS_MCP_ERR_CLOSED`.
+- Closing stops admission and wakes all producers and consumers. A non-discarding
+  close preserves admitted messages for the transport to drain.
+- `maelys_mcp_outbox_wait_drained` is bounded. Destruction is refused until the queue
+  is both closed and empty, preventing a successful API result from being silently
+  discarded.
+- Oversized messages, allocation failures, closed admission, and admission timeouts
+  increment the observable `rejected` statistic; no rejected message is reported as
+  delivered.
+- The queue mutex protects links, counters and state only. No serialization, provider
+  callback, transport I/O or thread join runs under it.
 
 ## Capacity and scheduling
 
-Both the number of messages and their estimated compact serialized bytes are bounded.
-Producers wait on a condition variable when capacity is exhausted and wake when the
-writer removes a batch or reports a terminal failure. Responses and notifications use
-separate FIFO queues. The default response burst is eight; a waiting notification is
-then forced before response processing resumes.
+Message count and compact serialized bytes are both bounded. Responses and
+notifications use separate FIFO queues. Responses are preferred, but after the
+configured response burst a waiting notification is selected to prevent starvation.
 
-A notification may provide a coalescence key such as `resource:<uri>`. A replacement
-keeps only the newest JSON message and moves its node to the queue tail. Thus the event
-order `A, B, A` is observed as `B, A`, which reflects the newest invalidation order.
-Responses are never coalesced.
+A notification may provide a coalescence key such as a subscription id plus resource
+URI. Replacing `A` in the sequence `A, B, A` moves the newest `A` to the tail, so the
+observable order becomes `B, A`. Responses are never coalesced.
 
-Subscription acknowledgements are wire-level JSON-RPC notifications, but are queued
-in the response-priority lane. MCP requires acknowledgement to be the first message of
-the listen stream; this classification prevents a later ordinary or graceful-close
-response from overtaking it. Resource and list-change notifications use keyed
-coalescence keys that include both the subscription id and event subject.
+Subscription acknowledgements are wire-level notifications but use the response lane.
+This preserves the required acknowledgement-before-event causal boundary. Ordinary
+resource and catalog notifications use keyed coalescence local to one channel.
 
-The callback must obey its transport's own shutdown contract and must not call back
-into the same outbox. The built-in stdio transport gives each complete message a
-monotonic write deadline (five seconds by default), reports a terminal I/O error to the
-outbox, and wakes the service loop so stdin cannot keep the failed runtime alive. Use
-`maelys_mcp_runtime_serve_stdio_with_options` or `--stdio-write-timeout-ms` to choose a
-different deadline. Custom callbacks must provide equivalent bounded or cancellable
-I/O when their transport can stall indefinitely.
+## Transport responsibility
+
+The transport owns output pumping and its execution model. Stdio uses one writer
+thread for its single durable channel and gives each descriptor write a monotonic
+deadline. A future transport may use an event loop or shared writer pool. In every
+case, transport shutdown must close the channel to wake a consumer waiting on an empty
+queue before joining or releasing that consumer.

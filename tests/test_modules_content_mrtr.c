@@ -68,10 +68,15 @@ static json_t *request(const char *method, json_t *params) {
         "method", method, "params", params);
 }
 
-static json_t *dispatch(maelys_mcp_runtime_t *runtime, const char *method, json_t *params) {
+static json_t *dispatch(maelys_mcp_channel_t *channel, const char *method, json_t *params) {
     json_t *owned_request = request(method, params);
-    json_t *response = maelys_mcp_runtime_handle(runtime, owned_request);
+    maelys_mcp_result_t status = maelys_mcp_channel_handle(channel, owned_request);
     json_decref(owned_request);
+    if (status != MAELYS_MCP_OK) return NULL;
+    json_t *response = NULL;
+    if (maelys_mcp_channel_next(channel, 1000u, &response) != MAELYS_MCP_OK) {
+        return NULL;
+    }
     return response;
 }
 
@@ -126,13 +131,20 @@ static int test_modules_rich_content_and_mrtr(void) {
     };
     maelys_mcp_runtime_t *core = NULL;
     ASSERT_TRUE(maelys_mcp_runtime_create(&config, &core) == MAELYS_MCP_OK);
-    json_t *response = dispatch(core, "server/discover", modern_params());
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel) == MAELYS_MCP_OK);
+    json_t *response = dispatch(channel, "server/discover", modern_params());
     json_t *capabilities = json_object_get(json_object_get(response, "result"), "capabilities");
     ASSERT_TRUE(json_object_size(capabilities) == 0u);
     json_decref(response);
-    response = dispatch(core, "tools/list", modern_params());
+    response = dispatch(channel, "tools/list", modern_params());
     ASSERT_TRUE(json_integer_value(json_object_get(json_object_get(response, "error"), "code")) == -32601);
     json_decref(response);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(core) == MAELYS_MCP_OK);
+    core = NULL;
+    channel = NULL;
+    ASSERT_TRUE(maelys_mcp_runtime_create(&config, &core) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_module_enabled(core, MAELYS_MCP_MODULE_TOOLS));
@@ -156,11 +168,12 @@ static int test_modules_rich_content_and_mrtr(void) {
     ASSERT_TRUE(maelys_mcp_provider_create(&provider_config, &provider) == MAELYS_MCP_OK);
     json_decref(schema);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(core, provider, NULL) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel) == MAELYS_MCP_OK);
 
     json_t *params = modern_params();
     json_object_set_new(params, "name", json_string("test.rich"));
     json_object_set_new(params, "arguments", json_object());
-    response = dispatch(core, "tools/call", params);
+    response = dispatch(channel, "tools/call", params);
     json_t *result = json_object_get(response, "result");
     ASSERT_TRUE(json_array_size(json_object_get(result, "content")) == 4u);
     ASSERT_TRUE(json_is_true(json_object_get(json_object_get(result, "structuredContent"), "ok")));
@@ -169,14 +182,14 @@ static int test_modules_rich_content_and_mrtr(void) {
     params = modern_params();
     json_object_set_new(params, "name", json_string("test.invalid-content"));
     json_object_set_new(params, "arguments", json_object());
-    response = dispatch(core, "tools/call", params);
+    response = dispatch(channel, "tools/call", params);
     ASSERT_TRUE(json_is_true(json_object_get(json_object_get(response, "result"), "isError")));
     json_decref(response);
 
     params = modern_params();
     json_object_set_new(params, "name", json_string("test.confirm"));
     json_object_set_new(params, "arguments", json_object());
-    response = dispatch(core, "tools/call", params);
+    response = dispatch(channel, "tools/call", params);
     ASSERT_TRUE(json_is_true(json_object_get(json_object_get(response, "result"), "isError")));
     json_decref(response);
 
@@ -186,7 +199,7 @@ static int test_modules_rich_content_and_mrtr(void) {
         "io.modelcontextprotocol/clientCapabilities"), "elicitation");
     json_object_set_new(params, "name", json_string("test.confirm"));
     json_object_set_new(params, "arguments", json_object());
-    response = dispatch(core, "tools/call", params);
+    response = dispatch(channel, "tools/call", params);
     ASSERT_TRUE(json_integer_value(json_object_get(json_object_get(response, "error"), "code")) == -32021);
     ASSERT_TRUE(json_is_object(json_object_get(json_object_get(json_object_get(response, "error"), "data"),
         "requiredCapabilities")));
@@ -195,7 +208,7 @@ static int test_modules_rich_content_and_mrtr(void) {
     params = modern_params();
     json_object_set_new(params, "name", json_string("test.confirm"));
     json_object_set_new(params, "arguments", json_object());
-    response = dispatch(core, "tools/call", params);
+    response = dispatch(channel, "tools/call", params);
     result = json_object_get(response, "result");
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "resultType")), "input_required") == 0);
     ASSERT_TRUE(json_is_object(json_object_get(result, "inputRequests")));
@@ -207,12 +220,13 @@ static int test_modules_rich_content_and_mrtr(void) {
     json_object_set_new(params, "arguments", json_object());
     json_object_set_new(params, "inputResponses", json_pack("{s:{s:s}}", "confirmation", "action", "accept"));
     json_object_set_new(params, "requestState", json_string("state-1"));
-    response = dispatch(core, "tools/call", params);
+    response = dispatch(channel, "tools/call", params);
     result = json_object_get(response, "result");
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "resultType")), "complete") == 0);
     ASSERT_TRUE(state.saw_retry == 1);
     json_decref(response);
-    maelys_mcp_runtime_destroy(core);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(core) == MAELYS_MCP_OK);
     return 0;
 }
 

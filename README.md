@@ -29,7 +29,7 @@ The first milestone provides:
 - injectable authorization and audit callbacks;
 - an external example provider and conformance tests;
 - isolated protocol stdout that cannot be contaminated by ordinary `printf()` calls;
-- a bounded asynchronous output bus with a single protocol writer, response priority,
+- opaque per-client channels with bounded passive output queues, response priority,
   anti-starvation and causal notification coalescence;
 - MCP 2026-07-28 `subscriptions/listen`, negotiated Tools/Resources filters,
   subscription-tagged change notifications, cancellation and graceful completion;
@@ -123,7 +123,7 @@ docs/                architecture, security and provider protocol
 See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-protocol.md),
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
 [C API and ABI policy](docs/abi-policy.md),
-[Asynchronous outbox](docs/outbox.md), [Subscriptions](docs/subscriptions.md),
+[Passive outbox](docs/outbox.md), [Subscriptions](docs/subscriptions.md),
 [Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
 Client setup examples are in [Codex and Claude clients](docs/clients.md).
 The scope and limitations of the upstream test suite are in
@@ -131,12 +131,14 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.9.0 bounds stdio output writes and terminates the transport when a client
-stops draining responses. The public `maelys_mcp_runtime_serve_stdio_with_options`
-entry point makes the write deadline configurable while the existing stdio function
-keeps a five-second default. The public C SDK continues to isolate provider stdout,
-validate descriptors, and serialize provider-originated events through an explicit
-lifecycle. Provider calls remain synchronous in this release. Streamable HTTP,
+Version 0.10.0 introduces native ABI 2 and replaces the runtime-wide output bus with
+opaque `maelys_mcp_channel_t` handles. Each channel owns its ordered output,
+subscriptions and legacy client state; provider events fan out through retained local
+references, so a slow or closing channel cannot suspend its peers. The outbox is now a
+passive bounded queue and stdio owns the only writer thread. This is an intentional
+pre-1.0 API break: embedders must migrate from `runtime_handle` and outbox attach/detach
+to channel create/handle/next/close/destroy. Provider SDKs and `maelys-provider/3` are
+unchanged. Provider calls remain synchronous in this release. Streamable HTTP,
 prompts, Tasks, progress, dynamic provider reload, full JSON Schema 2020-12 and
 Windows support are not implemented yet. The pre-1.0 ABI policy is documented and
 versioned; same-major ABI stability begins with 1.0.

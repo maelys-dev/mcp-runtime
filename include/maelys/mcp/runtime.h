@@ -5,7 +5,6 @@
 
 #include "maelys/mcp/error.h"
 #include "maelys/mcp/module.h"
-#include "maelys/mcp/outbox.h"
 #include "maelys/mcp/provider.h"
 
 #ifdef __cplusplus
@@ -18,6 +17,12 @@ extern "C" {
 #define MAELYS_MCP_DEFAULT_STDIO_WRITE_TIMEOUT_MS 5000u
 
 typedef struct maelys_mcp_runtime maelys_mcp_runtime_t;
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MAELYS_MCP_WARN_UNUSED_RESULT __attribute__((warn_unused_result))
+#else
+#define MAELYS_MCP_WARN_UNUSED_RESULT
+#endif
 
 typedef enum maelys_mcp_operation {
     MAELYS_MCP_OPERATION_LIST = 0,
@@ -65,23 +70,14 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     const maelys_mcp_runtime_config_t *config,
     maelys_mcp_runtime_t **out_runtime);
 
-void maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime);
+/* Returns MAELYS_MCP_ERR_STATE without freeing runtime while channels live. */
+MAELYS_MCP_WARN_UNUSED_RESULT
+maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime);
 
 maelys_mcp_result_t maelys_mcp_runtime_add_provider(
     maelys_mcp_runtime_t *runtime,
     maelys_mcp_provider_t *provider,
     char **out_error);
-
-json_t *maelys_mcp_runtime_handle(
-    maelys_mcp_runtime_t *runtime,
-    json_t *request);
-
-/* The runtime borrows the outbox. Detach it before destroying the outbox. */
-maelys_mcp_result_t maelys_mcp_runtime_attach_outbox(
-    maelys_mcp_runtime_t *runtime,
-    maelys_mcp_outbox_t *outbox);
-
-void maelys_mcp_runtime_detach_outbox(maelys_mcp_runtime_t *runtime);
 
 maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
     maelys_mcp_runtime_t *runtime,
@@ -101,3 +97,5 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
 #ifdef __cplusplus
 }
 #endif
+
+#undef MAELYS_MCP_WARN_UNUSED_RESULT

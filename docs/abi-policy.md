@@ -1,8 +1,9 @@
 # C API and ABI policy
 
 The public C API uses opaque handles for every stateful object:
-`maelys_mcp_runtime_t`, `maelys_mcp_provider_t`, `maelys_mcp_outbox_t` and
-`maelys_uri_t`. Their definitions are private and will remain private.
+`maelys_mcp_runtime_t`, `maelys_mcp_channel_t`, `maelys_mcp_provider_t`,
+`maelys_mcp_outbox_t` and `maelys_uri_t`. Their definitions are private and will
+remain private.
 
 Descriptors, callback requests, callback results, configuration records and statistics
 are deliberately public plain-data structures. They make provider integration simple,
@@ -27,3 +28,9 @@ The policy is:
 
 The build exports a static library today. This policy also applies if a shared-library
 artifact is introduced later.
+
+ABI 2 was introduced by version 0.10.0. It intentionally removes the ABI 1
+runtime-wide dispatch/outbox attachment surface. ABI 2 embedders create one or more
+channels, enqueue requests through `maelys_mcp_channel_handle`, pump ordered output
+with `maelys_mcp_channel_next`, and destroy every channel before destroying its
+runtime. No ABI 1 compatibility wrappers are exported.

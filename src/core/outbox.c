@@ -1,6 +1,7 @@
+#include "src/internal/internal.h"
 #include "maelys/mcp/outbox.h"
 
-#include <pthread.h>
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,6 @@ struct maelys_mcp_outbox {
     pthread_mutex_t mutex;
     pthread_cond_t available;
     pthread_cond_t space;
-    pthread_t writer;
     maelys_mcp_outbox_config_t config;
     outbox_queue_t responses;
     outbox_queue_t notifications;
@@ -30,12 +30,10 @@ struct maelys_mcp_outbox {
     size_t queued_bytes;
     size_t consecutive_responses;
     int accepting;
-    int discard;
-    int writer_started;
-    maelys_mcp_result_t writer_status;
     atomic_ullong enqueued;
-    atomic_ullong written;
+    atomic_ullong dequeued;
     atomic_ullong coalesced;
+    atomic_ullong rejected;
 };
 
 static char *copy_string(const char *value) {
@@ -53,7 +51,7 @@ static size_t message_bytes(json_t *message) {
 
 static void release_node(outbox_node_t *node) {
     if (!node) return;
-    json_decref(node->message);
+    if (node->message) json_decref(node->message);
     free(node->key);
     free(node);
 }
@@ -127,90 +125,27 @@ static void clear_pending(maelys_mcp_outbox_t *outbox) {
     outbox->queued_bytes = 0u;
 }
 
-static void *writer_main(void *opaque) {
-    maelys_mcp_outbox_t *outbox = opaque;
-    outbox_node_t **batch = calloc(outbox->config.batch_size, sizeof(*batch));
-    if (!batch) {
-        pthread_mutex_lock(&outbox->mutex);
-        outbox->writer_status = MAELYS_MCP_ERR_MEMORY;
-        outbox->accepting = 0;
-        clear_pending(outbox);
-        pthread_cond_broadcast(&outbox->space);
-        pthread_mutex_unlock(&outbox->mutex);
-        return NULL;
-    }
-    for (;;) {
-        pthread_mutex_lock(&outbox->mutex);
-        while (outbox->queued_messages == 0u && outbox->accepting) {
-            pthread_cond_wait(&outbox->available, &outbox->mutex);
-        }
-        if (outbox->discard) clear_pending(outbox);
-        if (!outbox->accepting && outbox->queued_messages == 0u) {
-            pthread_mutex_unlock(&outbox->mutex);
-            break;
-        }
-        size_t count = 0u;
-        while (count < outbox->config.batch_size && outbox->queued_messages) {
-            outbox_node_t *node = select_next(outbox);
-            if (!node) break;
-            batch[count++] = node;
-            outbox->queued_messages--;
-            outbox->queued_bytes -= node->bytes;
-        }
-        pthread_cond_broadcast(&outbox->space);
-        pthread_mutex_unlock(&outbox->mutex);
-
-        for (size_t index = 0; index < count; ++index) {
-            maelys_mcp_result_t status = outbox->config.write(
-                outbox->config.write_context, batch[index]->message);
-            if (status == MAELYS_MCP_OK) atomic_fetch_add(&outbox->written, 1u);
-            release_node(batch[index]);
-            batch[index] = NULL;
-            if (status != MAELYS_MCP_OK) {
-                for (++index; index < count; ++index) {
-                    release_node(batch[index]);
-                    batch[index] = NULL;
-                }
-                pthread_mutex_lock(&outbox->mutex);
-                outbox->writer_status = status;
-                outbox->accepting = 0;
-                outbox->discard = 1;
-                clear_pending(outbox);
-                pthread_cond_broadcast(&outbox->space);
-                pthread_mutex_unlock(&outbox->mutex);
-                free(batch);
-                return NULL;
-            }
-        }
-    }
-    free(batch);
-    return NULL;
-}
-
 maelys_mcp_result_t maelys_mcp_outbox_create(
     const maelys_mcp_outbox_config_t *config,
     maelys_mcp_outbox_t **out_outbox) {
-    if (!config || !out_outbox || !config->write) return MAELYS_MCP_ERR_ARGUMENT;
+    if (!config || !out_outbox) return MAELYS_MCP_ERR_ARGUMENT;
     *out_outbox = NULL;
     maelys_mcp_outbox_t *outbox = calloc(1u, sizeof(*outbox));
     if (!outbox) return MAELYS_MCP_ERR_MEMORY;
     outbox->config = *config;
     if (!outbox->config.max_messages) outbox->config.max_messages = 256u;
     if (!outbox->config.max_bytes) outbox->config.max_bytes = 4u * 1024u * 1024u;
-    if (!outbox->config.batch_size) outbox->config.batch_size = 32u;
     if (!outbox->config.response_burst) outbox->config.response_burst = 8u;
+    if (!outbox->config.admission_timeout_ms) {
+        outbox->config.admission_timeout_ms = 5000u;
+    }
     outbox->accepting = 1;
-    outbox->writer_status = MAELYS_MCP_OK;
     if (pthread_mutex_init(&outbox->mutex, NULL) != 0) goto failed;
-    if (pthread_cond_init(&outbox->available, NULL) != 0) goto failed_mutex;
-    if (pthread_cond_init(&outbox->space, NULL) != 0) goto failed_available;
-    if (pthread_create(&outbox->writer, NULL, writer_main, outbox) != 0) goto failed_space;
-    outbox->writer_started = 1;
+    if (maelys_mcp_cond_init_monotonic(&outbox->available) != 0) goto failed_mutex;
+    if (maelys_mcp_cond_init_monotonic(&outbox->space) != 0) goto failed_available;
     *out_outbox = outbox;
     return MAELYS_MCP_OK;
 
-failed_space:
-    pthread_cond_destroy(&outbox->space);
 failed_available:
     pthread_cond_destroy(&outbox->available);
 failed_mutex:
@@ -228,22 +163,30 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
     if (!outbox || !message ||
         (message_class != MAELYS_MCP_OUTBOX_RESPONSE &&
          message_class != MAELYS_MCP_OUTBOX_NOTIFICATION) ||
-        (coalesce_key && *coalesce_key && message_class != MAELYS_MCP_OUTBOX_NOTIFICATION)) {
+        (coalesce_key && *coalesce_key &&
+         message_class != MAELYS_MCP_OUTBOX_NOTIFICATION)) {
         return MAELYS_MCP_ERR_ARGUMENT;
     }
     size_t bytes = message_bytes(message);
-    if (!bytes || bytes > outbox->config.max_bytes) return MAELYS_MCP_ERR_PROTOCOL;
+    if (!bytes || bytes > outbox->config.max_bytes) {
+        atomic_fetch_add(&outbox->rejected, 1u);
+        return MAELYS_MCP_ERR_PROTOCOL;
+    }
     char *key = copy_string(coalesce_key);
     if (coalesce_key && *coalesce_key && !key) return MAELYS_MCP_ERR_MEMORY;
-    outbox_node_t *created = NULL;
+    uint64_t deadline_ms = 0u;
+    if (maelys_mcp_monotonic_deadline(
+        outbox->config.admission_timeout_ms, &deadline_ms) != 0) {
+        free(key);
+        return MAELYS_MCP_ERR_IO;
+    }
     pthread_mutex_lock(&outbox->mutex);
     for (;;) {
-        if (!outbox->accepting || outbox->writer_status != MAELYS_MCP_OK) {
-            maelys_mcp_result_t status = outbox->writer_status == MAELYS_MCP_OK ?
-                MAELYS_MCP_ERR_IO : outbox->writer_status;
+        if (!outbox->accepting) {
             pthread_mutex_unlock(&outbox->mutex);
             free(key);
-            return status;
+            atomic_fetch_add(&outbox->rejected, 1u);
+            return MAELYS_MCP_ERR_CLOSED;
         }
         outbox_node_t *previous = NULL;
         outbox_node_t *existing = key ? find_notification(
@@ -266,16 +209,16 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
             }
         } else if (outbox->queued_messages < outbox->config.max_messages &&
                    outbox->queued_bytes + bytes <= outbox->config.max_bytes) {
-            created = calloc(1u, sizeof(*created));
+            outbox_node_t *created = calloc(1u, sizeof(*created));
             if (!created) {
                 pthread_mutex_unlock(&outbox->mutex);
                 free(key);
+                atomic_fetch_add(&outbox->rejected, 1u);
                 return MAELYS_MCP_ERR_MEMORY;
             }
             created->message = message;
             created->key = key;
             created->bytes = bytes;
-            key = NULL;
             queue_push(message_class == MAELYS_MCP_OUTBOX_RESPONSE ?
                 &outbox->responses : &outbox->notifications, created);
             outbox->queued_messages++;
@@ -285,40 +228,132 @@ maelys_mcp_result_t maelys_mcp_outbox_enqueue_take(
             pthread_mutex_unlock(&outbox->mutex);
             return MAELYS_MCP_OK;
         }
-        pthread_cond_wait(&outbox->space, &outbox->mutex);
+        int waited = maelys_mcp_cond_wait_until(
+            &outbox->space, &outbox->mutex, deadline_ms);
+        if (waited == ETIMEDOUT) {
+            pthread_mutex_unlock(&outbox->mutex);
+            free(key);
+            atomic_fetch_add(&outbox->rejected, 1u);
+            return MAELYS_MCP_ERR_TIMEOUT;
+        }
+        if (waited != 0) {
+            pthread_mutex_unlock(&outbox->mutex);
+            free(key);
+            atomic_fetch_add(&outbox->rejected, 1u);
+            return MAELYS_MCP_ERR_IO;
+        }
     }
 }
 
-maelys_mcp_result_t maelys_mcp_outbox_destroy(
+maelys_mcp_result_t maelys_mcp_outbox_next(
     maelys_mcp_outbox_t *outbox,
-    int drain) {
+    unsigned int timeout_ms,
+    json_t **out_message) {
+    if (!outbox || !timeout_ms || !out_message) return MAELYS_MCP_ERR_ARGUMENT;
+    *out_message = NULL;
+    uint64_t deadline_ms = 0u;
+    if (maelys_mcp_monotonic_deadline(timeout_ms, &deadline_ms) != 0) {
+        return MAELYS_MCP_ERR_IO;
+    }
+    pthread_mutex_lock(&outbox->mutex);
+    while (outbox->queued_messages == 0u && outbox->accepting) {
+        int waited = maelys_mcp_cond_wait_until(
+            &outbox->available, &outbox->mutex, deadline_ms);
+        if (waited == ETIMEDOUT) {
+            pthread_mutex_unlock(&outbox->mutex);
+            return MAELYS_MCP_ERR_TIMEOUT;
+        }
+        if (waited != 0) {
+            pthread_mutex_unlock(&outbox->mutex);
+            return MAELYS_MCP_ERR_IO;
+        }
+    }
+    if (outbox->queued_messages == 0u) {
+        pthread_mutex_unlock(&outbox->mutex);
+        return MAELYS_MCP_ERR_CLOSED;
+    }
+    outbox_node_t *node = select_next(outbox);
+    if (!node) {
+        pthread_mutex_unlock(&outbox->mutex);
+        return MAELYS_MCP_ERR_IO;
+    }
+    outbox->queued_messages--;
+    outbox->queued_bytes -= node->bytes;
+    *out_message = node->message;
+    node->message = NULL;
+    atomic_fetch_add(&outbox->dequeued, 1u);
+    pthread_cond_broadcast(&outbox->space);
+    pthread_mutex_unlock(&outbox->mutex);
+    release_node(node);
+    return MAELYS_MCP_OK;
+}
+
+maelys_mcp_result_t maelys_mcp_outbox_close(
+    maelys_mcp_outbox_t *outbox,
+    int discard) {
     if (!outbox) return MAELYS_MCP_ERR_ARGUMENT;
     pthread_mutex_lock(&outbox->mutex);
     outbox->accepting = 0;
-    outbox->discard = !drain;
+    if (discard) clear_pending(outbox);
     pthread_cond_broadcast(&outbox->available);
     pthread_cond_broadcast(&outbox->space);
     pthread_mutex_unlock(&outbox->mutex);
-    if (outbox->writer_started) pthread_join(outbox->writer, NULL);
+    return MAELYS_MCP_OK;
+}
+
+maelys_mcp_result_t maelys_mcp_outbox_wait_drained(
+    maelys_mcp_outbox_t *outbox,
+    unsigned int timeout_ms) {
+    if (!outbox || !timeout_ms) return MAELYS_MCP_ERR_ARGUMENT;
+    uint64_t deadline_ms = 0u;
+    if (maelys_mcp_monotonic_deadline(timeout_ms, &deadline_ms) != 0) {
+        return MAELYS_MCP_ERR_IO;
+    }
     pthread_mutex_lock(&outbox->mutex);
-    clear_pending(outbox);
-    maelys_mcp_result_t status = outbox->writer_status;
+    if (outbox->accepting) {
+        pthread_mutex_unlock(&outbox->mutex);
+        return MAELYS_MCP_ERR_STATE;
+    }
+    while (outbox->queued_messages != 0u) {
+        int waited = maelys_mcp_cond_wait_until(
+            &outbox->space, &outbox->mutex, deadline_ms);
+        if (waited == ETIMEDOUT) {
+            pthread_mutex_unlock(&outbox->mutex);
+            return MAELYS_MCP_ERR_TIMEOUT;
+        }
+        if (waited != 0) {
+            pthread_mutex_unlock(&outbox->mutex);
+            return MAELYS_MCP_ERR_IO;
+        }
+    }
+    pthread_mutex_unlock(&outbox->mutex);
+    return MAELYS_MCP_OK;
+}
+
+maelys_mcp_result_t maelys_mcp_outbox_destroy(maelys_mcp_outbox_t *outbox) {
+    if (!outbox) return MAELYS_MCP_ERR_ARGUMENT;
+    pthread_mutex_lock(&outbox->mutex);
+    if (outbox->accepting || outbox->queued_messages != 0u) {
+        pthread_mutex_unlock(&outbox->mutex);
+        return MAELYS_MCP_ERR_STATE;
+    }
     pthread_mutex_unlock(&outbox->mutex);
     pthread_cond_destroy(&outbox->space);
     pthread_cond_destroy(&outbox->available);
     pthread_mutex_destroy(&outbox->mutex);
     free(outbox);
-    return status;
+    return MAELYS_MCP_OK;
 }
 
 void maelys_mcp_outbox_stats(
     maelys_mcp_outbox_t *outbox,
     maelys_mcp_outbox_stats_t *out_stats) {
     if (!outbox || !out_stats) return;
-    out_stats->enqueued = atomic_load(&outbox->enqueued);
-    out_stats->written = atomic_load(&outbox->written);
-    out_stats->coalesced = atomic_load(&outbox->coalesced);
     pthread_mutex_lock(&outbox->mutex);
+    out_stats->enqueued = atomic_load(&outbox->enqueued);
+    out_stats->dequeued = atomic_load(&outbox->dequeued);
+    out_stats->coalesced = atomic_load(&outbox->coalesced);
+    out_stats->rejected = atomic_load(&outbox->rejected);
     out_stats->queued_messages = outbox->queued_messages;
     out_stats->queued_bytes = outbox->queued_bytes;
     pthread_mutex_unlock(&outbox->mutex);

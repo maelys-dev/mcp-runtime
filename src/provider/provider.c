@@ -117,8 +117,10 @@ maelys_mcp_result_t maelys_mcp_provider_emit_event(
     maelys_mcp_result_t (*sink)(
         void *, const maelys_mcp_provider_event_t *) = provider->event_sink;
     void *context = provider->event_sink_context;
+    maelys_mcp_result_t status = sink ?
+        sink(context, event) : MAELYS_MCP_ERR_NOT_FOUND;
     pthread_mutex_unlock(&provider->event_mutex);
-    return sink ? sink(context, event) : MAELYS_MCP_ERR_NOT_FOUND;
+    return status;
 }
 
 maelys_mcp_result_t maelys_mcp_provider_create(
