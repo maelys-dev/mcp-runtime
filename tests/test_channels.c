@@ -380,10 +380,9 @@ static int wait_for_creator_count(
     maelys_mcp_runtime_t *runtime,
     size_t expected) {
     for (size_t attempt = 0; attempt < 1000u; ++attempt) {
-        uint_least64_t gate = atomic_load_explicit(
-            &runtime->channel_create_gate, memory_order_acquire);
-        size_t count = (size_t)(gate &
-            MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK);
+        pthread_mutex_lock(&runtime->channel_create_gate_mutex);
+        size_t count = runtime->channel_creators_admitted;
+        pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
         if (count == expected) return 1;
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
         nanosleep(&pause, NULL);
@@ -393,21 +392,10 @@ static int wait_for_creator_count(
 
 static int wait_for_create_gate_closed(maelys_mcp_runtime_t *runtime) {
     for (size_t attempt = 0; attempt < 1000u; ++attempt) {
-        uint_least64_t gate = atomic_load_explicit(
-            &runtime->channel_create_gate, memory_order_acquire);
-        if (gate & MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED) return 1;
-        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
-        nanosleep(&pause, NULL);
-    }
-    return 0;
-}
-
-static int wait_for_shutdown_request(maelys_mcp_runtime_t *runtime) {
-    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
-        pthread_mutex_lock(&runtime->lifecycle_mutex);
-        int requested = runtime->shutdown_requested;
-        pthread_mutex_unlock(&runtime->lifecycle_mutex);
-        if (requested) return 1;
+        pthread_mutex_lock(&runtime->channel_create_gate_mutex);
+        int accepting = runtime->channel_create_accepting;
+        pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
+        if (!accepting) return 1;
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
         nanosleep(&pause, NULL);
     }
@@ -504,21 +492,25 @@ static int test_destroy_races_blocked_activation(void) {
     pthread_t destroyer_thread;
     ASSERT_TRUE(pthread_create(&destroyer_thread, NULL,
         destroy_runtime_thread, &destroyer) == 0);
-    ASSERT_TRUE(wait_for_shutdown_request(runtime));
     release_activation(&activation);
     for (size_t index = 0; index < CREATOR_COUNT; ++index) {
         ASSERT_TRUE(pthread_join(creator_threads[index], NULL) == 0);
-        ASSERT_TRUE(creators[index].status == MAELYS_MCP_ERR_STATE);
-        ASSERT_TRUE(creators[index].channel == NULL);
+        ASSERT_TRUE(creators[index].status == MAELYS_MCP_OK);
+        ASSERT_TRUE(creators[index].channel != NULL);
     }
     ASSERT_TRUE(pthread_join(destroyer_thread, NULL) == 0);
-    ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
+    ASSERT_TRUE(destroyer.status == MAELYS_MCP_ERR_STATE);
+    for (size_t index = 0; index < CREATOR_COUNT; ++index) {
+        ASSERT_TRUE(maelys_mcp_channel_destroy(creators[index].channel) ==
+            MAELYS_MCP_OK);
+    }
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     ASSERT_TRUE(activation.calls == 1);
     activation_context_clear(&activation);
     return 0;
 }
 
-static int test_destroy_rejects_creators_waiting_on_lifecycle_lock(void) {
+static int test_create_after_gate_is_hardening_not_contract(void) {
     maelys_mcp_runtime_t *runtime = new_runtime(0);
     ASSERT_TRUE(runtime != NULL);
     enum { CREATOR_COUNT = 8 };
@@ -536,14 +528,28 @@ static int test_destroy_rejects_creators_waiting_on_lifecycle_lock(void) {
     ASSERT_TRUE(pthread_create(&destroyer_thread, NULL,
         destroy_runtime_thread, &destroyer) == 0);
     ASSERT_TRUE(wait_for_create_gate_closed(runtime));
+    /*
+     * This call starts after runtime_destroy and is outside the public
+     * lifetime contract. The earlier admitted creators keep the object live,
+     * so it exercises only the defensive closed-gate behavior.
+     */
+    maelys_mcp_channel_t *late_channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &late_channel) ==
+        MAELYS_MCP_ERR_STATE);
+    ASSERT_TRUE(late_channel == NULL);
     pthread_mutex_unlock(&runtime->lifecycle_mutex);
     for (size_t index = 0; index < CREATOR_COUNT; ++index) {
         ASSERT_TRUE(pthread_join(creator_threads[index], NULL) == 0);
-        ASSERT_TRUE(creators[index].status == MAELYS_MCP_ERR_STATE);
-        ASSERT_TRUE(creators[index].channel == NULL);
+        ASSERT_TRUE(creators[index].status == MAELYS_MCP_OK);
+        ASSERT_TRUE(creators[index].channel != NULL);
     }
     ASSERT_TRUE(pthread_join(destroyer_thread, NULL) == 0);
-    ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
+    ASSERT_TRUE(destroyer.status == MAELYS_MCP_ERR_STATE);
+    for (size_t index = 0; index < CREATOR_COUNT; ++index) {
+        ASSERT_TRUE(maelys_mcp_channel_destroy(creators[index].channel) ==
+            MAELYS_MCP_OK);
+    }
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     return 0;
 }
 
@@ -699,6 +705,31 @@ static int test_close_uses_one_absolute_deadline(void) {
     return 0;
 }
 
+static int test_destroy_consumes_channel_after_bounded_close_failure(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_config_t config = {
+        .max_messages = 4u,
+        .max_bytes = 1024u * 1024u,
+        .response_burst = 8u,
+        .admission_timeout_ms = 100u,
+        .close_timeout_ms = 10u
+    };
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(handle(channel, listen_request(json_string("terminal-destroy"),
+        "test://terminal")) == MAELYS_MCP_OK);
+    json_t *ack = next_message(channel, 1000u);
+    ASSERT_TRUE(ack != NULL);
+    json_decref(ack);
+
+    /* The close queues complete but no consumer drains it before the deadline. */
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_ERR_TIMEOUT);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
 typedef struct event_context {
     maelys_mcp_provider_t *provider;
     atomic_int delivered;
@@ -722,6 +753,137 @@ static void *emit_many_events(void *opaque) {
         }
     }
     return NULL;
+}
+
+typedef struct one_event_context {
+    maelys_mcp_provider_t *provider;
+    const char *uri;
+    maelys_mcp_result_t status;
+} one_event_context_t;
+
+static void *emit_one_resource_event(void *opaque) {
+    one_event_context_t *context = opaque;
+    const maelys_mcp_provider_event_t event = {
+        .kind = MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED,
+        .resource_uri = context->uri
+    };
+    context->status = maelys_mcp_provider_emit_event(context->provider, &event);
+    return NULL;
+}
+
+typedef struct channel_destroy_context {
+    maelys_mcp_channel_t *channel;
+    maelys_mcp_result_t status;
+} channel_destroy_context_t;
+
+static void *destroy_channel_thread(void *opaque) {
+    channel_destroy_context_t *context = opaque;
+    context->status = maelys_mcp_channel_destroy(context->channel);
+    return NULL;
+}
+
+static int wait_for_channel_state(
+    maelys_mcp_channel_t *channel,
+    maelys_mcp_channel_state_t state) {
+    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
+        pthread_mutex_lock(&channel->mutex);
+        int matches = channel->state == state;
+        pthread_mutex_unlock(&channel->mutex);
+        if (matches) return 1;
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int wait_for_channel_operation(
+    maelys_mcp_channel_t *channel) {
+    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
+        pthread_mutex_lock(&channel->mutex);
+        int held = channel->operations_inflight != 0u;
+        pthread_mutex_unlock(&channel->mutex);
+        if (held) return 1;
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int test_destroy_during_fanout_keeps_other_channel_live(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "destroy-event-provider", .version = "1"
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    ASSERT_TRUE(maelys_mcp_provider_create(&provider_config, &provider) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) ==
+        MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel_a = new_channel(runtime, 1u, 1000u);
+    maelys_mcp_channel_t *channel_b = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(channel_a && channel_b);
+    ASSERT_TRUE(handle(channel_a, listen_request(json_string("destroy-A"),
+        "test://fanout/")) == MAELYS_MCP_OK);
+    ASSERT_TRUE(handle(channel_b, listen_request(json_string("destroy-B"),
+        "test://fanout/")) == MAELYS_MCP_OK);
+    json_t *message = next_message(channel_a, 1000u);
+    ASSERT_TRUE(message != NULL);
+    json_decref(message);
+    message = next_message(channel_b, 1000u);
+    ASSERT_TRUE(message != NULL);
+    json_decref(message);
+
+    const maelys_mcp_provider_event_t first_event = {
+        .kind = MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED,
+        .resource_uri = "test://fanout/first"
+    };
+    ASSERT_TRUE(maelys_mcp_provider_emit_event(provider, &first_event) ==
+        MAELYS_MCP_OK);
+
+    one_event_context_t producer = {
+        .provider = provider,
+        .uri = "test://fanout/second"
+    };
+    pthread_t producer_thread;
+    ASSERT_TRUE(pthread_create(&producer_thread, NULL,
+        emit_one_resource_event, &producer) == 0);
+    ASSERT_TRUE(wait_for_channel_operation(channel_a));
+
+    channel_destroy_context_t destroyer = {.channel = channel_a};
+    pthread_t destroyer_thread;
+    ASSERT_TRUE(pthread_create(&destroyer_thread, NULL,
+        destroy_channel_thread, &destroyer) == 0);
+    ASSERT_TRUE(wait_for_channel_state(channel_a, MAELYS_MCP_CHANNEL_CLOSING));
+
+    message = next_message(channel_a, 1000u);
+    ASSERT_TRUE(message && is_resource_event(message, "test://fanout/first"));
+    json_decref(message);
+    ASSERT_TRUE(pthread_join(producer_thread, NULL) == 0);
+    ASSERT_TRUE(producer.status == MAELYS_MCP_OK);
+
+    message = next_message(channel_a, 1000u);
+    ASSERT_TRUE(message && is_resource_event(message, "test://fanout/second"));
+    json_decref(message);
+    message = next_message(channel_a, 1000u);
+    ASSERT_TRUE(message != NULL);
+    json_decref(message);
+    ASSERT_TRUE(pthread_join(destroyer_thread, NULL) == 0);
+    ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
+
+    for (size_t index = 0; index < 2u; ++index) {
+        message = next_message(channel_b, 1000u);
+        ASSERT_TRUE(message && is_resource_event(message,
+            index == 0u ? "test://fanout/first" : "test://fanout/second"));
+        json_decref(message);
+    }
+    ASSERT_TRUE(maelys_mcp_channel_complete_subscriptions(channel_b) ==
+        MAELYS_MCP_OK);
+    message = next_message(channel_b, 1000u);
+    ASSERT_TRUE(message != NULL);
+    json_decref(message);
+    ASSERT_TRUE(destroy_channel_and_runtime(channel_b, runtime));
+    return 0;
 }
 
 static int test_close_during_fanout_keeps_other_channel_live(void) {
@@ -838,14 +1000,18 @@ int main(void) {
             test_activation_failure_is_fail_closed},
         {"runtime destroy races blocked activation safely",
             test_destroy_races_blocked_activation},
-        {"runtime destroy rejects lifecycle lock waiters safely",
-            test_destroy_rejects_creators_waiting_on_lifecycle_lock},
+        {"create after closed gate is defensive, not contractual",
+            test_create_after_gate_is_hardening_not_contract},
         {"runtime destroy waits for multi-provider callbacks",
             test_runtime_destroy_waits_for_multi_provider_callbacks},
         {"close uses one absolute deadline",
             test_close_uses_one_absolute_deadline},
+        {"destroy consumes a channel after bounded close failure",
+            test_destroy_consumes_channel_after_bounded_close_failure},
         {"close during fanout keeps other channel live",
             test_close_during_fanout_keeps_other_channel_live},
+        {"destroy during fanout keeps other channel live",
+            test_destroy_during_fanout_keeps_other_channel_live},
         {"zero-channel event and argument contracts",
             test_zero_channel_event_and_argument_contracts}
     };

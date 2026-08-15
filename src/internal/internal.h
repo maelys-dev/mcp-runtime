@@ -13,10 +13,6 @@
 #include "maelys/mcp/runtime.h"
 
 #define MAELYS_MCP_MAX_MODULES 16u
-#define MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED UINT64_C(0x8000000000000000)
-#define MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK \
-    (MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED - UINT64_C(1))
-
 #define JSONRPC_INVALID_REQUEST (-32600)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
 #define JSONRPC_INVALID_PARAMS (-32602)
@@ -87,9 +83,10 @@ typedef enum maelys_mcp_channel_state {
  * A provider's event_mutex may wrap a sink callback and therefore precedes
  * provider_events_mutex, but no runtime path acquires event_mutex while holding
  * provider_events_mutex. Blocking activation, enqueue, and I/O run without the
- * lifecycle, registry, or channel metadata locks held. channel_create_gate
- * atomically closes create admission and counts admitted creators before they
- * acquire lifecycle_mutex.
+ * lifecycle, registry, or channel metadata locks held. The channel-create
+ * gate has its own mutex and condition and is never nested with another lock.
+ * It admits creators before allocation, then runtime destruction closes and
+ * drains it before acquiring lifecycle_mutex.
  */
 
 struct maelys_mcp_provider {
@@ -136,7 +133,12 @@ struct maelys_mcp_runtime {
     maelys_mcp_runtime_lifecycle_t lifecycle;
     maelys_mcp_result_t activation_status;
     int shutdown_requested;
-    atomic_uint_least64_t channel_create_gate;
+    pthread_mutex_t channel_create_gate_mutex;
+    pthread_cond_t channel_create_gate_drained;
+    int channel_create_gate_mutex_initialized;
+    int channel_create_gate_drained_initialized;
+    int channel_create_accepting;
+    size_t channel_creators_admitted;
     pthread_mutex_t channels_mutex;
     int channels_mutex_initialized;
     struct maelys_mcp_channel *channels;
@@ -236,6 +238,13 @@ int maelys_mcp_cond_wait_until(
     pthread_cond_t *condition,
     pthread_mutex_t *mutex,
     uint64_t deadline_ms);
+
+maelys_mcp_result_t maelys_mcp_stdio_finish_status(
+    maelys_mcp_result_t primary_status,
+    maelys_mcp_result_t close_status,
+    maelys_mcp_result_t writer_status,
+    maelys_mcp_result_t destroy_status,
+    maelys_mcp_result_t flags_status);
 int maelys_mcp_json_string_has_nul(const json_t *value);
 int maelys_mcp_json_string_equals(const json_t *value, const char *expected);
 int maelys_mcp_json_string_has_prefix(const json_t *value, const char *prefix);

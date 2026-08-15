@@ -37,6 +37,22 @@ static int test_argument_contract(void) {
     return 0;
 }
 
+static int test_finish_status_reports_post_dequeue_writer_failure(void) {
+    ASSERT_TRUE(maelys_mcp_stdio_finish_status(
+        MAELYS_MCP_OK, MAELYS_MCP_OK, MAELYS_MCP_ERR_IO,
+        MAELYS_MCP_OK, MAELYS_MCP_OK) == MAELYS_MCP_ERR_IO);
+    ASSERT_TRUE(maelys_mcp_stdio_finish_status(
+        MAELYS_MCP_ERR_PROTOCOL, MAELYS_MCP_ERR_TIMEOUT, MAELYS_MCP_ERR_IO,
+        MAELYS_MCP_ERR_STATE, MAELYS_MCP_ERR_IO) == MAELYS_MCP_ERR_PROTOCOL);
+    ASSERT_TRUE(maelys_mcp_stdio_finish_status(
+        MAELYS_MCP_OK, MAELYS_MCP_ERR_TIMEOUT, MAELYS_MCP_ERR_IO,
+        MAELYS_MCP_ERR_STATE, MAELYS_MCP_ERR_IO) == MAELYS_MCP_ERR_TIMEOUT);
+    ASSERT_TRUE(maelys_mcp_stdio_finish_status(
+        MAELYS_MCP_OK, MAELYS_MCP_OK, MAELYS_MCP_OK,
+        MAELYS_MCP_ERR_STATE, MAELYS_MCP_ERR_IO) == MAELYS_MCP_ERR_STATE);
+    return 0;
+}
+
 static int test_library_stdout_cannot_contaminate_protocol(void) {
     int protocol[2];
     int diagnostics[2];
@@ -275,6 +291,8 @@ static int test_stdio_restores_output_descriptor_flags(void) {
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"stdout isolation argument contract", test_argument_contract},
+        {"stdio finish status is deterministic",
+            test_finish_status_reports_post_dequeue_writer_failure},
         {"library stdout cannot contaminate MCP transport", test_library_stdout_cannot_contaminate_protocol},
         {"stalled stdio client fails within write deadline",
             test_stalled_client_fails_within_write_deadline},

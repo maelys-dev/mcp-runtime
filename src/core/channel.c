@@ -79,39 +79,26 @@ static maelys_mcp_result_t activate_providers(maelys_mcp_runtime_t *runtime) {
     return MAELYS_MCP_OK;
 }
 
-static void release_channel_create_locked(maelys_mcp_runtime_t *runtime) {
-    uint_least64_t previous = atomic_fetch_sub_explicit(
-        &runtime->channel_create_gate, UINT64_C(1), memory_order_acq_rel);
-    assert((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) != 0u);
-    if ((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) == 1u) {
-        pthread_cond_broadcast(&runtime->lifecycle_changed);
-    }
-}
-
 static maelys_mcp_result_t begin_channel_create(maelys_mcp_runtime_t *runtime) {
     /* The first runtime access admits this creator or observes the closed gate. */
-    uint_least64_t previous = atomic_fetch_add_explicit(
-        &runtime->channel_create_gate, UINT64_C(1), memory_order_acq_rel);
-    assert((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) !=
-        MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK);
-    pthread_mutex_lock(&runtime->lifecycle_mutex);
-    if ((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED) ||
-        runtime->shutdown_requested ||
-        runtime->lifecycle == MAELYS_MCP_RUNTIME_SHUTTING_DOWN ||
-        (atomic_load_explicit(&runtime->channel_create_gate,
-             memory_order_acquire) & MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED)) {
-        release_channel_create_locked(runtime);
-        pthread_mutex_unlock(&runtime->lifecycle_mutex);
+    pthread_mutex_lock(&runtime->channel_create_gate_mutex);
+    if (!runtime->channel_create_accepting) {
+        pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
         return MAELYS_MCP_ERR_STATE;
     }
-    pthread_mutex_unlock(&runtime->lifecycle_mutex);
+    runtime->channel_creators_admitted++;
+    pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
     return MAELYS_MCP_OK;
 }
 
 static void end_channel_create(maelys_mcp_runtime_t *runtime) {
-    pthread_mutex_lock(&runtime->lifecycle_mutex);
-    release_channel_create_locked(runtime);
-    pthread_mutex_unlock(&runtime->lifecycle_mutex);
+    pthread_mutex_lock(&runtime->channel_create_gate_mutex);
+    assert(runtime->channel_creators_admitted != 0u);
+    runtime->channel_creators_admitted--;
+    if (runtime->channel_creators_admitted == 0u) {
+        pthread_cond_broadcast(&runtime->channel_create_gate_drained);
+    }
+    pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
 }
 
 static maelys_mcp_result_t publish_channel(
@@ -409,10 +396,22 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
     if (!channel) return MAELYS_MCP_ERR_ARGUMENT;
     maelys_mcp_result_t status = maelys_mcp_channel_close(
         channel, channel->config.close_timeout_ms);
-    if (status != MAELYS_MCP_OK) return status;
+    if (status != MAELYS_MCP_OK) {
+        /*
+         * Destruction consumes ownership even when the bounded drain failed.
+         * Abort wakes blocked outbox users; the channel remains allocated until
+         * all operations that already retained it have released their borrow.
+         */
+        maelys_mcp_channel_abort(channel);
+        pthread_mutex_lock(&channel->mutex);
+        while (channel->operations_inflight != 0u) {
+            pthread_cond_wait(&channel->idle, &channel->mutex);
+        }
+        pthread_mutex_unlock(&channel->mutex);
+    }
     maelys_mcp_runtime_t *runtime = channel->runtime;
-    status = maelys_mcp_outbox_destroy(channel->outbox);
-    if (status != MAELYS_MCP_OK) return status;
+    maelys_mcp_result_t outbox_status = maelys_mcp_outbox_destroy(channel->outbox);
+    if (outbox_status != MAELYS_MCP_OK) return outbox_status;
     pthread_mutex_lock(&runtime->channels_mutex);
     maelys_mcp_channel_t **cursor = &runtime->channels;
     while (*cursor && *cursor != channel) cursor = &(*cursor)->next;
@@ -430,5 +429,5 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
     pthread_cond_destroy(&channel->idle);
     pthread_mutex_destroy(&channel->mutex);
     free(channel);
-    return MAELYS_MCP_OK;
+    return status;
 }
