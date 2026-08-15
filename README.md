@@ -131,14 +131,14 @@ The scope and limitations of the upstream test suite are in
 
 ## Status
 
-Version 0.8.0 adds a public C SDK for `maelys-provider/3` process providers. Its
-JSONL serving loop isolates provider stdout by default, validates descriptors, and
-serializes provider-originated events through an explicit lifecycle. Providers
-activate only after the runtime output bus is ready, then may emit resource updates and
-Tools/Resources list changes independently of normal responses. Provider calls remain
-synchronous in this release. Streamable HTTP, prompts, Tasks, progress, dynamic
-provider reload, full JSON Schema 2020-12 and Windows support are not implemented yet.
-The pre-1.0 ABI policy is documented and versioned; same-major ABI stability begins
-with 1.0.
+Version 0.9.0 bounds stdio output writes and terminates the transport when a client
+stops draining responses. The public `maelys_mcp_runtime_serve_stdio_with_options`
+entry point makes the write deadline configurable while the existing stdio function
+keeps a five-second default. The public C SDK continues to isolate provider stdout,
+validate descriptors, and serialize provider-originated events through an explicit
+lifecycle. Provider calls remain synchronous in this release. Streamable HTTP,
+prompts, Tasks, progress, dynamic provider reload, full JSON Schema 2020-12 and
+Windows support are not implemented yet. The pre-1.0 ABI policy is documented and
+versioned; same-major ABI stability begins with 1.0.
 
 The source is available under the [MIT License](LICENSE).

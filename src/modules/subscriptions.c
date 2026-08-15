@@ -299,6 +299,7 @@ static json_t *listen(
 }
 
 static int uri_matches(const char *subscription_uri, const char *event_uri) {
+    if (!subscription_uri || !event_uri || !*subscription_uri) return 0;
     size_t length = strlen(subscription_uri);
     return strcmp(subscription_uri, event_uri) == 0 ||
         (strncmp(subscription_uri, event_uri, length) == 0 &&

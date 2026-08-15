@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0 - 2026-08-15
+
+- Bound stdio message writes with a configurable monotonic deadline and wake the
+  service loop when the writer fails, preventing a non-draining client from freezing
+  the runtime and its producers indefinitely.
+- Add the backward-compatible `maelys_mcp_runtime_serve_stdio_with_options` API and
+  `--stdio-write-timeout-ms` host option; the existing API uses a five-second default.
+- Eliminate an unlocked `writer_status` read in the outbox and defensively reject empty
+  subscription URIs before descendant matching.
+- Add deterministic randomized coverage for outbox coalescence/byte accounting and the
+  subscription state machine, plus an end-to-end stalled-client regression test.
+- Keep native ABI version 1: the stdio options record and entry point are additive and
+  no released public layout changed.
+
 ## 0.8.0 - 2026-08-15
 
 - Add a public C SDK for `maelys-provider/3` process providers, including JSONL

@@ -2,23 +2,135 @@
 #include "maelys/mcp/outbox.h"
 #include "maelys/mcp/subscriptions.h"
 
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <unistd.h>
 
-static maelys_mcp_result_t write_stdio_message(void *context, json_t *message) {
-    int write_fd = *(const int *)context;
-    return maelys_mcp_write_json_line(write_fd, message);
+typedef struct stdio_writer_context {
+    int write_fd;
+    int wake_fd;
+    unsigned int write_timeout_ms;
+    atomic_int status;
+} stdio_writer_context_t;
+
+static void signal_writer_failure(
+    stdio_writer_context_t *context,
+    maelys_mcp_result_t status) {
+    atomic_store(&context->status, (int)status);
+    const unsigned char signal = 1u;
+    ssize_t ignored = write(context->wake_fd, &signal, sizeof(signal));
+    (void)ignored;
 }
 
-maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
+static maelys_mcp_result_t write_stdio_message(void *opaque, json_t *message) {
+    stdio_writer_context_t *context = opaque;
+    maelys_mcp_result_t status = maelys_mcp_write_json_line_with_timeout(
+        context->write_fd, message, context->write_timeout_ms);
+    if (status != MAELYS_MCP_OK) signal_writer_failure(context, status);
+    return status;
+}
+
+static int set_descriptor_flag(int fd, int command, int flag) {
+    int current = fcntl(fd, command);
+    if (current < 0) return -1;
+    int set_command = command == F_GETFD ? F_SETFD : F_SETFL;
+    return fcntl(fd, set_command, current | flag);
+}
+
+static maelys_mcp_result_t create_wakeup_pipe(int descriptors[2]) {
+    descriptors[0] = -1;
+    descriptors[1] = -1;
+    if (pipe(descriptors) != 0 ||
+        set_descriptor_flag(descriptors[0], F_GETFD, FD_CLOEXEC) != 0 ||
+        set_descriptor_flag(descriptors[1], F_GETFD, FD_CLOEXEC) != 0 ||
+        set_descriptor_flag(descriptors[1], F_GETFL, O_NONBLOCK) != 0) {
+        if (descriptors[0] >= 0) close(descriptors[0]);
+        if (descriptors[1] >= 0) close(descriptors[1]);
+        descriptors[0] = -1;
+        descriptors[1] = -1;
+        return MAELYS_MCP_ERR_IO;
+    }
+    return MAELYS_MCP_OK;
+}
+
+static maelys_mcp_result_t wait_for_input_or_writer(
+    int read_fd,
+    int wake_fd,
+    int *out_writer_failed) {
+    struct pollfd descriptors[2] = {
+        {.fd = read_fd, .events = POLLIN},
+        {.fd = wake_fd, .events = POLLIN}
+    };
+    *out_writer_failed = 0;
+    for (;;) {
+        int ready = poll(descriptors, 2u, -1);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return MAELYS_MCP_ERR_IO;
+        if (descriptors[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+            *out_writer_failed = 1;
+            return MAELYS_MCP_OK;
+        }
+        if (descriptors[0].revents & (POLLIN | POLLHUP)) return MAELYS_MCP_OK;
+        if (descriptors[0].revents & (POLLERR | POLLNVAL)) return MAELYS_MCP_ERR_IO;
+    }
+}
+
+static maelys_mcp_result_t finish_stdio(
+    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_line_reader_t *reader,
+    maelys_mcp_outbox_t *outbox,
+    int wake_pipe[2],
+    int write_fd,
+    int write_flags,
+    maelys_mcp_result_t status,
+    int drain) {
+    maelys_mcp_line_reader_clear(reader);
+    maelys_mcp_runtime_detach_outbox(runtime);
+    maelys_mcp_result_t outbox_status = maelys_mcp_outbox_destroy(outbox, drain);
+    close(wake_pipe[0]);
+    close(wake_pipe[1]);
+    if (fcntl(write_fd, F_SETFL, write_flags) != 0 && status == MAELYS_MCP_OK &&
+        outbox_status == MAELYS_MCP_OK) {
+        return MAELYS_MCP_ERR_IO;
+    }
+    return status == MAELYS_MCP_OK ? outbox_status : status;
+}
+
+maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
     maelys_mcp_runtime_t *runtime,
     int read_fd,
-    int write_fd) {
+    int write_fd,
+    const maelys_mcp_stdio_options_t *options) {
     if (!runtime || read_fd < 0 || write_fd < 0) return MAELYS_MCP_ERR_ARGUMENT;
+    unsigned int write_timeout_ms = options && options->write_timeout_ms ?
+        options->write_timeout_ms : MAELYS_MCP_DEFAULT_STDIO_WRITE_TIMEOUT_MS;
     maelys_mcp_line_reader_t reader;
     maelys_mcp_result_t initialized = maelys_mcp_line_reader_init(
         &reader, runtime->max_message_bytes);
     if (initialized != MAELYS_MCP_OK) return initialized;
+    int wake_pipe[2];
+    initialized = create_wakeup_pipe(wake_pipe);
+    if (initialized != MAELYS_MCP_OK) {
+        maelys_mcp_line_reader_clear(&reader);
+        return initialized;
+    }
+    int write_flags = fcntl(write_fd, F_GETFL);
+    if (write_flags < 0 || fcntl(write_fd, F_SETFL, write_flags | O_NONBLOCK) != 0) {
+        maelys_mcp_line_reader_clear(&reader);
+        close(wake_pipe[0]);
+        close(wake_pipe[1]);
+        return MAELYS_MCP_ERR_IO;
+    }
+    stdio_writer_context_t writer_context = {
+        .write_fd = write_fd,
+        .wake_fd = wake_pipe[1],
+        .write_timeout_ms = write_timeout_ms
+    };
+    atomic_init(&writer_context.status, (int)MAELYS_MCP_OK);
     maelys_mcp_outbox_config_t outbox_config = {
         .max_messages = 256u,
         .max_bytes = runtime->max_message_bytes > SIZE_MAX / 4u ?
@@ -26,54 +138,74 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
         .batch_size = 32u,
         .response_burst = 8u,
         .write = write_stdio_message,
-        .write_context = &write_fd
+        .write_context = &writer_context
     };
     maelys_mcp_outbox_t *outbox = NULL;
     initialized = maelys_mcp_outbox_create(&outbox_config, &outbox);
     if (initialized != MAELYS_MCP_OK) {
         maelys_mcp_line_reader_clear(&reader);
+        close(wake_pipe[0]);
+        close(wake_pipe[1]);
+        (void)fcntl(write_fd, F_SETFL, write_flags);
         return initialized;
     }
     initialized = maelys_mcp_runtime_attach_outbox(runtime, outbox);
     if (initialized != MAELYS_MCP_OK) {
-        maelys_mcp_line_reader_clear(&reader);
-        (void)maelys_mcp_outbox_destroy(outbox, 0);
-        return initialized;
+        return finish_stdio(runtime, &reader, outbox, wake_pipe,
+            write_fd, write_flags, initialized, 0);
     }
     for (;;) {
         json_t *request = NULL;
         char *error = NULL;
-        maelys_mcp_result_t status = maelys_mcp_line_reader_read(
-            &reader, read_fd, &request, &error);
+        maelys_mcp_result_t status = maelys_mcp_line_reader_next(
+            &reader, &request, &error);
+        int eof = 0;
         if (status == MAELYS_MCP_ERR_NOT_FOUND) {
+            int writer_failed = 0;
+            status = wait_for_input_or_writer(read_fd, wake_pipe[0], &writer_failed);
+            if (status != MAELYS_MCP_OK) {
+                free(error);
+                return finish_stdio(runtime, &reader, outbox, wake_pipe,
+                    write_fd, write_flags, status, 0);
+            }
+            if (writer_failed) {
+                free(error);
+                status = (maelys_mcp_result_t)atomic_load(&writer_context.status);
+                if (status == MAELYS_MCP_OK) status = MAELYS_MCP_ERR_IO;
+                return finish_stdio(runtime, &reader, outbox, wake_pipe,
+                    write_fd, write_flags, status, 0);
+            }
+            status = maelys_mcp_line_reader_read_once(
+                &reader, read_fd, &request, &error, &eof);
+            if (status == MAELYS_MCP_ERR_NOT_FOUND && !eof) {
+                free(error);
+                continue;
+            }
+        }
+        if (status == MAELYS_MCP_ERR_NOT_FOUND && eof) {
             free(error);
-            maelys_mcp_line_reader_clear(&reader);
             status = maelys_mcp_runtime_complete_subscriptions(runtime);
-            maelys_mcp_runtime_detach_outbox(runtime);
-            maelys_mcp_result_t outbox_status = maelys_mcp_outbox_destroy(outbox, 1);
-            return status == MAELYS_MCP_OK ? outbox_status : status;
+            return finish_stdio(runtime, &reader, outbox, wake_pipe,
+                write_fd, write_flags, status, 1);
         }
         if (status != MAELYS_MCP_OK) {
             json_t *response = maelys_mcp_error_response(NULL, -32700,
                 error ? error : "Parse error", NULL);
             free(error);
             if (!response) {
-                maelys_mcp_line_reader_clear(&reader);
-                maelys_mcp_runtime_detach_outbox(runtime);
-                (void)maelys_mcp_outbox_destroy(outbox, 0);
-                return MAELYS_MCP_ERR_MEMORY;
+                return finish_stdio(runtime, &reader, outbox, wake_pipe,
+                    write_fd, write_flags, MAELYS_MCP_ERR_MEMORY, 0);
             }
             status = maelys_mcp_outbox_enqueue_take(
                 outbox, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL);
             if (status != MAELYS_MCP_OK) {
                 json_decref(response);
-                maelys_mcp_line_reader_clear(&reader);
-                maelys_mcp_runtime_detach_outbox(runtime);
-                (void)maelys_mcp_outbox_destroy(outbox, 0);
-                return status;
+                return finish_stdio(runtime, &reader, outbox, wake_pipe,
+                    write_fd, write_flags, status, 0);
             }
             continue;
         }
+        free(error);
         json_t *response = maelys_mcp_runtime_handle(runtime, request);
         json_decref(request);
         if (!response) continue;
@@ -81,10 +213,16 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
             outbox, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL);
         if (status != MAELYS_MCP_OK) {
             json_decref(response);
-            maelys_mcp_line_reader_clear(&reader);
-            maelys_mcp_runtime_detach_outbox(runtime);
-            (void)maelys_mcp_outbox_destroy(outbox, 0);
-            return status;
+            return finish_stdio(runtime, &reader, outbox, wake_pipe,
+                write_fd, write_flags, status, 0);
         }
     }
+}
+
+maelys_mcp_result_t maelys_mcp_runtime_serve_stdio(
+    maelys_mcp_runtime_t *runtime,
+    int read_fd,
+    int write_fd) {
+    return maelys_mcp_runtime_serve_stdio_with_options(
+        runtime, read_fd, write_fd, NULL);
 }

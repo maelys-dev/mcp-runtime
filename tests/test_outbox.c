@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -64,6 +65,11 @@ static maelys_mcp_outbox_t *new_outbox(capture_t *capture, size_t burst) {
 
 static json_t *message(const char *kind, long long value) {
     return json_pack("{s:s,s:I}", "kind", kind, "value", (json_int_t)value);
+}
+
+static size_t serialized_bytes(json_t *value) {
+    size_t bytes = json_dumpb(value, NULL, 0u, JSON_COMPACT | JSON_SORT_KEYS);
+    return bytes ? bytes + 1u : 0u;
 }
 
 static int enqueue(
@@ -164,11 +170,98 @@ static int test_writer_failure_closes_queue(void) {
     return 0;
 }
 
+static int test_randomized_coalescence_and_byte_accounting(void) {
+    enum { KEY_COUNT = 8, ITERATIONS = 512 };
+    capture_t capture;
+    capture_init(&capture);
+    capture.block_first = 1;
+    maelys_mcp_outbox_config_t config = {
+        .max_messages = 16u,
+        .max_bytes = 4096u,
+        .batch_size = 16u,
+        .response_burst = 8u,
+        .write = capture_write,
+        .write_context = &capture
+    };
+    maelys_mcp_outbox_t *outbox = NULL;
+    ASSERT_TRUE(maelys_mcp_outbox_create(&config, &outbox) == MAELYS_MCP_OK);
+    ASSERT_TRUE(enqueue(outbox, "response", -1, MAELYS_MCP_OUTBOX_RESPONSE, NULL));
+    pthread_mutex_lock(&capture.mutex);
+    while (!capture.entered) pthread_cond_wait(&capture.condition, &capture.mutex);
+    pthread_mutex_unlock(&capture.mutex);
+
+    int active[KEY_COUNT] = {0};
+    long long values[KEY_COUNT] = {0};
+    size_t bytes_by_key[KEY_COUNT] = {0};
+    size_t order[KEY_COUNT] = {0};
+    size_t order_count = 0u;
+    size_t expected_bytes = 0u;
+    uint32_t random_state = 0x6d2b79f5u;
+    for (long long iteration = 0; iteration < ITERATIONS; ++iteration) {
+        random_state = random_state * 1664525u + 1013904223u;
+        size_t key_index = (size_t)(random_state % KEY_COUNT);
+        char key[32];
+        ASSERT_TRUE(snprintf(key, sizeof(key), "resource:%zu", key_index) > 0);
+        json_t *candidate = message("notification", iteration);
+        ASSERT_TRUE(candidate != NULL);
+        size_t candidate_bytes = serialized_bytes(candidate);
+        ASSERT_TRUE(candidate_bytes > 0u);
+        size_t previous_position = order_count;
+        if (active[key_index]) {
+            expected_bytes -= bytes_by_key[key_index];
+            for (size_t index = 0; index < order_count; ++index) {
+                if (order[index] == key_index) previous_position = index;
+            }
+            ASSERT_TRUE(previous_position < order_count);
+            for (size_t index = previous_position; index + 1u < order_count; ++index) {
+                order[index] = order[index + 1u];
+            }
+            order_count--;
+        } else {
+            active[key_index] = 1;
+        }
+        values[key_index] = iteration;
+        bytes_by_key[key_index] = candidate_bytes;
+        expected_bytes += candidate_bytes;
+        order[order_count++] = key_index;
+        maelys_mcp_result_t status = maelys_mcp_outbox_enqueue_take(
+            outbox, candidate, MAELYS_MCP_OUTBOX_NOTIFICATION, key);
+        if (status != MAELYS_MCP_OK) json_decref(candidate);
+        ASSERT_TRUE(status == MAELYS_MCP_OK);
+        maelys_mcp_outbox_stats_t stats = {0};
+        maelys_mcp_outbox_stats(outbox, &stats);
+        ASSERT_TRUE(stats.queued_messages == order_count);
+        ASSERT_TRUE(stats.queued_bytes == expected_bytes);
+        ASSERT_TRUE(stats.queued_messages <= config.max_messages);
+        ASSERT_TRUE(stats.queued_bytes <= config.max_bytes);
+    }
+    ASSERT_TRUE(order_count == KEY_COUNT);
+    maelys_mcp_outbox_stats_t stats = {0};
+    maelys_mcp_outbox_stats(outbox, &stats);
+    ASSERT_TRUE(stats.enqueued == (unsigned long long)ITERATIONS + 1u);
+    ASSERT_TRUE(stats.coalesced == (unsigned long long)ITERATIONS - KEY_COUNT);
+
+    pthread_mutex_lock(&capture.mutex);
+    capture.released = 1;
+    pthread_cond_broadcast(&capture.condition);
+    pthread_mutex_unlock(&capture.mutex);
+    ASSERT_TRUE(maelys_mcp_outbox_destroy(outbox, 1) == MAELYS_MCP_OK);
+    ASSERT_TRUE(capture.count == KEY_COUNT + 1u);
+    ASSERT_TRUE(capture.values[0] == -1);
+    for (size_t index = 0; index < order_count; ++index) {
+        ASSERT_TRUE(capture.values[index + 1u] == values[order[index]]);
+    }
+    capture_clear(&capture);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"fair scheduling and causal coalescence", test_fairness_and_causal_coalescence},
         {"multiple producers and bounded drain", test_multiple_producers_and_bounded_drain},
-        {"writer failure closes queue", test_writer_failure_closes_queue}
+        {"writer failure closes queue", test_writer_failure_closes_queue},
+        {"randomized coalescence and byte accounting",
+            test_randomized_coalescence_and_byte_accounting}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }

@@ -172,15 +172,29 @@ int maelys_mcp_json_string_has_nul(const json_t *value);
 int maelys_mcp_json_string_equals(const json_t *value, const char *expected);
 int maelys_mcp_json_string_has_prefix(const json_t *value, const char *prefix);
 maelys_mcp_result_t maelys_mcp_write_json_line(int fd, json_t *value);
+maelys_mcp_result_t maelys_mcp_write_json_line_with_timeout(
+    int fd,
+    json_t *value,
+    unsigned int timeout_ms);
 maelys_mcp_result_t maelys_mcp_line_reader_init(
     maelys_mcp_line_reader_t *reader,
     size_t max_bytes);
 void maelys_mcp_line_reader_clear(maelys_mcp_line_reader_t *reader);
+maelys_mcp_result_t maelys_mcp_line_reader_next(
+    maelys_mcp_line_reader_t *reader,
+    json_t **out_value,
+    char **out_error);
 maelys_mcp_result_t maelys_mcp_line_reader_read(
     maelys_mcp_line_reader_t *reader,
     int fd,
     json_t **out_value,
     char **out_error);
+maelys_mcp_result_t maelys_mcp_line_reader_read_once(
+    maelys_mcp_line_reader_t *reader,
+    int fd,
+    json_t **out_value,
+    char **out_error,
+    int *out_eof);
 maelys_mcp_result_t maelys_mcp_read_json_line(
     int fd,
     size_t max_bytes,
