@@ -471,6 +471,18 @@ maelys_mcp_result_t maelys_mcp_runtime_notify_tools_list_changed(
 maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions(
     maelys_mcp_channel_t *channel) {
     if (!channel) return MAELYS_MCP_ERR_ARGUMENT;
+    uint64_t deadline_ms = 0u;
+    if (maelys_mcp_monotonic_deadline(
+            channel->config.admission_timeout_ms, &deadline_ms) != 0) {
+        return MAELYS_MCP_ERR_IO;
+    }
+    return maelys_mcp_channel_complete_subscriptions_until(channel, deadline_ms);
+}
+
+maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions_until(
+    maelys_mcp_channel_t *channel,
+    uint64_t deadline_ms) {
+    if (!channel) return MAELYS_MCP_ERR_ARGUMENT;
     pthread_mutex_lock(&channel->mutex);
     size_t count = channel->subscription_count;
     json_t **ids = calloc(count ? count : 1u, sizeof(*ids));
@@ -487,6 +499,14 @@ maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions(
     pthread_mutex_unlock(&channel->mutex);
     maelys_mcp_result_t outcome = MAELYS_MCP_OK;
     for (size_t index = 0; index < count; ++index) {
+        int expired = maelys_mcp_monotonic_deadline_expired(deadline_ms);
+        if (expired != 0) {
+            if (outcome == MAELYS_MCP_OK) {
+                outcome = expired > 0 ? MAELYS_MCP_ERR_TIMEOUT : MAELYS_MCP_ERR_IO;
+            }
+            json_decref(ids[index]);
+            continue;
+        }
         if (!ids[index]) {
             outcome = MAELYS_MCP_ERR_MEMORY;
             continue;
@@ -510,8 +530,9 @@ maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions(
                 if (response) json_decref(response);
                 outcome = MAELYS_MCP_ERR_MEMORY;
             } else {
-                maelys_mcp_result_t status = maelys_mcp_channel_enqueue_take(
-                    channel, response, MAELYS_MCP_OUTBOX_RESPONSE, NULL, 0);
+                maelys_mcp_result_t status =
+                    maelys_mcp_channel_enqueue_take_until(channel, response,
+                        MAELYS_MCP_OUTBOX_RESPONSE, NULL, 0, deadline_ms);
                 if (status != MAELYS_MCP_OK) {
                     json_decref(response);
                     outcome = status;

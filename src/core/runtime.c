@@ -114,7 +114,11 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     if (!runtime) return MAELYS_MCP_ERR_ARGUMENT;
     pthread_mutex_lock(&runtime->lifecycle_mutex);
     runtime->shutdown_requested = 1;
-    while (runtime->lifecycle == MAELYS_MCP_RUNTIME_ACTIVATING) {
+    if (runtime->lifecycle != MAELYS_MCP_RUNTIME_ACTIVATING) {
+        runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
+    }
+    pthread_cond_broadcast(&runtime->lifecycle_changed);
+    while (runtime->channel_creators_inflight != 0u) {
         pthread_cond_wait(&runtime->lifecycle_changed, &runtime->lifecycle_mutex);
     }
     runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;

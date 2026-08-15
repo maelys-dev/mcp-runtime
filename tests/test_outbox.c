@@ -1,4 +1,5 @@
 #include "maelys/mcp.h"
+#include "src/internal/internal.h"
 #include "tests/test_support.h"
 
 #include <pthread.h>
@@ -178,13 +179,17 @@ static int test_admission_timeout_and_close_wakeup(void) {
     atomic_init(&consumer.status, (int)MAELYS_MCP_OK);
     pthread_t thread;
     ASSERT_TRUE(pthread_create(&thread, NULL, wait_for_message, &consumer) == 0);
-    struct timespec pause = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
-    nanosleep(&pause, NULL);
+    for (size_t attempt = 0; attempt < 1000u &&
+         maelys_mcp_outbox_waiter_count(outbox) == 0u; ++attempt) {
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    ASSERT_TRUE(maelys_mcp_outbox_waiter_count(outbox) == 1u);
     ASSERT_TRUE(maelys_mcp_outbox_close(outbox, 0) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_outbox_destroy(outbox) == MAELYS_MCP_OK);
     ASSERT_TRUE(pthread_join(thread, NULL) == 0);
     ASSERT_TRUE((maelys_mcp_result_t)atomic_load(&consumer.status) ==
         MAELYS_MCP_ERR_CLOSED);
-    ASSERT_TRUE(maelys_mcp_outbox_destroy(outbox) == MAELYS_MCP_OK);
     return 0;
 }
 

@@ -59,6 +59,14 @@ int maelys_mcp_monotonic_deadline(
     return 0;
 }
 
+int maelys_mcp_monotonic_deadline_expired(uint64_t deadline_ms) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    uint64_t current = (uint64_t)now.tv_sec * 1000u +
+        (uint64_t)now.tv_nsec / 1000000u;
+    return current >= deadline_ms;
+}
+
 int maelys_mcp_cond_init_monotonic(pthread_cond_t *condition) {
     if (!condition) return EINVAL;
 #ifdef __APPLE__

@@ -46,7 +46,8 @@ maelys_mcp_result_t maelys_mcp_channel_next(
 
 /*
  * Stops new work and fan-out, completes active subscriptions, and drains
- * admitted output within timeout_ms. Zero selects the configured timeout.
+ * admitted output within one monotonic timeout_ms deadline shared by every
+ * close phase. Zero selects the configured timeout.
  */
 maelys_mcp_result_t maelys_mcp_channel_close(
     maelys_mcp_channel_t *channel,

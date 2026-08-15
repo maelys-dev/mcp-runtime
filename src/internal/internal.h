@@ -130,6 +130,7 @@ struct maelys_mcp_runtime {
     maelys_mcp_runtime_lifecycle_t lifecycle;
     maelys_mcp_result_t activation_status;
     int shutdown_requested;
+    size_t channel_creators_inflight;
     pthread_mutex_t channels_mutex;
     int channels_mutex_initialized;
     struct maelys_mcp_channel *channels;
@@ -223,6 +224,7 @@ char *maelys_mcp_strdup(const char *value);
 int maelys_mcp_monotonic_deadline(
     unsigned int timeout_ms,
     uint64_t *out_deadline_ms);
+int maelys_mcp_monotonic_deadline_expired(uint64_t deadline_ms);
 int maelys_mcp_cond_init_monotonic(pthread_cond_t *condition);
 int maelys_mcp_cond_wait_until(
     pthread_cond_t *condition,
@@ -294,6 +296,26 @@ maelys_mcp_result_t maelys_mcp_channel_enqueue_take(
     maelys_mcp_outbox_class_t message_class,
     const char *coalesce_key,
     int fault_on_timeout);
+maelys_mcp_result_t maelys_mcp_channel_enqueue_take_until(
+    maelys_mcp_channel_t *channel,
+    json_t *message,
+    maelys_mcp_outbox_class_t message_class,
+    const char *coalesce_key,
+    int fault_on_timeout,
+    uint64_t deadline_ms);
+maelys_mcp_result_t maelys_mcp_outbox_enqueue_take_until(
+    maelys_mcp_outbox_t *outbox,
+    json_t *message,
+    maelys_mcp_outbox_class_t message_class,
+    const char *coalesce_key,
+    uint64_t deadline_ms);
+maelys_mcp_result_t maelys_mcp_outbox_wait_drained_until(
+    maelys_mcp_outbox_t *outbox,
+    uint64_t deadline_ms);
+size_t maelys_mcp_outbox_waiter_count(maelys_mcp_outbox_t *outbox);
+maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions_until(
+    maelys_mcp_channel_t *channel,
+    uint64_t deadline_ms);
 void maelys_mcp_channel_abort(maelys_mcp_channel_t *channel);
 maelys_mcp_result_t maelys_mcp_runtime_snapshot_channels(
     maelys_mcp_runtime_t *runtime,

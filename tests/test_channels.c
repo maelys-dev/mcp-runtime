@@ -376,6 +376,32 @@ static void *destroy_runtime_thread(void *opaque) {
     return NULL;
 }
 
+static int wait_for_creator_count(
+    maelys_mcp_runtime_t *runtime,
+    size_t expected) {
+    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
+        pthread_mutex_lock(&runtime->lifecycle_mutex);
+        size_t count = runtime->channel_creators_inflight;
+        pthread_mutex_unlock(&runtime->lifecycle_mutex);
+        if (count == expected) return 1;
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int wait_for_shutdown_request(maelys_mcp_runtime_t *runtime) {
+    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
+        pthread_mutex_lock(&runtime->lifecycle_mutex);
+        int requested = runtime->shutdown_requested;
+        pthread_mutex_unlock(&runtime->lifecycle_mutex);
+        if (requested) return 1;
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
 static int test_concurrent_activation_is_unique(void) {
     activation_context_t activation;
     activation_context_init(&activation, MAELYS_MCP_OK);
@@ -449,25 +475,61 @@ static int test_destroy_races_blocked_activation(void) {
     ASSERT_TRUE(runtime && provider);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) ==
         MAELYS_MCP_OK);
-    create_context_t creator = {.runtime = runtime};
-    pthread_t creator_thread;
-    ASSERT_TRUE(pthread_create(&creator_thread, NULL,
-        create_channel_thread, &creator) == 0);
+    enum { CREATOR_COUNT = 8 };
+    create_context_t creators[CREATOR_COUNT] = {0};
+    pthread_t creator_threads[CREATOR_COUNT];
+    creators[0].runtime = runtime;
+    ASSERT_TRUE(pthread_create(&creator_threads[0], NULL,
+        create_channel_thread, &creators[0]) == 0);
     wait_for_activation(&activation);
+    for (size_t index = 1; index < CREATOR_COUNT; ++index) {
+        creators[index].runtime = runtime;
+        ASSERT_TRUE(pthread_create(&creator_threads[index], NULL,
+            create_channel_thread, &creators[index]) == 0);
+    }
+    ASSERT_TRUE(wait_for_creator_count(runtime, CREATOR_COUNT));
     destroy_context_t destroyer = {.runtime = runtime};
     pthread_t destroyer_thread;
     ASSERT_TRUE(pthread_create(&destroyer_thread, NULL,
         destroy_runtime_thread, &destroyer) == 0);
-    struct timespec pause = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
-    nanosleep(&pause, NULL);
+    ASSERT_TRUE(wait_for_shutdown_request(runtime));
     release_activation(&activation);
-    ASSERT_TRUE(pthread_join(creator_thread, NULL) == 0);
+    for (size_t index = 0; index < CREATOR_COUNT; ++index) {
+        ASSERT_TRUE(pthread_join(creator_threads[index], NULL) == 0);
+        ASSERT_TRUE(creators[index].status == MAELYS_MCP_ERR_STATE);
+        ASSERT_TRUE(creators[index].channel == NULL);
+    }
     ASSERT_TRUE(pthread_join(destroyer_thread, NULL) == 0);
-    ASSERT_TRUE(creator.status == MAELYS_MCP_ERR_STATE);
-    ASSERT_TRUE(creator.channel == NULL);
     ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
     ASSERT_TRUE(activation.calls == 1);
     activation_context_clear(&activation);
+    return 0;
+}
+
+static uint64_t monotonic_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static int test_close_uses_one_absolute_deadline(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 4u, 100u);
+    ASSERT_TRUE(channel != NULL);
+    for (json_int_t id = 1; id <= 4; ++id) {
+        ASSERT_TRUE(handle(channel, listen_request(
+            json_integer(id), "test://deadline")) == MAELYS_MCP_OK);
+    }
+    uint64_t started = monotonic_ms();
+    ASSERT_TRUE(started != 0u);
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 40u) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+    uint64_t elapsed = monotonic_ms() - started;
+    ASSERT_TRUE(elapsed < 200u);
+    maelys_mcp_channel_abort(channel);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     return 0;
 }
 
@@ -610,6 +672,8 @@ int main(void) {
             test_activation_failure_is_fail_closed},
         {"runtime destroy races blocked activation safely",
             test_destroy_races_blocked_activation},
+        {"close uses one absolute deadline",
+            test_close_uses_one_absolute_deadline},
         {"close during fanout keeps other channel live",
             test_close_during_fanout_keeps_other_channel_live},
         {"zero-channel event and argument contracts",
