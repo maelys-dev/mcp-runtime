@@ -6,6 +6,10 @@ Provider stdout is protocol-only; diagnostics use stderr. Version 3 retains the
 explicit version 2 result model and adds activation plus provider-originated
 asynchronous events. Versions 1 and 2 are not accepted.
 
+Native providers should use the public C provider SDK
+(`maelys/mcp/provider_sdk.h`) rather than writing this protocol loop by hand. The
+wire format below remains the contract between the host and SDK implementations.
+
 The host launches an absolute executable directly with `--provider`, without a shell.
 Describe, call and shutdown deadlines are independently configurable. Defaults are
 5 seconds for discovery, 300 seconds for calls and 2 seconds for shutdown.

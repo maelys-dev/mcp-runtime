@@ -30,9 +30,9 @@ The runtime must not include headers or source files from codexmanager, projectc
 Hermes, or any provider. Dependencies point toward the public provider contract, never
 toward application implementations.
 
-The TypeScript and Python SDK packages implement that public contract but contain no
-application tools. Providers depend on an SDK; the native runtime never depends on an
-SDK or application package.
+The C, TypeScript and Python SDK packages implement that public contract but contain
+no application tools. Providers depend on an SDK; the native runtime never depends on
+an application package.
 
 Concrete providers live with the application that owns their business rules. For
 example, the Hermes provider belongs in the Hermes repository; this repository keeps

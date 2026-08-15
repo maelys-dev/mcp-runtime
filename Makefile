@@ -3,7 +3,7 @@ AR ?= ar
 PKG_CONFIG ?= pkg-config
 ANALYZER ?= clang
 PREFIX ?= /usr/local
-VERSION := 0.7.0
+VERSION := 0.8.0
 DOCKER ?= docker
 DOCKER_PLATFORM ?= linux/arm64
 ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
@@ -46,6 +46,7 @@ LIB_SOURCES := \
 	src/modules/subscriptions.c \
 	src/provider/provider.c \
 	src/provider/process_provider.c \
+	src/provider/provider_sdk.c \
 	src/transport/stdio.c \
 	src/transport/stdio_isolation.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJ)/%.o)
@@ -72,7 +73,7 @@ $(BIN)/maelys-mcp: $(OBJ)/host/main.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BIN)/example-provider: $(OBJ)/providers/example/main.o
+$(BIN)/example-provider: $(OBJ)/providers/example/main.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -81,7 +82,7 @@ $(BIN)/adversarial-provider: $(OBJ)/tests/helpers/adversarial_provider.o
 	$(CC) $(CFLAGS) $^ -o $@
 
 $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider: $(BIN)/adversarial-provider
-	cp $< $@
+	ln -sf $(notdir $<) $@
 
 $(BIN)/test-runtime: $(OBJ)/tests/test_runtime.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
@@ -92,6 +93,10 @@ $(BIN)/test-runtime-protocol: $(OBJ)/tests/test_runtime_protocol.o $(LIB)/libmae
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 $(BIN)/test-process-provider: $(OBJ)/tests/test_process_provider.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+$(BIN)/test-provider-sdk: $(OBJ)/tests/test_provider_sdk.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -127,7 +132,7 @@ $(OBJ)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -137,6 +142,7 @@ test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-p
 	$(BIN)/test-subscriptions
 	$(BIN)/test-runtime
 	$(BIN)/test-runtime-protocol
+	$(BIN)/test-provider-sdk
 	$(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/bad-json-provider) $(abspath $(BIN)/bad-envelope-provider) \
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
@@ -194,12 +200,13 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-process-provider \
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-process-provider $(BIN)/test-provider-sdk \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
 		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-provider-sdk
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/bad-json-provider) $(abspath $(BIN)/bad-envelope-provider) \
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
