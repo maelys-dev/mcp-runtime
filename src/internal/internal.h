@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <pthread.h>
 #include <jansson.h>
@@ -12,6 +13,9 @@
 #include "maelys/mcp/runtime.h"
 
 #define MAELYS_MCP_MAX_MODULES 16u
+#define MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED UINT64_C(0x8000000000000000)
+#define MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK \
+    (MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED - UINT64_C(1))
 
 #define JSONRPC_INVALID_REQUEST (-32600)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
@@ -83,7 +87,9 @@ typedef enum maelys_mcp_channel_state {
  * A provider's event_mutex may wrap a sink callback and therefore precedes
  * provider_events_mutex, but no runtime path acquires event_mutex while holding
  * provider_events_mutex. Blocking activation, enqueue, and I/O run without the
- * lifecycle, registry, or channel metadata locks held.
+ * lifecycle, registry, or channel metadata locks held. channel_create_gate
+ * atomically closes create admission and counts admitted creators before they
+ * acquire lifecycle_mutex.
  */
 
 struct maelys_mcp_provider {
@@ -130,7 +136,7 @@ struct maelys_mcp_runtime {
     maelys_mcp_runtime_lifecycle_t lifecycle;
     maelys_mcp_result_t activation_status;
     int shutdown_requested;
-    size_t channel_creators_inflight;
+    atomic_uint_least64_t channel_create_gate;
     pthread_mutex_t channels_mutex;
     int channels_mutex_initialized;
     struct maelys_mcp_channel *channels;
@@ -322,6 +328,9 @@ maelys_mcp_result_t maelys_mcp_runtime_snapshot_channels(
     maelys_mcp_channel_t ***out_channels,
     size_t *out_count);
 void maelys_mcp_channel_release_operation(maelys_mcp_channel_t *channel);
+maelys_mcp_result_t maelys_mcp_runtime_begin_provider_event(
+    maelys_mcp_runtime_t *runtime);
+void maelys_mcp_runtime_end_provider_event(maelys_mcp_runtime_t *runtime);
 void maelys_mcp_provider_bind_event_sink(
     maelys_mcp_provider_t *provider,
     maelys_mcp_result_t (*sink)(

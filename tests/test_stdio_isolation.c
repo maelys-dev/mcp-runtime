@@ -207,6 +207,47 @@ static int test_failed_close_still_terminates_writer(void) {
     return 0;
 }
 
+static int test_eof_reports_dequeued_writer_failure(void) {
+    int input[2];
+    int output[2];
+    ASSERT_TRUE(pipe(input) == 0);
+    ASSERT_TRUE(pipe(output) == 0);
+    ASSERT_TRUE(fill_pipe(output[1]) == 0);
+    ASSERT_TRUE(write(input[1], "{}\n", 3u) == 3);
+    ASSERT_TRUE(close(input[1]) == 0);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(output[0]);
+        maelys_mcp_runtime_config_t config = {
+            .server_name = "stdio-eof-writer-error",
+            .server_version = "test"
+        };
+        maelys_mcp_runtime_t *runtime = NULL;
+        if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) _exit(40);
+        maelys_mcp_stdio_options_t options = {.write_timeout_ms = 50u};
+        maelys_mcp_result_t status = maelys_mcp_runtime_serve_stdio_with_options(
+            runtime, input[0], output[1], &options);
+        maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+        close(input[0]);
+        close(output[1]);
+        if (destroy_status != MAELYS_MCP_OK) _exit(41);
+        _exit(status == MAELYS_MCP_ERR_IO ? 0 : 42);
+    }
+    close(input[0]);
+    close(output[1]);
+    int status = 0;
+    int exited = wait_for_child(pid, &status, 2000u);
+    if (!exited) {
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+    }
+    close(output[0]);
+    ASSERT_TRUE(exited);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
 static int test_stdio_restores_output_descriptor_flags(void) {
     int input[2];
     int output[2];
@@ -239,6 +280,8 @@ int main(void) {
             test_stalled_client_fails_within_write_deadline},
         {"failed close still terminates stdio writer",
             test_failed_close_still_terminates_writer},
+        {"EOF reports dequeued writer failure",
+            test_eof_reports_dequeued_writer_failure},
         {"stdio restores output descriptor flags",
             test_stdio_restores_output_descriptor_flags}
     };
