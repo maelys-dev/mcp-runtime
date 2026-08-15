@@ -96,6 +96,7 @@ static maelys_mcp_result_t wait_for_input_or_writer(
 static maelys_mcp_result_t finish_stdio(
     maelys_mcp_line_reader_t *reader,
     maelys_mcp_channel_t *channel,
+    stdio_writer_context_t *writer_context,
     pthread_t writer,
     int writer_started,
     int wake_pipe[2],
@@ -112,6 +113,8 @@ static maelys_mcp_result_t finish_stdio(
         maelys_mcp_channel_abort(channel);
     }
     if (writer_started) pthread_join(writer, NULL);
+    maelys_mcp_result_t writer_status = writer_started ?
+        (maelys_mcp_result_t)atomic_load(&writer_context->status) : MAELYS_MCP_OK;
     maelys_mcp_result_t destroy_status = maelys_mcp_channel_destroy(channel);
     close(wake_pipe[0]);
     close(wake_pipe[1]);
@@ -119,6 +122,7 @@ static maelys_mcp_result_t finish_stdio(
         MAELYS_MCP_OK : MAELYS_MCP_ERR_IO;
     if (status != MAELYS_MCP_OK) return status;
     if (close_status != MAELYS_MCP_OK) return close_status;
+    if (writer_status != MAELYS_MCP_OK) return writer_status;
     if (destroy_status != MAELYS_MCP_OK) return destroy_status;
     return flags_status;
 }
@@ -176,8 +180,9 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
     memset(&writer, 0, sizeof(writer));
     int writer_started = 0;
     if (pthread_create(&writer, NULL, stdio_writer_main, &writer_context) != 0) {
-        return finish_stdio(&reader, channel, writer, writer_started, wake_pipe,
-            write_fd, write_flags, MAELYS_MCP_ERR_IO, 0);
+        return finish_stdio(&reader, channel, &writer_context, writer,
+            writer_started, wake_pipe, write_fd, write_flags,
+            MAELYS_MCP_ERR_IO, 0);
     }
     writer_started = 1;
     for (;;) {
@@ -191,15 +196,15 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
             status = wait_for_input_or_writer(read_fd, wake_pipe[0], &writer_failed);
             if (status != MAELYS_MCP_OK) {
                 free(error);
-                return finish_stdio(&reader, channel, writer, writer_started,
-                    wake_pipe, write_fd, write_flags, status, 0);
+                return finish_stdio(&reader, channel, &writer_context, writer,
+                    writer_started, wake_pipe, write_fd, write_flags, status, 0);
             }
             if (writer_failed) {
                 free(error);
                 status = (maelys_mcp_result_t)atomic_load(&writer_context.status);
                 if (status == MAELYS_MCP_OK) status = MAELYS_MCP_ERR_IO;
-                return finish_stdio(&reader, channel, writer, writer_started,
-                    wake_pipe, write_fd, write_flags, status, 0);
+                return finish_stdio(&reader, channel, &writer_context, writer,
+                    writer_started, wake_pipe, write_fd, write_flags, status, 0);
             }
             status = maelys_mcp_line_reader_read_once(
                 &reader, read_fd, &request, &error, &eof);
@@ -210,23 +215,24 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         }
         if (status == MAELYS_MCP_ERR_NOT_FOUND && eof) {
             free(error);
-            return finish_stdio(&reader, channel, writer, writer_started,
-                wake_pipe, write_fd, write_flags, MAELYS_MCP_OK, 1);
+            return finish_stdio(&reader, channel, &writer_context, writer,
+                writer_started, wake_pipe, write_fd, write_flags, MAELYS_MCP_OK, 1);
         }
         if (status != MAELYS_MCP_OK) {
             json_t *response = maelys_mcp_error_response(NULL, -32700,
                 error ? error : "Parse error", NULL);
             free(error);
             if (!response) {
-                return finish_stdio(&reader, channel, writer, writer_started,
-                    wake_pipe, write_fd, write_flags, MAELYS_MCP_ERR_MEMORY, 0);
+                return finish_stdio(&reader, channel, &writer_context, writer,
+                    writer_started, wake_pipe, write_fd, write_flags,
+                    MAELYS_MCP_ERR_MEMORY, 0);
             }
             status = maelys_mcp_channel_enqueue_take(channel, response,
                 MAELYS_MCP_OUTBOX_RESPONSE, NULL, 1);
             if (status != MAELYS_MCP_OK) {
                 json_decref(response);
-                return finish_stdio(&reader, channel, writer, writer_started,
-                    wake_pipe, write_fd, write_flags, status, 0);
+                return finish_stdio(&reader, channel, &writer_context, writer,
+                    writer_started, wake_pipe, write_fd, write_flags, status, 0);
             }
             continue;
         }
@@ -234,8 +240,8 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         status = maelys_mcp_channel_handle(channel, request);
         json_decref(request);
         if (status != MAELYS_MCP_OK) {
-            return finish_stdio(&reader, channel, writer, writer_started,
-                wake_pipe, write_fd, write_flags, status, 0);
+            return finish_stdio(&reader, channel, &writer_context, writer,
+                writer_started, wake_pipe, write_fd, write_flags, status, 0);
         }
     }
 }

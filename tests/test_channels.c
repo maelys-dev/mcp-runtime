@@ -380,10 +380,22 @@ static int wait_for_creator_count(
     maelys_mcp_runtime_t *runtime,
     size_t expected) {
     for (size_t attempt = 0; attempt < 1000u; ++attempt) {
-        pthread_mutex_lock(&runtime->lifecycle_mutex);
-        size_t count = runtime->channel_creators_inflight;
-        pthread_mutex_unlock(&runtime->lifecycle_mutex);
+        uint_least64_t gate = atomic_load_explicit(
+            &runtime->channel_create_gate, memory_order_acquire);
+        size_t count = (size_t)(gate &
+            MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK);
         if (count == expected) return 1;
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int wait_for_create_gate_closed(maelys_mcp_runtime_t *runtime) {
+    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
+        uint_least64_t gate = atomic_load_explicit(
+            &runtime->channel_create_gate, memory_order_acquire);
+        if (gate & MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED) return 1;
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
         nanosleep(&pause, NULL);
     }
@@ -503,6 +515,160 @@ static int test_destroy_races_blocked_activation(void) {
     ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
     ASSERT_TRUE(activation.calls == 1);
     activation_context_clear(&activation);
+    return 0;
+}
+
+static int test_destroy_rejects_creators_waiting_on_lifecycle_lock(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    enum { CREATOR_COUNT = 8 };
+    create_context_t creators[CREATOR_COUNT] = {0};
+    pthread_t creator_threads[CREATOR_COUNT];
+    pthread_mutex_lock(&runtime->lifecycle_mutex);
+    for (size_t index = 0; index < CREATOR_COUNT; ++index) {
+        creators[index].runtime = runtime;
+        ASSERT_TRUE(pthread_create(&creator_threads[index], NULL,
+            create_channel_thread, &creators[index]) == 0);
+    }
+    ASSERT_TRUE(wait_for_creator_count(runtime, CREATOR_COUNT));
+    destroy_context_t destroyer = {.runtime = runtime};
+    pthread_t destroyer_thread;
+    ASSERT_TRUE(pthread_create(&destroyer_thread, NULL,
+        destroy_runtime_thread, &destroyer) == 0);
+    ASSERT_TRUE(wait_for_create_gate_closed(runtime));
+    pthread_mutex_unlock(&runtime->lifecycle_mutex);
+    for (size_t index = 0; index < CREATOR_COUNT; ++index) {
+        ASSERT_TRUE(pthread_join(creator_threads[index], NULL) == 0);
+        ASSERT_TRUE(creators[index].status == MAELYS_MCP_ERR_STATE);
+        ASSERT_TRUE(creators[index].channel == NULL);
+    }
+    ASSERT_TRUE(pthread_join(destroyer_thread, NULL) == 0);
+    ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
+    return 0;
+}
+
+typedef struct provider_callback_context {
+    maelys_mcp_runtime_t *runtime;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    size_t admitted;
+    int release;
+} provider_callback_context_t;
+
+static maelys_mcp_result_t hold_provider_event_callback(
+    void *opaque,
+    const maelys_mcp_provider_event_t *event) {
+    provider_callback_context_t *context = opaque;
+    (void)event;
+    if (maelys_mcp_runtime_begin_provider_event(context->runtime) !=
+        MAELYS_MCP_OK) {
+        return MAELYS_MCP_ERR_NOT_FOUND;
+    }
+    pthread_mutex_lock(&context->mutex);
+    context->admitted++;
+    pthread_cond_broadcast(&context->changed);
+    while (!context->release) {
+        pthread_cond_wait(&context->changed, &context->mutex);
+    }
+    pthread_mutex_unlock(&context->mutex);
+    maelys_mcp_runtime_end_provider_event(context->runtime);
+    return MAELYS_MCP_OK;
+}
+
+typedef struct provider_emit_context {
+    maelys_mcp_provider_t *provider;
+    maelys_mcp_result_t status;
+} provider_emit_context_t;
+
+static void *emit_provider_event(void *opaque) {
+    provider_emit_context_t *context = opaque;
+    const maelys_mcp_provider_event_t event = {
+        .kind = MAELYS_MCP_PROVIDER_EVENT_TOOLS_LIST_CHANGED
+    };
+    context->status = maelys_mcp_provider_emit_event(context->provider, &event);
+    return NULL;
+}
+
+typedef struct barrier_destroy_context {
+    maelys_mcp_runtime_t *runtime;
+    maelys_mcp_result_t status;
+    atomic_int done;
+} barrier_destroy_context_t;
+
+static void *destroy_runtime_with_completion(void *opaque) {
+    barrier_destroy_context_t *context = opaque;
+    context->status = maelys_mcp_runtime_destroy(context->runtime);
+    atomic_store(&context->done, 1);
+    return NULL;
+}
+
+static int wait_for_provider_event_shutdown(maelys_mcp_runtime_t *runtime) {
+    for (size_t attempt = 0; attempt < 1000u; ++attempt) {
+        pthread_mutex_lock(&runtime->provider_events_mutex);
+        int accepting = runtime->provider_events_accepting;
+        pthread_mutex_unlock(&runtime->provider_events_mutex);
+        if (!accepting) return 1;
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return 0;
+}
+
+static int test_runtime_destroy_waits_for_multi_provider_callbacks(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_provider_t *providers[2] = {NULL, NULL};
+    const maelys_mcp_provider_config_t provider_configs[2] = {
+        {.name = "barrier-provider-a", .version = "1"},
+        {.name = "barrier-provider-b", .version = "1"}
+    };
+    provider_callback_context_t callback_barrier = {.runtime = runtime};
+    ASSERT_TRUE(pthread_mutex_init(&callback_barrier.mutex, NULL) == 0);
+    ASSERT_TRUE(pthread_cond_init(&callback_barrier.changed, NULL) == 0);
+    provider_emit_context_t emits[2] = {0};
+    pthread_t callback_threads[2];
+    for (size_t index = 0; index < 2u; ++index) {
+        ASSERT_TRUE(maelys_mcp_provider_create(&provider_configs[index],
+            &providers[index]) == MAELYS_MCP_OK);
+        ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, providers[index],
+            NULL) == MAELYS_MCP_OK);
+        maelys_mcp_provider_bind_event_sink(providers[index],
+            hold_provider_event_callback, &callback_barrier);
+        emits[index].provider = providers[index];
+    }
+    maelys_mcp_channel_t *activation_channel = new_channel(runtime, 8u, 100u);
+    ASSERT_TRUE(activation_channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(activation_channel) == MAELYS_MCP_OK);
+    for (size_t index = 0; index < 2u; ++index) {
+        ASSERT_TRUE(pthread_create(&callback_threads[index], NULL,
+            emit_provider_event, &emits[index]) == 0);
+    }
+    pthread_mutex_lock(&callback_barrier.mutex);
+    while (callback_barrier.admitted != 2u) {
+        pthread_cond_wait(&callback_barrier.changed, &callback_barrier.mutex);
+    }
+    pthread_mutex_unlock(&callback_barrier.mutex);
+
+    barrier_destroy_context_t destroyer = {.runtime = runtime};
+    atomic_init(&destroyer.done, 0);
+    pthread_t destroyer_thread;
+    ASSERT_TRUE(pthread_create(&destroyer_thread, NULL,
+        destroy_runtime_with_completion, &destroyer) == 0);
+    ASSERT_TRUE(wait_for_provider_event_shutdown(runtime));
+    ASSERT_TRUE(atomic_load(&destroyer.done) == 0);
+
+    pthread_mutex_lock(&callback_barrier.mutex);
+    callback_barrier.release = 1;
+    pthread_cond_broadcast(&callback_barrier.changed);
+    pthread_mutex_unlock(&callback_barrier.mutex);
+    for (size_t index = 0; index < 2u; ++index) {
+        ASSERT_TRUE(pthread_join(callback_threads[index], NULL) == 0);
+        ASSERT_TRUE(emits[index].status == MAELYS_MCP_OK);
+    }
+    ASSERT_TRUE(pthread_join(destroyer_thread, NULL) == 0);
+    ASSERT_TRUE(destroyer.status == MAELYS_MCP_OK);
+    pthread_cond_destroy(&callback_barrier.changed);
+    pthread_mutex_destroy(&callback_barrier.mutex);
     return 0;
 }
 
@@ -672,6 +838,10 @@ int main(void) {
             test_activation_failure_is_fail_closed},
         {"runtime destroy races blocked activation safely",
             test_destroy_races_blocked_activation},
+        {"runtime destroy rejects lifecycle lock waiters safely",
+            test_destroy_rejects_creators_waiting_on_lifecycle_lock},
+        {"runtime destroy waits for multi-provider callbacks",
+            test_runtime_destroy_waits_for_multi_provider_callbacks},
         {"close uses one absolute deadline",
             test_close_uses_one_absolute_deadline},
         {"close during fanout keeps other channel live",

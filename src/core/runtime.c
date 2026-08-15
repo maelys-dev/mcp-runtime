@@ -1,6 +1,7 @@
 #include "src/internal/internal.h"
 #include "maelys/mcp/subscriptions.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,6 +84,7 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->provider_events_idle_initialized = 1;
     runtime->lifecycle = MAELYS_MCP_RUNTIME_COLD;
     runtime->activation_status = MAELYS_MCP_OK;
+    atomic_init(&runtime->channel_create_gate, UINT64_C(0));
     *out_runtime = runtime;
     return MAELYS_MCP_OK;
 
@@ -112,13 +114,17 @@ failed:
 
 maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     if (!runtime) return MAELYS_MCP_ERR_ARGUMENT;
+    atomic_fetch_or_explicit(&runtime->channel_create_gate,
+        MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED, memory_order_acq_rel);
     pthread_mutex_lock(&runtime->lifecycle_mutex);
     runtime->shutdown_requested = 1;
     if (runtime->lifecycle != MAELYS_MCP_RUNTIME_ACTIVATING) {
         runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
     }
     pthread_cond_broadcast(&runtime->lifecycle_changed);
-    while (runtime->channel_creators_inflight != 0u) {
+    while ((atomic_load_explicit(&runtime->channel_create_gate,
+                memory_order_acquire) &
+            MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) != 0u) {
         pthread_cond_wait(&runtime->lifecycle_changed, &runtime->lifecycle_mutex);
     }
     runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
@@ -153,13 +159,8 @@ static maelys_mcp_result_t handle_provider_event(
     const maelys_mcp_provider_event_t *event) {
     maelys_mcp_runtime_t *runtime = context;
     if (!runtime || !event) return MAELYS_MCP_ERR_ARGUMENT;
-    pthread_mutex_lock(&runtime->provider_events_mutex);
-    if (!runtime->provider_events_accepting) {
-        pthread_mutex_unlock(&runtime->provider_events_mutex);
-        return MAELYS_MCP_ERR_NOT_FOUND;
-    }
-    runtime->provider_events_inflight++;
-    pthread_mutex_unlock(&runtime->provider_events_mutex);
+    maelys_mcp_result_t admitted = maelys_mcp_runtime_begin_provider_event(runtime);
+    if (admitted != MAELYS_MCP_OK) return admitted;
     maelys_mcp_result_t result;
     switch (event->kind) {
         case MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED:
@@ -176,13 +177,32 @@ static maelys_mcp_result_t handle_provider_event(
             result = MAELYS_MCP_ERR_ARGUMENT;
             break;
     }
+    maelys_mcp_runtime_end_provider_event(runtime);
+    return result;
+}
+
+maelys_mcp_result_t maelys_mcp_runtime_begin_provider_event(
+    maelys_mcp_runtime_t *runtime) {
+    if (!runtime) return MAELYS_MCP_ERR_ARGUMENT;
     pthread_mutex_lock(&runtime->provider_events_mutex);
+    if (!runtime->provider_events_accepting) {
+        pthread_mutex_unlock(&runtime->provider_events_mutex);
+        return MAELYS_MCP_ERR_NOT_FOUND;
+    }
+    runtime->provider_events_inflight++;
+    pthread_mutex_unlock(&runtime->provider_events_mutex);
+    return MAELYS_MCP_OK;
+}
+
+void maelys_mcp_runtime_end_provider_event(maelys_mcp_runtime_t *runtime) {
+    if (!runtime) return;
+    pthread_mutex_lock(&runtime->provider_events_mutex);
+    assert(runtime->provider_events_inflight != 0u);
     runtime->provider_events_inflight--;
     if (runtime->provider_events_inflight == 0u) {
         pthread_cond_broadcast(&runtime->provider_events_idle);
     }
     pthread_mutex_unlock(&runtime->provider_events_mutex);
-    return result;
 }
 
 static void stop_provider_events(maelys_mcp_runtime_t *runtime) {

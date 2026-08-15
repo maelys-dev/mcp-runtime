@@ -1,6 +1,7 @@
 #include "src/internal/internal.h"
 #include "maelys/mcp/subscriptions.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,24 +79,38 @@ static maelys_mcp_result_t activate_providers(maelys_mcp_runtime_t *runtime) {
     return MAELYS_MCP_OK;
 }
 
+static void release_channel_create_locked(maelys_mcp_runtime_t *runtime) {
+    uint_least64_t previous = atomic_fetch_sub_explicit(
+        &runtime->channel_create_gate, UINT64_C(1), memory_order_acq_rel);
+    assert((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) != 0u);
+    if ((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) == 1u) {
+        pthread_cond_broadcast(&runtime->lifecycle_changed);
+    }
+}
+
 static maelys_mcp_result_t begin_channel_create(maelys_mcp_runtime_t *runtime) {
+    /* The first runtime access admits this creator or observes the closed gate. */
+    uint_least64_t previous = atomic_fetch_add_explicit(
+        &runtime->channel_create_gate, UINT64_C(1), memory_order_acq_rel);
+    assert((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK) !=
+        MAELYS_MCP_CHANNEL_CREATE_GATE_COUNT_MASK);
     pthread_mutex_lock(&runtime->lifecycle_mutex);
-    if (runtime->shutdown_requested ||
-        runtime->lifecycle == MAELYS_MCP_RUNTIME_SHUTTING_DOWN) {
+    if ((previous & MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED) ||
+        runtime->shutdown_requested ||
+        runtime->lifecycle == MAELYS_MCP_RUNTIME_SHUTTING_DOWN ||
+        (atomic_load_explicit(&runtime->channel_create_gate,
+             memory_order_acquire) & MAELYS_MCP_CHANNEL_CREATE_GATE_CLOSED)) {
+        release_channel_create_locked(runtime);
         pthread_mutex_unlock(&runtime->lifecycle_mutex);
         return MAELYS_MCP_ERR_STATE;
     }
-    runtime->channel_creators_inflight++;
     pthread_mutex_unlock(&runtime->lifecycle_mutex);
     return MAELYS_MCP_OK;
 }
 
 static void end_channel_create(maelys_mcp_runtime_t *runtime) {
     pthread_mutex_lock(&runtime->lifecycle_mutex);
-    runtime->channel_creators_inflight--;
-    if (runtime->channel_creators_inflight == 0u) {
-        pthread_cond_broadcast(&runtime->lifecycle_changed);
-    }
+    release_channel_create_locked(runtime);
     pthread_mutex_unlock(&runtime->lifecycle_mutex);
 }
 
@@ -396,17 +411,14 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
         channel, channel->config.close_timeout_ms);
     if (status != MAELYS_MCP_OK) return status;
     maelys_mcp_runtime_t *runtime = channel->runtime;
+    status = maelys_mcp_outbox_destroy(channel->outbox);
+    if (status != MAELYS_MCP_OK) return status;
     pthread_mutex_lock(&runtime->channels_mutex);
     maelys_mcp_channel_t **cursor = &runtime->channels;
     while (*cursor && *cursor != channel) cursor = &(*cursor)->next;
     if (*cursor != channel) {
         pthread_mutex_unlock(&runtime->channels_mutex);
         return MAELYS_MCP_ERR_STATE;
-    }
-    status = maelys_mcp_outbox_destroy(channel->outbox);
-    if (status != MAELYS_MCP_OK) {
-        pthread_mutex_unlock(&runtime->channels_mutex);
-        return status;
     }
     *cursor = channel->next;
     runtime->live_channel_count--;

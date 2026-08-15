@@ -70,7 +70,10 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     const maelys_mcp_runtime_config_t *config,
     maelys_mcp_runtime_t **out_runtime);
 
-/* Returns MAELYS_MCP_ERR_STATE without freeing runtime while channels live. */
+/*
+ * Closes channel-create admission, waits for admitted creators, and returns
+ * MAELYS_MCP_ERR_STATE without freeing runtime while published channels live.
+ */
 MAELYS_MCP_WARN_UNUSED_RESULT
 maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime);
 
