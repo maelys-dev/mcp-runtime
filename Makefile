@@ -48,6 +48,7 @@ LIB_SOURCES := \
 	src/core/resources.c \
 	src/core/schema.c \
 	src/core/runtime.c \
+	src/internal/stdio_status.c \
 	src/modules/registry.c \
 	src/modules/mrtr.c \
 	src/modules/tools.c \

@@ -705,7 +705,7 @@ static int test_close_uses_one_absolute_deadline(void) {
     return 0;
 }
 
-static int test_destroy_consumes_channel_after_bounded_close_failure(void) {
+static int test_destroy_is_terminal_after_bounded_close_failure(void) {
     maelys_mcp_runtime_t *runtime = new_runtime(1);
     ASSERT_TRUE(runtime != NULL);
     maelys_mcp_channel_config_t config = {
@@ -727,6 +727,78 @@ static int test_destroy_consumes_channel_after_bounded_close_failure(void) {
     /* The close queues complete but no consumer drains it before the deadline. */
     ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_ERR_TIMEOUT);
     ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+static int test_closed_channel_handle_reports_closed(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 4u, 100u);
+    ASSERT_TRUE(channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
+    json_t *request = discover_request(17);
+    ASSERT_TRUE(request != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, request) ==
+        MAELYS_MCP_ERR_CLOSED);
+    json_decref(request);
+    ASSERT_TRUE(destroy_channel_and_runtime(channel, runtime));
+    return 0;
+}
+
+typedef struct handle_loop_context {
+    maelys_mcp_channel_t *channel;
+    atomic_int started;
+    atomic_int unexpected_status;
+} handle_loop_context_t;
+
+static void *handle_until_channel_closes(void *opaque) {
+    handle_loop_context_t *context = opaque;
+    for (json_int_t id = 1;; ++id) {
+        json_t *request = discover_request(id);
+        if (!request) {
+            atomic_store(&context->unexpected_status, 1);
+            return NULL;
+        }
+        atomic_store(&context->started, 1);
+        maelys_mcp_result_t status = maelys_mcp_channel_handle(context->channel, request);
+        json_decref(request);
+        if (status == MAELYS_MCP_OK) continue;
+        if (status != MAELYS_MCP_ERR_CLOSED && status != MAELYS_MCP_ERR_STATE) {
+            atomic_store(&context->unexpected_status, 1);
+        }
+        return NULL;
+    }
+}
+
+static int test_handle_close_transition_is_synchronized(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 64u, 1000u);
+    ASSERT_TRUE(channel != NULL);
+    drain_context_t drain = {.channel = channel};
+    pthread_t consumer;
+    ASSERT_TRUE(pthread_create(&consumer, NULL, drain_until_closed, &drain) == 0);
+    handle_loop_context_t handler = {.channel = channel};
+    atomic_init(&handler.started, 0);
+    atomic_init(&handler.unexpected_status, 0);
+    pthread_t handler_thread;
+    ASSERT_TRUE(pthread_create(&handler_thread, NULL,
+        handle_until_channel_closes, &handler) == 0);
+    for (size_t attempt = 0; attempt < 1000u && !atomic_load(&handler.started);
+         ++attempt) {
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    ASSERT_TRUE(atomic_load(&handler.started) != 0);
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 2000u) == MAELYS_MCP_OK);
+    ASSERT_TRUE(pthread_join(handler_thread, NULL) == 0);
+    ASSERT_TRUE(pthread_join(consumer, NULL) == 0);
+    ASSERT_TRUE(atomic_load(&handler.unexpected_status) == 0);
+    ASSERT_TRUE(drain.terminal == MAELYS_MCP_ERR_CLOSED);
+    for (size_t index = 0; index < drain.count; ++index) {
+        json_decref(drain.messages[index]);
+    }
+    ASSERT_TRUE(destroy_channel_and_runtime(channel, runtime));
     return 0;
 }
 
@@ -1006,8 +1078,12 @@ int main(void) {
             test_runtime_destroy_waits_for_multi_provider_callbacks},
         {"close uses one absolute deadline",
             test_close_uses_one_absolute_deadline},
-        {"destroy consumes a channel after bounded close failure",
-            test_destroy_consumes_channel_after_bounded_close_failure},
+        {"destroy is terminal after bounded close failure",
+            test_destroy_is_terminal_after_bounded_close_failure},
+        {"closed channel handle reports closed",
+            test_closed_channel_handle_reports_closed},
+        {"handle and close state transition is synchronized",
+            test_handle_close_transition_is_synchronized},
         {"close during fanout keeps other channel live",
             test_close_during_fanout_keeps_other_channel_live},
         {"destroy during fanout keeps other channel live",

@@ -182,9 +182,10 @@ maelys_mcp_result_t maelys_mcp_channel_create(
 
 static maelys_mcp_result_t begin_operation(maelys_mcp_channel_t *channel) {
     pthread_mutex_lock(&channel->mutex);
-    if (channel->state != MAELYS_MCP_CHANNEL_ACTIVE) {
+    maelys_mcp_channel_state_t state = channel->state;
+    if (state != MAELYS_MCP_CHANNEL_ACTIVE) {
         pthread_mutex_unlock(&channel->mutex);
-        return channel->state == MAELYS_MCP_CHANNEL_CLOSED ?
+        return state == MAELYS_MCP_CHANNEL_CLOSED ?
             MAELYS_MCP_ERR_CLOSED : MAELYS_MCP_ERR_STATE;
     }
     channel->operations_inflight++;
@@ -411,7 +412,13 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
     }
     maelys_mcp_runtime_t *runtime = channel->runtime;
     maelys_mcp_result_t outbox_status = maelys_mcp_outbox_destroy(channel->outbox);
-    if (outbox_status != MAELYS_MCP_OK) return outbox_status;
+    if (outbox_status != MAELYS_MCP_OK) {
+        /* A terminal abort establishes the only valid destroy preconditions. */
+        maelys_mcp_channel_abort(channel);
+        outbox_status = maelys_mcp_outbox_destroy(channel->outbox);
+    }
+    /* A closed, discarded outbox has no failing teardown path. */
+    if (outbox_status != MAELYS_MCP_OK) abort();
     pthread_mutex_lock(&runtime->channels_mutex);
     maelys_mcp_channel_t **cursor = &runtime->channels;
     while (*cursor && *cursor != channel) cursor = &(*cursor)->next;
