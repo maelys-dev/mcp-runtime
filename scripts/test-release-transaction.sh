@@ -213,9 +213,20 @@ assert_boundary_rejected() {
 
 commit_boundary_mutation() {
   local label=$1
-  git add -A .github/workflows scripts
+  git add -A -- .github/workflows scripts Makefile
   git commit --quiet -m "test workflow boundary mutation: $label"
   assert_boundary_rejected "$label"
+}
+
+assert_boundary_accepted() {
+  local label=$1
+  local candidate
+  candidate=$(git rev-parse HEAD)
+  git reset --hard --quiet "$boundary_baseline"
+  if ! bash "$boundary_checker" "$candidate" >/dev/null 2>&1; then
+    echo "workflow boundary rejected an allowed candidate: $label" >&2
+    exit 1
+  fi
 }
 
 git reset --hard --quiet "$boundary_baseline"
@@ -297,6 +308,69 @@ path = Path(sys.argv[1])
 path.write_text(path.read_text(encoding="utf-8") + "\n# candidate tampering\n", encoding="utf-8")
 PY
 commit_boundary_mutation "boundary checker tampering"
+
+for sealed_script in \
+  scripts/check-release-contract.sh \
+  scripts/check-release-workflow.sh \
+  scripts/check-release-binding.sh \
+  scripts/check-release-secrets.sh \
+  scripts/release-version.sh \
+  scripts/prepare-release.sh; do
+  printf '\n# candidate tampering\n' >> "$sealed_script"
+  commit_boundary_mutation "sealed script tampering: $sealed_script"
+done
+
+python3 - Makefile <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = """test-release-contract:
+\tbash scripts/check-release-contract.sh
+\tbash scripts/check-release-workflow.sh
+\tbash scripts/test-release-transaction.sh
+"""
+path.write_text(text.replace(old, "test-release-contract:\n\t@true\n", 1), encoding="utf-8")
+PY
+commit_boundary_mutation "neutralized release contract recipe"
+
+python3 - Makefile <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_text(
+    path.read_text(encoding="utf-8")
+    + "\ntest-release-contract:\n\tbash scripts/check-release-contract.sh\n",
+    encoding="utf-8",
+)
+PY
+commit_boundary_mutation "duplicate release contract target"
+
+python3 - Makefile <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_text("SHELL := /bin/true\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+PY
+commit_boundary_mutation "altered Make recipe execution context"
+
+python3 - Makefile <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "VERSION := 0.10.0\n"
+if old not in text:
+    raise SystemExit("VERSION mutation target missing")
+path.write_text(text.replace(old, "VERSION := 0.10.1\n", 1), encoding="utf-8")
+PY
+git add Makefile
+git commit --quiet -m "test workflow boundary version update"
+assert_boundary_accepted "VERSION-only Makefile update"
 
 printf 'name: extra workflow\n' > .github/workflows/extra.yml
 commit_boundary_mutation "additional workflow"

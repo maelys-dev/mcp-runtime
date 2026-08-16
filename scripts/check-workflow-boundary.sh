@@ -67,6 +67,47 @@ def require_value!(actual, expected, label)
   fail!("#{label} does not match the sealed contract") unless actual == expected
 end
 
+def regular_blob_content!(ref, path)
+  entry = capture_git!("ls-tree", ref, "--", path).strip
+  metadata, actual_path = entry.split("\t", 2)
+  mode, type, = metadata.to_s.split(" ", 3)
+  fail!("#{path} must be a regular blob in #{ref}") unless
+    ["100644", "100755"].include?(mode) && type == "blob" && actual_path == path
+  capture_git!("show", "#{ref}:#{path}")
+end
+
+def normalize_makefile_version!(content, label)
+  matches = content.scan(/^VERSION := [^\n]+$/)
+  fail!("#{label} must contain exactly one VERSION := line") unless matches.length == 1
+  content.sub(/^VERSION := [^\n]+$/, "VERSION := <release-version>")
+end
+
+def validate_release_make_target!(content)
+  recipe_blocks = []
+  lines = content.lines
+  lines.each_with_index do |line, index|
+    next unless line == "test-release-contract:\n"
+
+    recipes = []
+    cursor = index + 1
+    while cursor < lines.length && lines[cursor].start_with?("\t")
+      recipes << lines[cursor]
+      cursor += 1
+    end
+    recipe_blocks << recipes
+  end
+  fail!("Makefile must define test-release-contract exactly once") unless recipe_blocks.length == 1
+  require_value!(
+    recipe_blocks.fetch(0),
+    [
+      "\tbash scripts/check-release-contract.sh\n",
+      "\tbash scripts/check-release-workflow.sh\n",
+      "\tbash scripts/test-release-transaction.sh\n"
+    ],
+    "test-release-contract recipe"
+  )
+end
+
 expected_paths = [
   ".github/workflows/ci.yml",
   ".github/workflows/release.yml",
@@ -241,9 +282,31 @@ require_value!(load_candidate_yaml(candidate, ".github/workflows/ci.yml"), expec
 require_value!(load_candidate_yaml(candidate, ".github/workflows/release.yml"), expected_release, "release.yml")
 require_value!(load_candidate_yaml(candidate, ".github/workflows/workflow-boundary.yml"), expected_boundary, "workflow-boundary.yml")
 
-base_script = capture_git!("show", "HEAD:scripts/check-workflow-boundary.sh")
-candidate_script = capture_git!("show", "#{candidate}:scripts/check-workflow-boundary.sh")
-require_value!(candidate_script, base_script, "check-workflow-boundary.sh")
+sealed_paths = [
+  "scripts/check-workflow-boundary.sh",
+  "scripts/check-release-contract.sh",
+  "scripts/check-release-workflow.sh",
+  "scripts/check-release-binding.sh",
+  "scripts/check-release-secrets.sh",
+  "scripts/release-version.sh",
+  "scripts/prepare-release.sh"
+]
+sealed_paths.each do |path|
+  require_value!(
+    regular_blob_content!(candidate, path),
+    regular_blob_content!("HEAD", path),
+    path
+  )
+end
+
+candidate_makefile = regular_blob_content!(candidate, "Makefile")
+base_makefile = regular_blob_content!("HEAD", "Makefile")
+validate_release_make_target!(candidate_makefile)
+require_value!(
+  normalize_makefile_version!(candidate_makefile, "candidate Makefile"),
+  normalize_makefile_version!(base_makefile, "base Makefile"),
+  "Makefile outside VERSION"
+)
 
 puts "workflow boundary: PASS"
 RUBY
