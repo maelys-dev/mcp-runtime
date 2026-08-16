@@ -29,8 +29,9 @@ jobs:
           node-version: 24
           package-manager-cache: false
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3 ripgrep ruby
       - run: make check-all CC=clang ANALYZER=clang
+      - run: make test-release-contract
       - run: make analyze CC=clang ANALYZER=clang
 
   sanitizers:

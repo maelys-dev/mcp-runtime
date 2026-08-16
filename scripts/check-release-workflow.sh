@@ -4,113 +4,119 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 workflow="$root/.github/workflows/release.yml"
 
-python3 - "$workflow" <<'PY'
-from __future__ import annotations
+ruby -rpsych - "$workflow" <<'RUBY'
+path = ARGV.fetch(0)
 
-import re
-import sys
-from pathlib import Path
+def fail!(message)
+  abort("release workflow: #{message}")
+end
 
-text = Path(sys.argv[1]).read_text(encoding="utf-8")
+def decode(node)
+  case node
+  when Psych::Nodes::Scalar
+    fail!("anchors and tags are not allowed") if node.anchor || node.tag
+    node.value
+  when Psych::Nodes::Sequence
+    fail!("flow sequences are not allowed") unless node.style == Psych::Nodes::Sequence::BLOCK
+    fail!("anchors and tags are not allowed") if node.anchor || node.tag
+    node.children.map { |child| decode(child) }
+  when Psych::Nodes::Mapping
+    fail!("flow mappings are not allowed") unless node.style == Psych::Nodes::Mapping::BLOCK
+    fail!("anchors and tags are not allowed") if node.anchor || node.tag
+    fail!("mapping has an odd number of nodes") unless node.children.length.even?
+    value = {}
+    node.children.each_slice(2) do |key, child|
+      fail!("mapping keys must be plain scalars") unless key.is_a?(Psych::Nodes::Scalar)
+      decoded_key = decode(key)
+      fail!("duplicate mapping key #{decoded_key.inspect}") if value.key?(decoded_key)
+      value[decoded_key] = decode(child)
+    end
+    value
+  when Psych::Nodes::Alias
+    fail!("aliases are not allowed")
+  else
+    fail!("unexpected YAML node #{node.class}")
+  end
+end
 
-if re.search(r"(?m)^\s*if\s*:", text):
-    raise SystemExit("release workflow must not use conditional execution")
-if re.search(r"(?m)^\s*continue-on-error\s*:", text):
-    raise SystemExit("release workflow must not ignore failed steps")
-if re.search(r"(?:\|\||;|&&)\s*(?:true|:)\b", text):
-    raise SystemExit("release workflow must not mask shell command failures")
+stream = Psych.parse_stream(File.read(path, encoding: "UTF-8"))
+fail!("must contain exactly one YAML document") unless stream.children.length == 1
+document = stream.children.fetch(0)
+fail!("document anchors and tags are not allowed") if document.tag || document.implicit == false
+root = decode(document.root)
 
+def require_keys!(value, expected, label)
+  actual = value.keys.sort
+  wanted = expected.sort
+  fail!("#{label} keys must be #{wanted.join(', ')}") unless actual == wanted
+end
 
-def top_level_block(key: str) -> str:
-    match = re.search(rf"(?m)^{re.escape(key)}:\n", text)
-    if not match:
-        raise SystemExit(f"release workflow missing top-level {key}")
-    following = re.search(r"(?m)^[A-Za-z][A-Za-z0-9_-]*:\s*$", text[match.end():])
-    end = match.end() + following.start() if following else len(text)
-    return text[match.end():end]
+def require_value!(actual, expected, label)
+  fail!("#{label} must be #{expected.inspect}") unless actual == expected
+end
 
+checkout = "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+setup_node = "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444"
+install_native = "sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3"
+tag_validation = <<~SH
+  test "$GITHUB_REF_TYPE" = "tag"
+  version="$(bash scripts/release-version.sh)"
+  test "$GITHUB_REF_NAME" = "v$version"
+  bash scripts/check-release-contract.sh
+SH
+publish_release = <<~SH
+  version="$(bash scripts/release-version.sh)"
+  gh release create "$GITHUB_REF_NAME" --title "mcp-runtime $version" --generate-notes --verify-tag
+SH
 
-def direct_keys(block: str, indent: int) -> list[str]:
-    return re.findall(rf"(?m)^{' ' * indent}([A-Za-z][A-Za-z0-9_-]*):", block)
+require_keys!(root, %w[name on permissions jobs], "top-level")
+require_value!(root.fetch("name"), "Release", "name")
+require_value!(root.fetch("permissions"), { "contents" => "read" }, "default permissions")
 
+trigger = root.fetch("on")
+require_keys!(trigger, ["push"], "trigger")
+push = trigger.fetch("push")
+require_keys!(push, ["tags"], "push trigger")
+require_value!(push.fetch("tags"), ["v*"], "tag trigger")
 
-def nested_block(block: str, key: str, indent: int) -> str:
-    match = re.search(rf"(?m)^{' ' * indent}{re.escape(key)}:\n", block)
-    if not match:
-        raise SystemExit(f"release workflow missing {key}")
-    following = re.search(rf"(?m)^{' ' * indent}[A-Za-z][A-Za-z0-9_-]*:", block[match.end():])
-    end = match.end() + following.start() if following else len(block)
-    return block[match.end():end]
+jobs = root.fetch("jobs")
+require_keys!(jobs, %w[verify publish], "jobs")
 
+verify = jobs.fetch("verify")
+require_keys!(verify, %w[name runs-on timeout-minutes steps], "verify")
+require_value!(verify.fetch("name"), "Verify tagged release", "verify name")
+require_value!(verify.fetch("runs-on"), "ubuntu-24.04", "verify runner")
+require_value!(verify.fetch("timeout-minutes"), "20", "verify timeout")
+expected_verify_steps = [
+  { "uses" => checkout },
+  {
+    "uses" => setup_node,
+    "with" => { "node-version" => "24", "package-manager-cache" => "false" }
+  },
+  { "name" => "Install native dependencies", "run" => install_native },
+  { "name" => "Verify tag and release metadata", "run" => tag_validation },
+  { "run" => "make check-all CC=clang ANALYZER=clang" }
+]
+require_value!(verify.fetch("steps"), expected_verify_steps, "verify steps")
 
-if direct_keys(text, 0) != ["name", "on", "permissions", "jobs"]:
-    raise SystemExit("release workflow must expose only name, on, permissions and jobs")
-if not re.search(r"(?m)^name: Release$", text):
-    raise SystemExit("release workflow name must be Release")
+publish = jobs.fetch("publish")
+require_keys!(publish, %w[name needs runs-on timeout-minutes permissions steps], "publish")
+require_value!(publish.fetch("name"), "Publish GitHub release", "publish name")
+require_value!(publish.fetch("needs"), "verify", "publish dependency")
+require_value!(publish.fetch("runs-on"), "ubuntu-24.04", "publish runner")
+require_value!(publish.fetch("timeout-minutes"), "5", "publish timeout")
+require_value!(publish.fetch("permissions"), { "contents" => "write" }, "publish permissions")
+expected_publish_steps = [
+  { "uses" => checkout },
+  {
+    "name" => "Create GitHub release for the pushed tag",
+    "env" => { "GH_TOKEN" => "${{ github.token }}" },
+    "run" => publish_release
+  }
+]
+require_value!(publish.fetch("steps"), expected_publish_steps, "publish steps")
 
-on_block = top_level_block("on")
-if direct_keys(on_block, 2) != ["push"]:
-    raise SystemExit("release workflow must have only the push trigger")
-push_block = nested_block(on_block, "push", 2)
-if direct_keys(push_block, 4) != ["tags"]:
-    raise SystemExit("release workflow push trigger must have only tags")
-tag_block = nested_block(push_block, "tags", 4)
-if [line.strip() for line in tag_block.splitlines() if line.strip()] != ['- "v*"']:
-    raise SystemExit('release workflow tags must be exactly ["v*"]')
-
-permissions_block = top_level_block("permissions")
-if [line.strip() for line in permissions_block.splitlines() if line.strip()] != ["contents: read"]:
-    raise SystemExit("release workflow must default to contents: read")
-
-jobs_block = top_level_block("jobs")
-if direct_keys(jobs_block, 2) != ["verify", "publish"]:
-    raise SystemExit("release workflow must define only verify and publish jobs")
-verify_block = nested_block(jobs_block, "verify", 2)
-publish_block = nested_block(jobs_block, "publish", 2)
-if "permissions" in direct_keys(verify_block, 4):
-    raise SystemExit("verify must not override permissions")
-if not re.search(r"(?m)^    needs: verify$", publish_block):
-    raise SystemExit("publish must depend on verify")
-if len(re.findall(r"(?m)^\s*contents:\s*write\s*$", text)) != 1:
-    raise SystemExit("release workflow must contain exactly one contents: write permission")
-if not re.search(r"(?ms)^    permissions:\n      contents: write$", publish_block):
-    raise SystemExit("only publish may receive contents: write")
-
-def require_exactly_once(label: str, pattern: str, owner: str) -> None:
-    total = len(re.findall(pattern, text))
-    local = len(re.findall(pattern, owner))
-    if total != 1 or local != 1:
-        raise SystemExit(f"release workflow must contain {label} exactly once in its designated job")
-
-
-require_exactly_once(
-    "tag/version validation",
-    r'test "\$GITHUB_REF_NAME" = "v\$version"',
-    verify_block,
-)
-require_exactly_once(
-    "release contract validation",
-    r"bash scripts/check-release-contract\.sh",
-    verify_block,
-)
-require_exactly_once(
-    "native verification",
-    r"make check-all CC=clang ANALYZER=clang",
-    verify_block,
-)
-require_exactly_once(
-    "GitHub release creation",
-    r'gh release create "\$GITHUB_REF_NAME" .*--verify-tag',
-    publish_block,
-)
-
-uses_lines = [line for line in text.splitlines() if "uses:" in line]
-if not uses_lines:
-    raise SystemExit("release workflow must use pinned actions")
-for line in uses_lines:
-    if not re.fullmatch(
-        r"\s*- uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(?:\s+#.*)?",
-        line,
-    ):
-        raise SystemExit(f"release workflow has an unpinned action: {line.strip()}")
-PY
+run_values = [verify, publish].flat_map { |job| job.fetch("steps") }.map { |step| step["run"] }.compact
+release_creates = run_values.grep(/\bgh release create\b/)
+require_value!(release_creates, [publish_release], "GitHub release creation")
+RUBY
