@@ -1,5 +1,7 @@
 # Changelog
 
+## Unreleased
+
 ## 0.10.0 - 2026-08-15
 
 - Introduce opaque `maelys_mcp_channel_t` handles. Each channel owns its ordered

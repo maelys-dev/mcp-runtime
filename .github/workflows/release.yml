@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify tagged release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3
+      - name: Verify tag and release metadata
+        run: |
+          test "$GITHUB_REF_TYPE" = "tag"
+          version="$(bash scripts/release-version.sh)"
+          test "$GITHUB_REF_NAME" = "v$version"
+          bash scripts/check-release-contract.sh
+      - run: make check-all CC=clang ANALYZER=clang
+
+  publish:
+    name: Publish GitHub release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Create GitHub release for the pushed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(bash scripts/release-version.sh)"
+          gh release create "$GITHUB_REF_NAME" --title "mcp-runtime $version" --generate-notes --verify-tag

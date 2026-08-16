@@ -67,7 +67,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 -include $(DEPENDENCY_FILES)
 
 .PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
-	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize
+	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize test-release-contract
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
 
@@ -206,6 +206,11 @@ test-mcp-conformance-official: all
 		--package '$(MCP_CONFORMANCE_PACKAGE)'
 
 check-all: check check-sdks test-provider-conformance
+
+test-release-contract:
+	bash scripts/check-release-contract.sh
+	bash scripts/check-release-workflow.sh
+	bash scripts/test-release-transaction.sh
 
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/lib/pkgconfig" \
