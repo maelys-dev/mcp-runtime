@@ -67,7 +67,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 -include $(DEPENDENCY_FILES)
 
 .PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
-	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize test-release-contract
+	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize test-release-contract test-workflow-boundary
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
 
@@ -210,6 +210,10 @@ check-all: check check-sdks test-provider-conformance
 test-release-contract:
 	bash scripts/check-release-contract.sh
 	bash scripts/check-release-workflow.sh
+	bash scripts/test-release-transaction.sh
+
+test-workflow-boundary:
+	bash scripts/check-workflow-boundary.sh "$(shell git rev-parse HEAD)"
 	bash scripts/test-release-transaction.sh
 
 install: all

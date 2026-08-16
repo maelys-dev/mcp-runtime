@@ -8,11 +8,24 @@ trap 'rm -rf "$tmp"' EXIT
 git clone --quiet --no-hardlinks "$root" "$tmp/repo"
 cp "$root/.github/workflows/ci.yml" "$tmp/repo/.github/workflows/ci.yml"
 cp "$root/.github/workflows/release.yml" "$tmp/repo/.github/workflows/release.yml"
+cp "$root/.github/workflows/workflow-boundary.yml" "$tmp/repo/.github/workflows/workflow-boundary.yml"
 cp "$root/Makefile" "$tmp/repo/Makefile"
-for script in check-release-binding.sh check-release-contract.sh check-release-secrets.sh check-release-workflow.sh test-release-transaction.sh; do
+for script in check-release-binding.sh check-release-contract.sh check-release-secrets.sh check-release-workflow.sh check-workflow-boundary.sh test-release-transaction.sh; do
   cp "$root/scripts/$script" "$tmp/repo/scripts/$script"
 done
 cd "$tmp/repo"
+
+# The workflow-boundary checker reads candidate Git objects. Make the copied
+# implementation the baseline commit before creating isolated mutations.
+git config user.email "tests@mcp-runtime.invalid"
+git config user.name "mcp-runtime tests"
+git add Makefile .github/workflows scripts
+if ! git diff --cached --quiet; then
+  git commit --quiet -m "test workflow boundary baseline"
+fi
+boundary_baseline=$(git rev-parse HEAD)
+boundary_checker="$tmp/check-workflow-boundary.sh"
+cp scripts/check-workflow-boundary.sh "$boundary_checker"
 
 bash scripts/check-release-contract.sh
 /bin/bash scripts/check-release-contract.sh
@@ -184,3 +197,120 @@ if RELEASE_DATE=2026-08-16 bash scripts/prepare-release.sh "$next_version" >/dev
 fi
 after=$(git diff -- Makefile CHANGELOG.md)
 test "$before" = "$after"
+
+assert_boundary_rejected() {
+  local label=$1
+  local candidate
+  candidate=$(git rev-parse HEAD)
+  # The real pull_request_target checkout remains on the base while the
+  # candidate is fetched into a separate ref. Recreate that topology here.
+  git reset --hard --quiet "$boundary_baseline"
+  if bash "$boundary_checker" "$candidate" >/dev/null 2>&1; then
+    echo "workflow boundary mutation was accepted: $label" >&2
+    exit 1
+  fi
+}
+
+commit_boundary_mutation() {
+  local label=$1
+  git add -A .github/workflows scripts
+  git commit --quiet -m "test workflow boundary mutation: $label"
+  assert_boundary_rejected "$label"
+}
+
+git reset --hard --quiet "$boundary_baseline"
+bash "$boundary_checker" "$boundary_baseline"
+
+# A candidate may contain arbitrary source, but the checker reads blobs only.
+# The sentinel would create this marker if any candidate script were executed.
+sentinel_marker="$tmp/candidate-sentinel-ran"
+cat > scripts/candidate-sentinel.sh <<SH
+#!/usr/bin/env bash
+touch "$sentinel_marker"
+SH
+chmod +x scripts/candidate-sentinel.sh
+git add scripts/candidate-sentinel.sh
+git commit --quiet -m "test candidate sentinel"
+sentinel_candidate=$(git rev-parse HEAD)
+git reset --hard --quiet "$boundary_baseline"
+bash "$boundary_checker" "$sentinel_candidate"
+test ! -e "$sentinel_marker"
+
+python3 - .github/workflows/ci.yml <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "      - run: make test-release-contract\n"
+path.write_text(text.replace(old, "      - if: false\n        run: make test-release-contract\n", 1), encoding="utf-8")
+PY
+commit_boundary_mutation "conditional CI release guard"
+
+python3 - .github/workflows/ci.yml <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "  check:\n    name: Native, SDK and provider checks\n"
+path.write_text(text.replace(old, "  check:\n    if: false\n    name: Native, SDK and provider checks\n", 1), encoding="utf-8")
+PY
+commit_boundary_mutation "conditional CI check job"
+
+python3 - .github/workflows/ci.yml <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "      - run: make test-release-contract\n"
+path.write_text(text.replace(old, "      - run: make test-release-contract\n        continue-on-error: true\n", 1), encoding="utf-8")
+PY
+commit_boundary_mutation "ignored CI release guard failure"
+
+python3 - .github/workflows/ci.yml <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+path.write_text(text.replace("    runs-on: ubuntu-24.04\n", "    runs-on: self-hosted\n", 1), encoding="utf-8")
+PY
+commit_boundary_mutation "self-hosted CI runner"
+
+python3 - .github/workflows/workflow-boundary.yml <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+path.write_text(text.replace("  pull_request_target:\n", "  pull_request:\n", 1), encoding="utf-8")
+PY
+commit_boundary_mutation "boundary trigger replacement"
+
+python3 - scripts/check-workflow-boundary.sh <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.write_text(path.read_text(encoding="utf-8") + "\n# candidate tampering\n", encoding="utf-8")
+PY
+commit_boundary_mutation "boundary checker tampering"
+
+printf 'name: extra workflow\n' > .github/workflows/extra.yml
+commit_boundary_mutation "additional workflow"
+
+rm .github/workflows/release.yml
+ln -s ci.yml .github/workflows/release.yml
+commit_boundary_mutation "workflow symlink"
+
+if bash "$boundary_checker" HEAD >/dev/null 2>&1; then
+  echo "workflow boundary accepted a non-SHA reference" >&2
+  exit 1
+fi
+if bash "$boundary_checker" 0000000000000000000000000000000000000000 >/dev/null 2>&1; then
+  echo "workflow boundary accepted an absent commit" >&2
+  exit 1
+fi
+git reset --hard --quiet "$boundary_baseline"

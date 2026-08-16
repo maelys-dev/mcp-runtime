@@ -1,0 +1,35 @@
+name: Workflow boundary
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-boundary:
+    name: Workflow boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Fetch candidate workflow objects
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head:refs/mcp-runtime/candidate"
+          test "$(git rev-parse refs/mcp-runtime/candidate)" = "$CANDIDATE_SHA"
+      - name: Validate candidate workflow boundary
+        env:
+          CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/check-workflow-boundary.sh "$CANDIDATE_SHA"
