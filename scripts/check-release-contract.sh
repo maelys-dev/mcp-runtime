@@ -5,19 +5,20 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 version=$(bash "$root/scripts/release-version.sh")
 changelog="$root/CHANGELOG.md"
 
-mapfile -t headings < <(sed -n 's/^## //p' "$changelog")
+first_heading=$(sed -n 's/^## //p' "$changelog" | sed -n '1p')
+release_heading=$(sed -n 's/^## //p' "$changelog" | sed -n '2p')
 
-if [[ ${#headings[@]} -lt 2 || ${headings[0]} != "Unreleased" ]]; then
+if [[ $first_heading != "Unreleased" || -z $release_heading ]]; then
   echo "CHANGELOG.md must begin with an Unreleased section" >&2
   exit 1
 fi
 
-if [[ ! ${headings[1]} =~ ^${version}[[:space:]]-[[:space:]][0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+if [[ ! $release_heading =~ ^${version}[[:space:]]-[[:space:]][0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
   echo "CHANGELOG.md must place $version directly after Unreleased" >&2
   exit 1
 fi
 
-release_count=$(printf '%s\n' "${headings[@]}" | grep -Fxc "$version - ${headings[1]#"$version - "}")
+release_count=$(sed -n 's/^## //p' "$changelog" | grep -Fxc "$release_heading")
 if [[ $release_count -ne 1 ]]; then
   echo "CHANGELOG.md must contain exactly one $version release heading" >&2
   exit 1

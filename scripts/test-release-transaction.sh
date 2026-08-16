@@ -9,6 +9,7 @@ git clone --quiet --no-hardlinks "$root" "$tmp/repo"
 cd "$tmp/repo"
 
 bash scripts/check-release-contract.sh
+/bin/bash scripts/check-release-contract.sh
 bash scripts/check-release-workflow.sh
 current_version=$(bash scripts/release-version.sh)
 next_version=$(python3 - "$current_version" <<'PY'
@@ -76,6 +77,16 @@ reject_workflow_mutation "branch trigger" $'    tags:\n' $'    branches:\n      
 reject_workflow_mutation "verify write permission" $'  verify:\n' $'  verify:\n    permissions:\n      contents: write\n'
 reject_workflow_mutation "unpinned action" \
   'actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444' 'actions/setup-node@v5.0.0'
+reject_workflow_mutation "conditional publish" $'    needs: verify\n' $'    needs: verify\n    if: always()\n'
+reject_workflow_mutation "ignored verification failure" \
+  '      - run: make check-all CC=clang ANALYZER=clang' \
+  $'      - run: make check-all CC=clang ANALYZER=clang\n        continue-on-error: true'
+reject_workflow_mutation "masked contract failure" \
+  '          bash scripts/check-release-contract.sh' \
+  '          bash scripts/check-release-contract.sh || true'
+reject_workflow_mutation "release creation outside publish" \
+  '      - run: make check-all CC=clang ANALYZER=clang' \
+  $'      - run: make check-all CC=clang ANALYZER=clang\n      - run: gh release create "$GITHUB_REF_NAME" --verify-tag'
 cp "$workflow_pristine" "$workflow"
 
 cp release-transaction.toml release-transaction-invalid.toml
@@ -91,6 +102,21 @@ path.write_text(
 PY
 if bash scripts/check-release-binding.sh release-transaction-invalid.toml; then
   echo "binding/CI divergence was accepted" >&2
+  exit 1
+fi
+
+cp release-transaction.toml release-transaction-empty-jobs.toml
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path("release-transaction-empty-jobs.toml")
+text = path.read_text(encoding="utf-8")
+start = text.index("expected_jobs = [")
+end = text.index("]\n", start) + 2
+path.write_text(text[:start] + "expected_jobs = []\n" + text[end:], encoding="utf-8")
+PY
+if bash scripts/check-release-binding.sh release-transaction-empty-jobs.toml; then
+  echo "empty expected_jobs was accepted" >&2
   exit 1
 fi
 

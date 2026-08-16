@@ -13,6 +13,13 @@ from pathlib import Path
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
 
+if re.search(r"(?m)^\s*if\s*:", text):
+    raise SystemExit("release workflow must not use conditional execution")
+if re.search(r"(?m)^\s*continue-on-error\s*:", text):
+    raise SystemExit("release workflow must not ignore failed steps")
+if re.search(r"(?:\|\||;|&&)\s*(?:true|:)\b", text):
+    raise SystemExit("release workflow must not mask shell command failures")
+
 
 def top_level_block(key: str) -> str:
     match = re.search(rf"(?m)^{re.escape(key)}:\n", text)
@@ -69,17 +76,33 @@ if len(re.findall(r"(?m)^\s*contents:\s*write\s*$", text)) != 1:
 if not re.search(r"(?ms)^    permissions:\n      contents: write$", publish_block):
     raise SystemExit("only publish may receive contents: write")
 
-required = {
-    "version check": r'test "\$GITHUB_REF_NAME" = "v\$version"',
-    "contract check": r"bash scripts/check-release-contract\.sh",
-    "native verification": r"make check-all CC=clang ANALYZER=clang",
-    "release creation": r'gh release create "\$GITHUB_REF_NAME" .*--verify-tag',
-}
-for label, pattern in required.items():
-    if not re.search(pattern, text):
-        raise SystemExit(f"release workflow missing {label}")
-if not re.search(required["release creation"], publish_block):
-    raise SystemExit("only publish may create the GitHub release")
+def require_exactly_once(label: str, pattern: str, owner: str) -> None:
+    total = len(re.findall(pattern, text))
+    local = len(re.findall(pattern, owner))
+    if total != 1 or local != 1:
+        raise SystemExit(f"release workflow must contain {label} exactly once in its designated job")
+
+
+require_exactly_once(
+    "tag/version validation",
+    r'test "\$GITHUB_REF_NAME" = "v\$version"',
+    verify_block,
+)
+require_exactly_once(
+    "release contract validation",
+    r"bash scripts/check-release-contract\.sh",
+    verify_block,
+)
+require_exactly_once(
+    "native verification",
+    r"make check-all CC=clang ANALYZER=clang",
+    verify_block,
+)
+require_exactly_once(
+    "GitHub release creation",
+    r'gh release create "\$GITHUB_REF_NAME" .*--verify-tag',
+    publish_block,
+)
 
 uses_lines = [line for line in text.splitlines() if "uses:" in line]
 if not uses_lines:

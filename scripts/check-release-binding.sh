@@ -69,8 +69,19 @@ ci_text = ci_path.read_text(encoding="utf-8")
 if not re.search(r"(?m)^name: CI$", ci_text):
     raise SystemExit("ci.yml must define workflow CI")
 ci_job_names = re.findall(r"(?m)^    name: (.+)$", ci_text)
+required_jobs = [
+    "Native, SDK and provider checks",
+    "ASan, UBSan and TSan",
+    "Fuzzer smoke campaigns",
+    "Supported official MCP scenarios",
+]
 if quoted_value("expected_workflow") != "CI":
     raise SystemExit("release_transaction.expected_workflow must be CI")
-if string_array("expected_jobs") != ci_job_names:
+expected_jobs = string_array("expected_jobs")
+if expected_jobs != required_jobs:
+    raise SystemExit("release_transaction.expected_jobs must be the four sealed CI jobs")
+if ci_job_names != required_jobs:
+    raise SystemExit("ci.yml must expose exactly the four sealed CI jobs")
+if expected_jobs != ci_job_names:
     raise SystemExit("release_transaction.expected_jobs diverges from ci.yml")
 PY
