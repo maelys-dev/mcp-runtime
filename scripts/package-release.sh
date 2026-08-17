@@ -58,9 +58,11 @@ package() {  # $1 = variant label
 }
 
 echo "==> dynamic variant"
+# No test run here: correctness is gated by CI on main and by cut-release.sh's
+# local `make check` before a tag is ever created. Re-running the suite in the
+# release build only adds time and exposes the release to test flakes.
 make clean
 make all
-make check
 package dynamic
 
 echo "==> static variant (jansson + uriparser from pinned source)"
