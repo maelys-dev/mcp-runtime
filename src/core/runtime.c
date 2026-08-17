@@ -326,6 +326,29 @@ static const char *client_name_from_params(json_t *params) {
     return json_is_string(name) ? json_string_value(name) : "unknown";
 }
 
+/*
+ * Legacy clients negotiate over the classic initialize handshake. Every dated
+ * revision up to 2025-11-25 shares that handshake, so the runtime accepts any
+ * of them and echoes the client's version back — MCP version negotiation says a
+ * server that supports the requested version MUST respond with the same one.
+ * 2026-07-28 dropped initialize entirely and is handled statelessly through
+ * per-request _meta, so it never reaches this path.
+ */
+static const char *const legacy_protocol_versions[] = {
+    "2024-11-05", "2025-03-26", "2025-06-18", MAELYS_MCP_PROTOCOL_LEGACY,
+};
+
+static int is_supported_legacy_version(const json_t *version) {
+    if (!json_is_string(version) || maelys_mcp_json_string_has_nul(version)) return 0;
+    const char *value = json_string_value(version);
+    for (size_t index = 0;
+         index < sizeof(legacy_protocol_versions) / sizeof(legacy_protocol_versions[0]);
+         ++index) {
+        if (strcmp(value, legacy_protocol_versions[index]) == 0) return 1;
+    }
+    return 0;
+}
+
 static json_t *initialize(
     maelys_mcp_channel_t *channel,
     json_t *id,
@@ -338,11 +361,13 @@ static json_t *initialize(
             "Initialize already received", NULL);
     }
     json_t *version = json_is_object(params) ? json_object_get(params, "protocolVersion") : NULL;
-    if (!maelys_mcp_json_string_equals(version, MAELYS_MCP_PROTOCOL_LEGACY)) {
+    if (!is_supported_legacy_version(version)) {
         pthread_mutex_unlock(&channel->mutex);
         return maelys_mcp_error_response(id, JSONRPC_INVALID_PARAMS,
             "Unsupported legacy protocol version", NULL);
     }
+    (void)snprintf(channel->legacy_protocol_version,
+        sizeof(channel->legacy_protocol_version), "%s", json_string_value(version));
     json_t *client = json_object_get(params, "clientInfo");
     json_t *name = json_is_object(client) ? json_object_get(client, "name") : NULL;
     (void)snprintf(channel->legacy_client_name, sizeof(channel->legacy_client_name),
@@ -355,7 +380,7 @@ static json_t *initialize(
     json_t *caps = maelys_mcp_runtime_capabilities(runtime, 0);
     if (!result || !info || !caps ||
         json_object_set_new(result, "protocolVersion",
-            json_string(MAELYS_MCP_PROTOCOL_LEGACY)) != 0 ||
+            json_string(json_string_value(version))) != 0 ||
         json_object_set(result, "capabilities", caps) != 0 ||
         json_object_set(result, "serverInfo", info) != 0) {
         if (result) json_decref(result);
@@ -478,10 +503,13 @@ json_t *maelys_mcp_runtime_dispatch(
 
     int modern = modern_version != NULL;
     char legacy_client_name[sizeof(channel->legacy_client_name)];
+    char legacy_protocol_version[sizeof(channel->legacy_protocol_version)];
     pthread_mutex_lock(&channel->mutex);
     int legacy_initialized = channel->legacy_initialized;
     (void)snprintf(legacy_client_name, sizeof(legacy_client_name), "%s",
         channel->legacy_client_name);
+    (void)snprintf(legacy_protocol_version, sizeof(legacy_protocol_version), "%s",
+        channel->legacy_protocol_version);
     pthread_mutex_unlock(&channel->mutex);
     if (!modern && !legacy_initialized) {
         return maelys_mcp_error_response(id, MCP_SERVER_NOT_INITIALIZED,
@@ -491,7 +519,7 @@ json_t *maelys_mcp_runtime_dispatch(
         .channel = channel,
         .id = id,
         .params = params,
-        .protocol_version = modern ? modern_version : MAELYS_MCP_PROTOCOL_LEGACY,
+        .protocol_version = modern ? modern_version : legacy_protocol_version,
         .client_name = modern ? client_name_from_params(params) : legacy_client_name,
         .modern = modern,
         .post_enqueue_subscription_id = out_post_enqueue_subscription_id

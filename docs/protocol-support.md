@@ -4,8 +4,12 @@ The runtime implements two protocol eras:
 
 - `2026-07-28`: stateless per-request metadata, `server/discover`, server identity in
   result metadata, mandatory final `resultType`, and conservative cache hints;
-- `2025-11-25`: the `initialize` / `notifications/initialized` lifecycle for existing
-  stdio clients.
+- the legacy `initialize` / `notifications/initialized` lifecycle for existing stdio
+  clients. Every dated revision up to `2025-11-25` shares that handshake, so the
+  runtime accepts `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25`, and — per
+  MCP version negotiation — echoes the client's requested version back in the
+  `initialize` result. `2026-07-28` removed `initialize`; a client that sends it is by
+  definition using the legacy era.
 
 The modern implementation follows the final specification rather than its earlier
 release-candidate wire shape. Primary references:

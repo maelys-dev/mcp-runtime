@@ -166,6 +166,7 @@ struct maelys_mcp_channel {
     int legacy_initialize_received;
     int legacy_initialized;
     char legacy_client_name[128];
+    char legacy_protocol_version[16];
     maelys_mcp_subscription_t *subscriptions;
     size_t subscription_count;
 };
