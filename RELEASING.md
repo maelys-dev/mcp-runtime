@@ -107,13 +107,18 @@ Users install with `brew install maelys-dev/tap/mcp-runtime`. The formula lives
 in the separate [`maelys-dev/homebrew-tap`](https://github.com/maelys-dev/homebrew-tap)
 repo (`Formula/mcp-runtime.rb`) and builds from the release source tarball.
 
-After each release, update two lines of the formula — the `url` (new tag) and its
-`sha256`:
+`cut-release.sh` bumps it automatically as its last step — it only needs the git
+tag (the formula builds from GitHub's source archive), so it doesn't wait on the
+binary release workflow or its approval gate. To bump it on its own:
 
 ```sh
-url="https://github.com/maelys-dev/mcp-runtime/archive/refs/tags/vX.Y.Z.tar.gz"
-curl -fsSL "$url" | shasum -a 256      # paste both into Formula/mcp-runtime.rb
+scripts/update-tap-formula.sh          # defaults to the current VERSION's tag
+scripts/update-tap-formula.sh v1.2.3   # or bump to any already-pushed tag
 ```
+
+It downloads the exact archive URL the formula uses (retrying through transient
+`codeload.github.com` errors), computes its sha256, rewrites the two formula
+lines, and pushes — no manual copy-paste.
 
 Homebrew works on macOS and Linux, so the one tap covers both. This is a
 convenience layer on top of the release tarballs, not a replacement for them.
