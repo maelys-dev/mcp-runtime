@@ -38,6 +38,24 @@ The first milestone provides:
 It is deliberately not a shell-command wrapper. Provider executables are absolute,
 explicitly configured paths, launched without a shell and with a minimal environment.
 
+## Install
+
+On macOS or Linux, via the Homebrew tap:
+
+```sh
+brew install maelys-dev/tap/mcp-runtime
+```
+
+This builds from source and installs the `maelys-mcp` host, the static library
+`libmaelys_mcp.a`, and the public headers.
+
+Alternatively, download a prebuilt tarball from the
+[latest release](https://github.com/maelys-dev/mcp-runtime/releases/latest):
+each platform ships a `-static` archive (standalone, bundles jansson and
+uriparser) and a `-dynamic` one (links them from the system), with a `.sha256`
+and a build provenance attestation verifiable via `gh attestation verify`.
+Windows is not supported (the runtime is POSIX-only).
+
 ## Build and test
 
 Requirements: a C11 compiler, POSIX shell utilities, `make`, `pkg-config`, Jansson,
