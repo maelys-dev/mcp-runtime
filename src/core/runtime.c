@@ -493,15 +493,6 @@ json_t *maelys_mcp_runtime_dispatch(
     }
     if (!id) return NULL;
 
-    json_t *meta = json_is_object(params) ? json_object_get(params, "_meta") : NULL;
-    const char *modern_version = NULL;
-    if (meta || strcmp(method_name, "server/discover") == 0) {
-        json_t *metadata_error = validate_modern_metadata(id, params, &modern_version);
-        if (metadata_error) return metadata_error;
-    }
-    if (strcmp(method_name, "server/discover") == 0) return discover(runtime, id);
-
-    int modern = modern_version != NULL;
     char legacy_client_name[sizeof(channel->legacy_client_name)];
     char legacy_protocol_version[sizeof(channel->legacy_protocol_version)];
     pthread_mutex_lock(&channel->mutex);
@@ -511,6 +502,29 @@ json_t *maelys_mcp_runtime_dispatch(
     (void)snprintf(legacy_protocol_version, sizeof(legacy_protocol_version), "%s",
         channel->legacy_protocol_version);
     pthread_mutex_unlock(&channel->mutex);
+
+    /*
+     * `_meta` is a general MCP extension point (progress tokens, and other
+     * application-defined keys), not by itself a sign of protocol negotiation.
+     * Only treat a request as attempting 2026-07-28 per-request negotiation
+     * when `_meta` actually carries the protocol-version key — including on an
+     * already legacy-initialized channel, where that key can only mean an
+     * explicit (and here unsupported) attempt to renegotiate mid-session.
+     * Absent that key, `_meta` is opaque and passed through untouched.
+     * server/discover is the stateless discovery entry point and always
+     * requires full modern metadata, regardless of any prior legacy session.
+     */
+    json_t *meta = json_is_object(params) ? json_object_get(params, "_meta") : NULL;
+    int meta_requests_negotiation = json_is_object(meta) &&
+        json_object_get(meta, "io.modelcontextprotocol/protocolVersion") != NULL;
+    const char *modern_version = NULL;
+    if (meta_requests_negotiation || strcmp(method_name, "server/discover") == 0) {
+        json_t *metadata_error = validate_modern_metadata(id, params, &modern_version);
+        if (metadata_error) return metadata_error;
+    }
+    if (strcmp(method_name, "server/discover") == 0) return discover(runtime, id);
+
+    int modern = modern_version != NULL;
     if (!modern && !legacy_initialized) {
         return maelys_mcp_error_response(id, MCP_SERVER_NOT_INITIALIZED,
             "Server not initialized", NULL);

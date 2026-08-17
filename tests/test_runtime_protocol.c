@@ -226,6 +226,38 @@ static int test_legacy_version_negotiation(void) {
     return 0;
 }
 
+static int test_legacy_channel_ignores_opaque_request_meta(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "hermes", "version", "1");
+    json_t *response = dispatch(channel,
+        request(json_integer(1), "initialize", init));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = request(NULL, "notifications/initialized", json_object());
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+
+    /*
+     * A legacy-initialized channel making an ordinary request with an opaque,
+     * application-defined `_meta` (e.g. a progress token) must not be forced
+     * through modern protocolVersion/clientCapabilities validation: the
+     * protocol was already pinned by initialize. This reproduces the failure
+     * a legacy client (e.g. Hermes) hit on tools/list with such a `_meta`.
+     */
+    json_t *params = json_pack("{s:{s:s}}", "_meta", "progressToken", "abc");
+    response = dispatch(channel,
+        request(json_integer(2), "tools/list", params));
+    ASSERT_TRUE(error_code(response) != -32602);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
 static int test_output_schema_failure_is_fail_closed(void) {
     maelys_mcp_channel_t *channel = NULL;
     maelys_mcp_runtime_t *runtime = new_runtime(NULL);
@@ -268,6 +300,7 @@ int main(void) {
         {"modern metadata and version contract", test_modern_metadata_contract},
         {"legacy initialization lifecycle and unknown method", test_legacy_lifecycle_and_unknown_method},
         {"legacy protocol version negotiation", test_legacy_version_negotiation},
+        {"legacy channel ignores opaque request meta", test_legacy_channel_ignores_opaque_request_meta},
         {"invalid provider output is fail-closed", test_output_schema_failure_is_fail_closed}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
