@@ -86,7 +86,10 @@ static json_t *response_result(json_t *response) {
 
 int main(void) {
     test_context_t state = {0};
-    ASSERT_TRUE(strcmp(maelys_mcp_version_string(), "0.10.0") == 0);
+    char expected_version[32];
+    (void)snprintf(expected_version, sizeof(expected_version), "%u.%u.%u",
+        MAELYS_MCP_VERSION_MAJOR, MAELYS_MCP_VERSION_MINOR, MAELYS_MCP_VERSION_PATCH);
+    ASSERT_TRUE(strcmp(maelys_mcp_version_string(), expected_version) == 0);
     ASSERT_TRUE(maelys_mcp_abi_version() == MAELYS_MCP_ABI_VERSION);
     maelys_mcp_tool_effect_t parsed_effect = MAELYS_MCP_EFFECT_UNSPECIFIED;
     ASSERT_TRUE(maelys_mcp_tool_effect_parse("commit", &parsed_effect) == MAELYS_MCP_OK);

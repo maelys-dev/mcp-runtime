@@ -5,7 +5,7 @@ extern "C" {
 #endif
 
 #define MAELYS_MCP_VERSION_MAJOR 0u
-#define MAELYS_MCP_VERSION_MINOR 10u
+#define MAELYS_MCP_VERSION_MINOR 11u
 #define MAELYS_MCP_VERSION_PATCH 0u
 
 /*
