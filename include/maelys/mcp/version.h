@@ -4,6 +4,10 @@
 extern "C" {
 #endif
 
+/*
+ * Generated from VERSION by scripts/generate-version-header.sh. Do not edit
+ * MAJOR/MINOR/PATCH by hand — edit VERSION and regenerate.
+ */
 #define MAELYS_MCP_VERSION_MAJOR 0u
 #define MAELYS_MCP_VERSION_MINOR 12u
 #define MAELYS_MCP_VERSION_PATCH 0u

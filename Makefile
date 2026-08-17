@@ -69,7 +69,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
 -include $(DEPENDENCY_FILES)
 
-.PHONY: all clean test check check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
+.PHONY: all clean test check check-version-header check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
 	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
@@ -185,7 +185,10 @@ analyze:
 		$(ANALYZER) --analyze -o /dev/null $(CPPFLAGS) $(CFLAGS) $$source; \
 	done
 
-check: test audit
+check-version-header:
+	bash scripts/generate-version-header.sh --check
+
+check: check-version-header test audit
 
 check-sdks:
 	node --test sdk/typescript/test/*.test.js

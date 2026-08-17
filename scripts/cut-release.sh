@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # One-command release. From a clean, up-to-date main, this:
-#   1. bumps the two version sources together (VERSION file + version.h);
+#   1. writes VERSION — the single source of truth — and regenerates
+#      include/maelys/mcp/version.h from it (scripts/generate-version-header.sh);
 #   2. runs `make check` LOCALLY — the gate that catches a broken bump before
 #      it ever reaches CI or a tag;
 #   3. opens a release PR and waits for the required checks;
@@ -23,7 +24,6 @@ if ! [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
   echo "usage: $0 X.Y.Z  (SemVer, no prerelease)" >&2
   exit 1
 fi
-major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
 tag="v${ver}"
 
 # --- preconditions: clean, on main, up to date, tag free, notes written ---
@@ -37,14 +37,9 @@ fi
 grep -q "^## ${ver} " CHANGELOG.md \
   || { echo "CHANGELOG.md has no '## ${ver} - <date>' entry — write the notes first" >&2; exit 1; }
 
-# --- bump the two version sources together so they can never desync ---
+# --- VERSION is the single source of truth; regenerate version.h from it ---
 printf '%s\n' "$ver" > VERSION
-sed -i.bak -E \
-  -e "s/^#define MAELYS_MCP_VERSION_MAJOR .*/#define MAELYS_MCP_VERSION_MAJOR ${major}u/" \
-  -e "s/^#define MAELYS_MCP_VERSION_MINOR .*/#define MAELYS_MCP_VERSION_MINOR ${minor}u/" \
-  -e "s/^#define MAELYS_MCP_VERSION_PATCH .*/#define MAELYS_MCP_VERSION_PATCH ${patch}u/" \
-  include/maelys/mcp/version.h
-rm -f include/maelys/mcp/version.h.bak
+bash scripts/generate-version-header.sh
 
 # --- local gate: never tag something make check rejects ---
 echo "==> make check (local gate)"
