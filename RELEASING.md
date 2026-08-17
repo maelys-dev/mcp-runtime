@@ -13,19 +13,22 @@ From a clean, up-to-date `main`, write the `## X.Y.Z - <date>` entry in
 scripts/cut-release.sh X.Y.Z
 ```
 
-It bumps both version sources (`VERSION` and `include/maelys/mcp/version.h`)
-together, runs `make check` **locally** to reject a broken bump before it ever
-reaches CI, opens a release PR, waits for the required checks, merges it, and
-pushes the annotated `vX.Y.Z` tag. Then approve the `release` environment when
-the `publish` job requests it.
+`VERSION` is the single source of truth for the version; it writes that file and
+regenerates `include/maelys/mcp/version.h` from it
+(`scripts/generate-version-header.sh`) — nothing hand-edits both files. It then
+runs `make check` **locally** to reject a broken bump before it ever reaches CI,
+opens a release PR, waits for the required checks, merges it, and pushes the
+annotated `vX.Y.Z` tag. Then approve the `release` environment when the
+`publish` job requests it.
 
-The local `make check` gate matters: the version string is asserted against the
-`version.h` triple, so a bump that desyncs the two sources fails here, not after
-a tag is already public.
+`version.h` stays a normal committed header — so `#include`-ing it works from a
+plain checkout with no build step — but `make check-version-header` verifies it
+was produced by the generator from `VERSION`; any manual edit that lets the two
+drift fails the build immediately, not after a tag is already public.
 
 ### Manual equivalent
 
-1. Bump `VERSION` and the `MAJOR`/`MINOR`/`PATCH` macros in
+1. Bump `VERSION`, run `scripts/generate-version-header.sh` to regenerate
    `include/maelys/mcp/version.h`, plus `CHANGELOG.md`, on a PR merged to `main`
    after `CI` is green.
 2. `git tag -a vX.Y.Z -m "mcp-runtime X.Y.Z" <merge-commit> && git push origin vX.Y.Z`
