@@ -6,14 +6,30 @@ publishes without it.
 
 ## Cutting a release
 
-1. Update `VERSION` (a plain SemVer data file) and `CHANGELOG.md`, on a reviewed
-   PR merged to `main`. Wait for `CI` to be green on the merge commit.
-2. Tag the exact green commit and push:
-   ```sh
-   git tag -a vX.Y.Z -m "mcp-runtime X.Y.Z" <commit>
-   git push origin vX.Y.Z
-   ```
-3. Approve the `release` environment when the `publish` job requests it.
+From a clean, up-to-date `main`, write the `## X.Y.Z - <date>` entry in
+`CHANGELOG.md`, then run one command:
+
+```sh
+scripts/cut-release.sh X.Y.Z
+```
+
+It bumps both version sources (`VERSION` and `include/maelys/mcp/version.h`)
+together, runs `make check` **locally** to reject a broken bump before it ever
+reaches CI, opens a release PR, waits for the required checks, merges it, and
+pushes the annotated `vX.Y.Z` tag. Then approve the `release` environment when
+the `publish` job requests it.
+
+The local `make check` gate matters: the version string is asserted against the
+`version.h` triple, so a bump that desyncs the two sources fails here, not after
+a tag is already public.
+
+### Manual equivalent
+
+1. Bump `VERSION` and the `MAJOR`/`MINOR`/`PATCH` macros in
+   `include/maelys/mcp/version.h`, plus `CHANGELOG.md`, on a PR merged to `main`
+   after `CI` is green.
+2. `git tag -a vX.Y.Z -m "mcp-runtime X.Y.Z" <merge-commit> && git push origin vX.Y.Z`
+3. Approve the `release` environment.
 
 The tag triggers a matrix build (Linux x86_64/arm64, macOS arm64/x86_64), then a
 separate `publish` job attaches the artifacts to the GitHub Release. The build
