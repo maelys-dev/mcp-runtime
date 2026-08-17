@@ -95,6 +95,23 @@ This proves the artifact was built by this repository's workflow from a specific
 commit. It does not prove the artifact is free of vulnerabilities — provenance is
 integrity of the process, not of the source.
 
+## Homebrew tap
+
+Users install with `brew install maelys-dev/tap/mcp-runtime`. The formula lives
+in the separate [`maelys-dev/homebrew-tap`](https://github.com/maelys-dev/homebrew-tap)
+repo (`Formula/mcp-runtime.rb`) and builds from the release source tarball.
+
+After each release, update two lines of the formula — the `url` (new tag) and its
+`sha256`:
+
+```sh
+url="https://github.com/maelys-dev/mcp-runtime/archive/refs/tags/vX.Y.Z.tar.gz"
+curl -fsSL "$url" | shasum -a 256      # paste both into Formula/mcp-runtime.rb
+```
+
+Homebrew works on macOS and Linux, so the one tap covers both. This is a
+convenience layer on top of the release tarballs, not a replacement for them.
+
 ## Before the first binary release (one-time setup)
 
 - **Configure the `release` environment** (Settings → Environments) with a
