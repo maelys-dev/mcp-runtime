@@ -31,10 +31,13 @@ a tag is already public.
 2. `git tag -a vX.Y.Z -m "mcp-runtime X.Y.Z" <merge-commit> && git push origin vX.Y.Z`
 3. Approve the `release` environment.
 
-The tag triggers a matrix build (Linux x86_64/arm64, macOS arm64/x86_64), then a
+The tag triggers a matrix build (Linux x86_64/arm64, macOS arm64), then a
 separate `publish` job attaches the artifacts to the GitHub Release. The build
 job has no write access and no secrets; the publish job compiles nothing and only
 verifies checksums before uploading.
+
+Finally, update the Homebrew formula (see [Homebrew tap](#homebrew-tap) below) —
+two lines, so `brew install` serves the new version.
 
 ## Building the artifacts locally
 
@@ -117,9 +120,8 @@ convenience layer on top of the release tarballs, not a replacement for them.
 - **Configure the `release` environment** (Settings → Environments) with a
   required reviewer — otherwise the approval gate is a no-op — and enable branch
   protection on `main` plus restricted creation of `v*` tags.
-- The first tag will surface any per-platform build fixes; the cross-OS matrix is
-  not testable locally (macOS arm64 and Linux arm64 are verified; the x86_64
-  targets are exercised only on the first CI run).
+- All three targets (Linux x86_64/arm64, macOS arm64) built successfully in the
+  v0.11.0 release run. macOS Intel (x86_64) is intentionally not shipped.
 
 Workflow actions are already pinned to full SHA; update them via a dedicated PR
 by re-resolving the desired version tag.
