@@ -69,3 +69,8 @@ git push origin "$tag"
 echo "==> ${tag} pushed."
 echo "    The Release workflow is building; approve the 'publish' job when it"
 echo "    shows 'Review required' to attach the tarballs to the GitHub Release."
+
+# --- Homebrew tap: only needs the tag (builds from the source archive), so
+# it doesn't wait on the binary release workflow or its approval gate. ---
+echo "==> updating the Homebrew tap"
+bash scripts/update-tap-formula.sh "$tag"
