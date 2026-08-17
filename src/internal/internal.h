@@ -167,6 +167,7 @@ struct maelys_mcp_channel {
     int legacy_initialized;
     char legacy_client_name[128];
     char legacy_protocol_version[16];
+    json_t *legacy_capabilities;
     maelys_mcp_subscription_t *subscriptions;
     size_t subscription_count;
 };
@@ -177,6 +178,7 @@ typedef struct maelys_mcp_module_request {
     json_t *params;
     const char *protocol_version;
     const char *client_name;
+    json_t *legacy_capabilities;
     int modern;
     json_t **post_enqueue_subscription_id;
 } maelys_mcp_module_request_t;

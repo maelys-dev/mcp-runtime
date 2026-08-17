@@ -6,6 +6,7 @@
 
 typedef struct test_state {
     int saw_retry;
+    int saw_client_capabilities;
 } test_state_t;
 
 static maelys_mcp_result_t rich_call(
@@ -30,6 +31,16 @@ static maelys_mcp_result_t rich_call(
         return result->content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
     }
     if (strcmp(request->tool_name, "test.confirm") == 0) {
+        /*
+         * Wire-level check, not just mcp-runtime's internal gate: a real
+         * out-of-process provider only ever sees what travels over
+         * maelys-provider/3, so the fix must put the legacy-declared
+         * capability where the provider can actually read it.
+         */
+        if (json_is_object(request->client_capabilities) &&
+            json_is_object(json_object_get(request->client_capabilities, "elicitation"))) {
+            state->saw_client_capabilities = 1;
+        }
         if (!request->input_responses) {
             result->type = MAELYS_MCP_PROVIDER_RESULT_INPUT_REQUIRED;
             json_error_t parse_error;
@@ -230,10 +241,123 @@ static int test_modules_rich_content_and_mrtr(void) {
     return 0;
 }
 
+/*
+ * A legacy channel declares capabilities once, at initialize(), under the
+ * same top-level keys (elicitation, sampling, roots) modern per-request _meta
+ * carries. This must be enough to use input_required/MRTR under the client's
+ * own negotiated legacy revision, per the spec's compatibility matrix — not
+ * a blanket "legacy can never do MRTR" the way it used to be. A capability
+ * the client genuinely never declared must still be refused explicitly.
+ */
+static int test_legacy_mrtr_capability_negotiation(void) {
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "legacy-mrtr-test", .server_version = "1.0"
+    };
+    maelys_mcp_runtime_t *core = NULL;
+    ASSERT_TRUE(maelys_mcp_runtime_create(&config, &core) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
+
+    test_state_t state = {0};
+    json_t *schema = json_pack("{s:s,s:b}", "type", "object", "additionalProperties", 0);
+    maelys_mcp_tool_t tool = {.name = "test.confirm", .description = "MRTR",
+        .input_schema = schema, .effect = MAELYS_MCP_EFFECT_APPLY};
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "test", .version = "1", .tools = &tool, .tool_count = 1,
+        .call = rich_call, .context = &state
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    ASSERT_TRUE(maelys_mcp_provider_create(&provider_config, &provider) == MAELYS_MCP_OK);
+    json_decref(schema);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(core, provider, NULL) == MAELYS_MCP_OK);
+
+    /* Channel A: legacy, no elicitation declared. */
+    maelys_mcp_channel_t *channel_a = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel_a) == MAELYS_MCP_OK);
+    json_t *init_a = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "legacy-no-caps", "version", "1");
+    json_t *response = dispatch(channel_a, "initialize", init_a);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = json_pack("{s:s,s:s}", "jsonrpc", "2.0",
+        "method", "notifications/initialized");
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel_a, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+
+    /* Before MRTR is enabled, the call fails as an ordinary tool error. */
+    json_t *params = json_pack("{s:s,s:{}}", "name", "test.confirm", "arguments");
+    response = dispatch(channel_a, "tools/call", params);
+    ASSERT_TRUE(json_is_true(json_object_get(json_object_get(response, "result"), "isError")));
+    json_decref(response);
+
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
+
+    /* MRTR is enabled, but this legacy client never declared elicitation:
+     * refused explicitly, not silently allowed. */
+    params = json_pack("{s:s,s:{}}", "name", "test.confirm", "arguments");
+    response = dispatch(channel_a, "tools/call", params);
+    ASSERT_TRUE(json_integer_value(json_object_get(json_object_get(response, "error"), "code")) == -32021);
+    ASSERT_TRUE(json_is_object(json_object_get(json_object_get(json_object_get(response, "error"), "data"),
+        "requiredCapabilities")));
+    json_decref(response);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel_a) == MAELYS_MCP_OK);
+
+    /* Channel B: legacy, elicitation declared at initialize. */
+    maelys_mcp_channel_t *channel_b = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel_b) == MAELYS_MCP_OK);
+    json_t *init_b = json_pack("{s:s,s:{s:{}},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities", "elicitation",
+        "clientInfo", "name", "legacy-with-caps", "version", "1");
+    response = dispatch(channel_b, "initialize", init_b);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    initialized = json_pack("{s:s,s:s}", "jsonrpc", "2.0",
+        "method", "notifications/initialized");
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel_b, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+
+    params = json_pack("{s:s,s:{}}", "name", "test.confirm", "arguments");
+    response = dispatch(channel_b, "tools/call", params);
+    json_t *result = json_object_get(response, "result");
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "resultType")), "input_required") == 0);
+    ASSERT_TRUE(json_is_object(json_object_get(result, "inputRequests")));
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "requestState")), "state-1") == 0);
+    json_decref(response);
+    /* The declared capability actually reached the provider over the wire,
+     * not just mcp-runtime's own internal gate. */
+    ASSERT_TRUE(state.saw_client_capabilities == 1);
+
+    params = json_pack("{s:s,s:{},s:{s:{s:s}},s:s}",
+        "name", "test.confirm", "arguments",
+        "inputResponses", "confirmation", "action", "accept",
+        "requestState", "state-1");
+    response = dispatch(channel_b, "tools/call", params);
+    result = json_object_get(response, "result");
+    /*
+     * Legacy channels never carry resultType/server-identity _meta on a
+     * complete result — serialize_provider_result() gates that wire
+     * convention on request->modern, by design (see docs/architecture.md:
+     * "Modern final results carry resultType: 'complete', server identity
+     * metadata..."). A legacy complete result is just the bare content
+     * array, so assert on that instead of the modern-only envelope field.
+     */
+    ASSERT_TRUE(json_object_get(result, "resultType") == NULL);
+    ASSERT_TRUE(json_array_size(json_object_get(result, "content")) >= 1u);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(
+        json_array_get(json_object_get(result, "content"), 0), "text")), "confirmed") == 0);
+    ASSERT_TRUE(state.saw_retry == 1);
+    json_decref(response);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel_b) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(core) == MAELYS_MCP_OK);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"content block validation", test_content_validation},
-        {"module registry, rich content, and MRTR", test_modules_rich_content_and_mrtr}
+        {"module registry, rich content, and MRTR", test_modules_rich_content_and_mrtr},
+        {"legacy channel MRTR capability negotiation", test_legacy_mrtr_capability_negotiation}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }

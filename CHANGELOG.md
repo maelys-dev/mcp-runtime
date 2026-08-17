@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.2 - 2026-08-17
+
+- Legacy clients (`2024-11-05` through `2025-11-25`) can now use `input_required`/MRTR
+  (elicitation, sampling, roots) exactly like modern clients, provided they declared
+  the relevant capability once at `initialize` — the same top-level keys
+  (`elicitation`, `sampling`, `roots`) that modern clients declare per-request in
+  `_meta`. Previously every legacy channel was unconditionally denied with
+  `input_required requires the modern MCP protocol and MRTR module`, regardless of
+  what it had declared. Applies to both `tools/call` and `resources/read`. A legacy
+  channel that declared nothing keeps getting `-32021`/`requiredCapabilities`, same
+  as before.
+
 ## 0.12.1 - 2026-08-17
 
 - Fix a regression where any request carrying an opaque `_meta` object (for example
