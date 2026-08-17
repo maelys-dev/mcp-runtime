@@ -35,10 +35,10 @@ jobs:
       id-token: write       # OIDC, requis par l'attestation de provenance
       attestations: write   # écrit l'attestation — ce n'est PAS contents: write
     steps:
-      # TODO(sécurité) : épingler chaque action sur son SHA 40-hex complet
-      # avant merge. Un tag comme @v4 est mutable ; seul le SHA est immuable.
+      # Actions épinglées sur SHA 40-hex (immuable). Mettre à jour par une PR
+      # dédiée, en re-résolvant le SHA du tag de version voulu.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Vérifie que le tag correspond à VERSION
         shell: bash
@@ -67,12 +67,12 @@ jobs:
 
       # Lie cryptographiquement CHAQUE tarball à ce commit, ce workflow, ce runner.
       - name: Atteste la provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
         with:
           subject-path: 'dist/*.tar.gz'
 
       - name: Publie les artefacts internes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
           path: dist/
@@ -91,7 +91,7 @@ jobs:
     environment: release
     steps:
       - name: Récupère tous les artefacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: incoming
 
