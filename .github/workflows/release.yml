@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # Deps liées statiquement, construites depuis la source et vérifiées par SHA-256.
+  JANSSON_URL: https://github.com/akheron/jansson/releases/download/v2.14/jansson-2.14.tar.gz
+  JANSSON_SHA: 5798d010e41cf8d76b66236cfb2f2543c8d082181d16bc3085ab49538d4b9929
+  URIPARSER_URL: https://github.com/uriparser/uriparser/releases/download/uriparser-1.0.2/uriparser-1.0.2.tar.gz
+  URIPARSER_SHA: 963554c32d40fb6cba5644f1ba63e6dd7a182b2948bd71ee448c532f53b07f1e
+
 jobs:
   # ─── RÔLE « CONSTRUIT » : aucun droit d'écriture, aucun secret ───
   # Ce job exécute le Makefile. C'est le seul endroit où du code candidat
@@ -47,44 +54,79 @@ jobs:
           test "v${file_version}" = "${GITHUB_REF_NAME}" \
             || { echo "tag ${GITHUB_REF_NAME} != v${file_version} (fichier VERSION)"; exit 1; }
 
-      - name: Dépendances
+      - name: Chaîne d'outils + deps dynamiques
         shell: bash
         run: |
           set -euo pipefail
           if [ "${RUNNER_OS}" = "Linux" ]; then
             sudo apt-get update
-            sudo apt-get install -y libjansson-dev liburiparser-dev
+            sudo apt-get install -y build-essential cmake pkg-config \
+              libjansson-dev liburiparser-dev
           else
-            brew install jansson uriparser
+            brew install cmake jansson uriparser
             echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "${GITHUB_ENV}"
           fi
 
-      - name: Build
-        run: make all
-
-      - name: Vérifie le runtime
-        run: make check
-
-      - name: Empaquète (make install -> tarball)
+      - name: Build + empaquète les deux variantes
         id: package
         shell: bash
         run: |
           set -euo pipefail
           version="$(cat VERSION)"
-          name="mcp-runtime-${version}-${{ matrix.target }}"
-          rm -rf stage dist && mkdir -p stage dist
-          make install DESTDIR="${PWD}/stage" PREFIX=/usr/local
-          tar -czf "dist/${name}.tar.gz" -C stage .
-          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
-          echo "artifact=${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+          mkdir -p dist
 
-      # Lie cryptographiquement le tarball à CE commit, CE workflow, CE runner.
+          package() {   # $1 = étiquette de variante (dynamic|static)
+            local name="mcp-runtime-${version}-${{ matrix.target }}-$1"
+            rm -rf stage && mkdir -p stage
+            make install DESTDIR="${PWD}/stage" PREFIX=/usr/local
+            tar -czf "dist/${name}.tar.gz" -C stage .
+            ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          }
+
+          # ── Variante DYNAMIQUE : liée aux libs système (apt/brew) ──
+          make clean
+          make all
+          make check          # gate de correction, identique à la CI de branche
+          package dynamic
+
+          # ── Variante STATIQUE : jansson+uriparser depuis la source, liées .a ──
+          # libc/libSystem reste dynamique (fully-static impossible sur macOS) ;
+          # le binaire ne dépend plus que du système, pas des deps.
+          deps="${PWD}/.deps-static"
+          rm -rf "${deps}" srcdeps && mkdir -p srcdeps && cd srcdeps
+          curl -fsSL -o jansson.tar.gz "${JANSSON_URL}"
+          echo "${JANSSON_SHA}  jansson.tar.gz" | shasum -a 256 -c -
+          curl -fsSL -o uriparser.tar.gz "${URIPARSER_URL}"
+          echo "${URIPARSER_SHA}  uriparser.tar.gz" | shasum -a 256 -c -
+          tar xzf jansson.tar.gz && tar xzf uriparser.tar.gz
+          cmake -S jansson-2.14 -B jb -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DJANSSON_BUILD_SHARED_LIBS=OFF \
+            -DJANSSON_BUILD_DOCS=OFF -DJANSSON_WITHOUT_TESTS=ON \
+            -DJANSSON_EXAMPLES=OFF \
+            -DCMAKE_INSTALL_PREFIX="${deps}" -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build jb --target install
+          cmake -S uriparser-1.0.2 -B ub -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF -DURIPARSER_BUILD_DOCS=OFF \
+            -DURIPARSER_BUILD_TESTS=OFF -DURIPARSER_BUILD_TOOLS=OFF \
+            -DCMAKE_INSTALL_PREFIX="${deps}" -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build ub --target install
+          cd ..
+          make clean
+          make all \
+            MCP_DEP_CFLAGS="-I${deps}/include" \
+            MCP_DEP_LIBS="${deps}/lib/libjansson.a ${deps}/lib/liburiparser.a"
+          ./build/release/bin/maelys-mcp --help >/dev/null   # smoke : le binaire static tourne
+          package static
+
+          echo "Artefacts produits :"; ls -1 dist
+
+      # Lie cryptographiquement CHAQUE tarball à ce commit, ce workflow, ce runner.
       - name: Atteste la provenance
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: dist/${{ steps.package.outputs.artifact }}
+          subject-path: 'dist/*.tar.gz'
 
-      - name: Publie l'artefact interne
+      - name: Publie les artefacts internes
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
@@ -116,8 +158,7 @@ jobs:
           find incoming -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
             -exec cp {} dist/ \;
           ( cd dist && shasum -a 256 -c *.sha256 )
-          echo "Artefacts vérifiés :"
-          ls -1 dist
+          echo "Artefacts vérifiés :"; ls -1 dist
 
       - name: Crée la GitHub Release
         env:

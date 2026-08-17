@@ -10,10 +10,14 @@ ASAN_LINUX_IMAGE ?= maelys-mcp-runtime-asan:ubuntu24.04
 FUZZ_CC ?= clang
 MCP_CONFORMANCE_PACKAGE ?= @modelcontextprotocol/conformance@0.2.0-alpha.11
 
-CPPFLAGS += -Iinclude -I. -DMAELYS_MCP_VERSION='"$(VERSION)"' $(shell $(PKG_CONFIG) --cflags jansson liburiparser)
+# Dependency flags are overridable so a release can link jansson/uriparser
+# statically (pass the .a paths in MCP_DEP_LIBS) without touching the build.
+MCP_DEP_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags jansson liburiparser)
+MCP_DEP_LIBS ?= $(shell $(PKG_CONFIG) --libs jansson liburiparser)
+CPPFLAGS += -Iinclude -I. -DMAELYS_MCP_VERSION='"$(VERSION)"' $(MCP_DEP_CFLAGS)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread
-LDLIBS += $(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread
+LDLIBS += $(MCP_DEP_LIBS) -pthread
 
 BUILD_ROOT ?= build
 BUILD_PROFILE ?= release
@@ -36,7 +40,7 @@ NO_THREAD_BUILD := $(BUILD_ROOT)/no-thread
 NO_THREAD_BIN := $(NO_THREAD_BUILD)/test-channel-no-thread
 NO_THREAD_CFLAGS := -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -pthread
-NO_THREAD_LDLIBS := $(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread
+NO_THREAD_LDLIBS := $(MCP_DEP_LIBS) -pthread
 
 LIB_SOURCES := \
 	src/jsonrpc/core.c \
