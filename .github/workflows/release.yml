@@ -1,0 +1,119 @@
+name: Release
+
+# Déclenché par le tag annoté vX.Y.Z que tu pousses à la main.
+# Le tag EST ta cérémonie d'autorisation ; rien ne se publie sans lui.
+on:
+  push:
+    tags: ["v*"]
+
+# Défaut global : lecture seule, partout. Chaque job élève ce dont il a besoin.
+permissions:
+  contents: read
+
+jobs:
+  # ─── RÔLE « CONSTRUIT » : aucun droit d'écriture, aucun secret ───
+  # Ce job exécute le Makefile via scripts/package-release.sh — la même commande
+  # que tu peux lancer en local. C'est le seul endroit où du code candidat
+  # s'exécute, donc le seul où un RCE pourrait vivre ; il ne peut ni publier,
+  # ni pousser, ni toucher à un token d'écriture.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-14
+            target: macos-arm64
+          - os: macos-13
+            target: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read        # ne peut pas modifier le dépôt
+      id-token: write       # OIDC, requis par l'attestation de provenance
+      attestations: write   # écrit l'attestation — ce n'est PAS contents: write
+    steps:
+      # Actions épinglées sur SHA 40-hex (immuable). Mettre à jour par une PR
+      # dédiée, en re-résolvant le SHA du tag de version voulu.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Vérifie que le tag correspond à VERSION
+        shell: bash
+        run: |
+          set -euo pipefail
+          file_version="$(cat VERSION)"
+          test "v${file_version}" = "${GITHUB_REF_NAME}" \
+            || { echo "tag ${GITHUB_REF_NAME} != v${file_version} (fichier VERSION)"; exit 1; }
+
+      - name: Chaîne d'outils + deps dynamiques
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential cmake pkg-config curl \
+              ca-certificates libjansson-dev liburiparser-dev
+          else
+            brew install cmake jansson uriparser
+            echo "PKG_CONFIG_PATH=$(brew --prefix)/lib/pkgconfig" >> "${GITHUB_ENV}"
+          fi
+
+      # Une seule source de vérité : le même script en local et en CI.
+      - name: Build + empaquète (dynamic + static)
+        run: bash scripts/package-release.sh ${{ matrix.target }}
+
+      # Lie cryptographiquement CHAQUE tarball à ce commit, ce workflow, ce runner.
+      - name: Atteste la provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-path: 'dist/*.tar.gz'
+
+      - name: Publie les artefacts internes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # ─── RÔLES « AUTORISE » + « PUBLIE » : seul job avec contents: write ───
+  # Il ne compile RIEN. Il télécharge des tarballs déjà construits, vérifie
+  # leurs checksums (lecture d'octets, aucune exécution de code candidat),
+  # et les attache à la Release. L'environnement `release` suspend ce job
+  # jusqu'à ton approbation explicite.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # LE seul endroit du workflow
+    environment: release
+    steps:
+      - name: Récupère tous les artefacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: incoming
+
+      - name: Rassemble et vérifie les checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find incoming -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+            -exec cp {} dist/ \;
+          ( cd dist && sha256sum -c *.sha256 )
+          echo "Artefacts vérifiés :"; ls -1 dist
+
+      - name: Crée la GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "mcp-runtime ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --verify-tag \
+            dist/*

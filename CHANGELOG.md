@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0 - 2026-08-17
+
+- Add a tag-triggered binary release pipeline (`.github/workflows/release.yml`)
+  with separated build and publish roles: the privileged publish job runs no
+  candidate code, only verifies checksums and attaches artifacts.
+- Ship per-platform static and dynamic tarballs (Linux x86_64/arm64, macOS
+  arm64/x86_64) via `scripts/package-release.sh`, each with a SHA-256 checksum
+  and a build provenance attestation.
+- Move `VERSION` into a data file read by both `make` and the release workflow.
+
 ## 0.10.0 - 2026-08-15
 
 - Introduce opaque `maelys_mcp_channel_t` handles. Each channel owns its ordered

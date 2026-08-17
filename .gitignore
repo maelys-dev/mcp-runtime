@@ -5,3 +5,7 @@
 .DS_Store
 __pycache__/
 *.pyc
+/dist/
+/.deps-static/
+/srcdeps/
+/stage/
