@@ -81,10 +81,12 @@ integrity of the process, not of the source.
 
 ## Before the first binary release (one-time setup)
 
-- **Pin actions to full SHA** in `release.yml` (currently `@v4`/`@v1`, marked
-  TODO). Only a 40-hex SHA is immutable.
 - **Configure the `release` environment** (Settings → Environments) with a
   required reviewer — otherwise the approval gate is a no-op — and enable branch
   protection on `main` plus restricted creation of `v*` tags.
 - The first tag will surface any per-platform build fixes; the cross-OS matrix is
-  not testable locally.
+  not testable locally (macOS arm64 and Linux arm64 are verified; the x86_64
+  targets are exercised only on the first CI run).
+
+Workflow actions are already pinned to full SHA; update them via a dedicated PR
+by re-resolving the desired version tag.
