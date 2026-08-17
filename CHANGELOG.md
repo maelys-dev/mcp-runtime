@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.12.0 - 2026-08-17
+
+- Negotiate the legacy `initialize` handshake instead of requiring an exact match on
+  `2025-11-25`. The runtime now accepts `2024-11-05`, `2025-03-26`, `2025-06-18` and
+  `2025-11-25`, and echoes the client's requested version back in the result, so
+  clients (such as Codex) that announce an older dated revision are no longer rejected
+  with `-32602`. `2026-07-28` support (stateless, via per-request `_meta`) is unchanged.
+
 ## 0.11.0 - 2026-08-17
 
 - Add a tag-triggered binary release pipeline (`.github/workflows/release.yml`)

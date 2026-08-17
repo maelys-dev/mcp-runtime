@@ -192,6 +192,40 @@ static maelys_mcp_result_t invalid_output_call(
     return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
+static int test_legacy_version_negotiation(void) {
+    static const char *const versions[] = {
+        "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25",
+    };
+    for (size_t index = 0; index < sizeof(versions) / sizeof(versions[0]); ++index) {
+        maelys_mcp_channel_t *channel = NULL;
+        maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+        ASSERT_TRUE(runtime != NULL);
+        json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+            "protocolVersion", versions[index], "capabilities",
+            "clientInfo", "name", "codex", "version", "1");
+        json_t *response = dispatch(channel,
+            request(json_integer(1), "initialize", init));
+        json_t *result = json_object_get(response, "result");
+        json_t *negotiated = json_is_object(result) ?
+            json_object_get(result, "protocolVersion") : NULL;
+        /* MCP negotiation: a supported requested version is echoed back. */
+        ASSERT_TRUE(json_is_string(negotiated) &&
+            strcmp(json_string_value(negotiated), versions[index]) == 0);
+        json_decref(response);
+        ASSERT_TRUE(cleanup(runtime, channel));
+    }
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    json_t *bad = json_pack("{s:s}", "protocolVersion", "2020-01-01");
+    json_t *response = dispatch(channel,
+        request(json_integer(1), "initialize", bad));
+    ASSERT_TRUE(error_code(response) == -32602);
+    json_decref(response);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
 static int test_output_schema_failure_is_fail_closed(void) {
     maelys_mcp_channel_t *channel = NULL;
     maelys_mcp_runtime_t *runtime = new_runtime(NULL);
@@ -233,6 +267,7 @@ int main(void) {
         {"notifications do not produce responses", test_notifications_have_no_response_or_side_effect},
         {"modern metadata and version contract", test_modern_metadata_contract},
         {"legacy initialization lifecycle and unknown method", test_legacy_lifecycle_and_unknown_method},
+        {"legacy protocol version negotiation", test_legacy_version_negotiation},
         {"invalid provider output is fail-closed", test_output_schema_failure_is_fail_closed}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
