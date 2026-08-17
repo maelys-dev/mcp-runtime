@@ -20,6 +20,33 @@ separate `publish` job attaches the artifacts to the GitHub Release. The build
 job has no write access and no secrets; the publish job compiles nothing and only
 verifies checksums before uploading.
 
+## Building the artifacts locally
+
+The CI workflow and a local build share one script — a single source of truth:
+
+```sh
+scripts/package-release.sh            # target auto-detected from uname
+scripts/package-release.sh linux-arm64  # or force a label
+```
+
+It produces both tarballs (+ `.sha256`) for the current platform in `dist/`,
+building jansson/uriparser from pinned, checksum-verified source for the static
+variant. It assumes a C toolchain, `make`, `cmake`, `curl`, `pkg-config` and the
+jansson/uriparser dev packages are installed.
+
+To reproduce a **Linux** build from macOS (or to check a clean environment), run
+it in the pinned Ubuntu image — the container works on a copy, never the host
+tree:
+
+```sh
+docker run --rm --platform linux/arm64 -v "$PWD:/source:ro" ubuntu:24.04 bash -c '
+  apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config curl ca-certificates \
+    libjansson-dev liburiparser-dev
+  cp -a /source /work && cd /work && rm -rf build dist .deps-static srcdeps stage
+  scripts/package-release.sh'
+```
+
 ## Artifacts
 
 Each platform ships **two tarballs**, both carrying a `.sha256` and a build
