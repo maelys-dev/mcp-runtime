@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.1 - 2026-08-17
+
+- Fix a regression where any request carrying an opaque `_meta` object (for example
+  a progress token) on an already legacy-initialized channel was incorrectly forced
+  through modern `protocolVersion`/`clientCapabilities` validation and rejected with
+  `-32602`. Only `_meta` that actually carries the
+  `io.modelcontextprotocol/protocolVersion` key is now treated as a negotiation
+  attempt — including on a legacy-initialized channel, where it is correctly
+  rejected as an unsupported mid-session renegotiation. Fixes a startup failure
+  observed with legacy MCP clients (e.g. Hermes) sending per-request metadata.
+
 ## 0.12.0 - 2026-08-17
 
 - Negotiate the legacy `initialize` handshake instead of requiring an exact match on
