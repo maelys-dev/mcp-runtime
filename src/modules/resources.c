@@ -160,11 +160,19 @@ static int provider_has_templates(const maelys_mcp_provider_t *provider) {
     return provider && provider->resource_template_count && provider->read_resource;
 }
 
+/*
+ * Unlike tools.c's call_tool, resources/read has never validated which
+ * specific capability (roots/elicitation/sampling) a client declared before
+ * honoring input_required here - only whether MRTR is enabled at all. That
+ * pre-existing, modern-and-legacy-alike simplification is out of scope for
+ * this fix. What was legacy-specific (and wrong) was gating input_required
+ * on request->modern unconditionally, denying it to every legacy channel
+ * regardless of what it declared at initialize - dropped below.
+ */
 static int valid_input_required(
     maelys_mcp_runtime_t *runtime,
-    const maelys_mcp_module_request_t *request,
     const maelys_mcp_resource_result_t *result) {
-    return request->modern && maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_MRTR) &&
+    return maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_MRTR) &&
         ((json_is_object(result->input_requests) && json_object_size(result->input_requests)) ||
          (json_is_string(result->request_state) &&
           !maelys_mcp_json_string_has_nul(result->request_state)));
@@ -177,7 +185,7 @@ static json_t *serialize_read_result(
     json_t *result = json_object();
     if (!result) goto failed;
     if (provider_result->type == MAELYS_MCP_RESOURCE_RESULT_INPUT_REQUIRED) {
-        if (!valid_input_required(runtime, request, provider_result)) goto failed;
+        if (!valid_input_required(runtime, provider_result)) goto failed;
         if (provider_result->input_requests && json_object_set(result,
             "inputRequests", provider_result->input_requests) != 0) goto failed;
         if (provider_result->request_state && json_object_set(result,
@@ -235,13 +243,24 @@ static json_t *read_resource(
         return maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
             "Policy denied", NULL);
     }
+    /*
+     * Same era-aware source as tools.c's call_tool: modern clients declare
+     * capabilities per-request in _meta, legacy clients declare them once at
+     * initialize and mcp-runtime snapshots that onto every request on the
+     * channel. Resolve to whichever the request's era actually carries so a
+     * real out-of-process provider can see what the client declared,
+     * regardless of protocol era.
+     */
     json_t *meta = json_object_get(request->params, "_meta");
+    json_t *client_capabilities = request->modern ?
+        (json_is_object(meta) ?
+            json_object_get(meta, "io.modelcontextprotocol/clientCapabilities") : NULL) :
+        request->legacy_capabilities;
     maelys_mcp_resource_request_t provider_request = {
         .uri = canonical,
         .input_responses = input_responses,
         .request_state = request_state,
-        .client_capabilities = json_is_object(meta) ?
-            json_object_get(meta, "io.modelcontextprotocol/clientCapabilities") : NULL
+        .client_capabilities = client_capabilities
     };
     maelys_mcp_provider_t *provider = exact_provider(runtime, canonical);
     maelys_mcp_resource_result_t provider_result;

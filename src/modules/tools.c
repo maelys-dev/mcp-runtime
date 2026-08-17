@@ -187,14 +187,13 @@ static maelys_mcp_result_t validate_provider_result(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_owned_tool_t *tool,
     const maelys_mcp_provider_result_t *result,
-    int modern,
     json_t *client_capabilities,
     json_t **out_required_capabilities,
     char **out_error) {
     if (result->type == MAELYS_MCP_PROVIDER_RESULT_INPUT_REQUIRED) {
-        if (!modern || !maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_MRTR)) {
+        if (!maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_MRTR)) {
             if (out_error) *out_error = maelys_mcp_strdup(
-                "input_required requires the modern MCP protocol and MRTR module");
+                "input_required requires the MRTR module");
             return MAELYS_MCP_ERR_PROTOCOL;
         }
         if ((!result->input_requests || json_object_size(result->input_requests) == 0u) &&
@@ -298,9 +297,18 @@ static json_t *call_tool(
         json_object_get(params, "inputResponses") : NULL;
     json_t *request_state = json_is_object(params) ?
         json_object_get(params, "requestState") : NULL;
+    /*
+     * Capability declaration is per-era, not just per-request: modern clients
+     * declare it in _meta on every request, legacy clients declare it once at
+     * initialize() and it is snapshotted onto the channel. Both use the same
+     * top-level keys (elicitation, sampling, roots), so validate_input_requests
+     * needs no era knowledge — only the right source for this call.
+     */
     json_t *meta = json_is_object(params) ? json_object_get(params, "_meta") : NULL;
-    json_t *client_capabilities = json_is_object(meta) ?
-        json_object_get(meta, "io.modelcontextprotocol/clientCapabilities") : NULL;
+    json_t *client_capabilities = request->modern ?
+        (json_is_object(meta) ?
+            json_object_get(meta, "io.modelcontextprotocol/clientCapabilities") : NULL) :
+        request->legacy_capabilities;
     int invalid_input_responses = 0;
     if (json_is_object(input_responses)) {
         const char *response_key;
@@ -319,8 +327,8 @@ static json_t *call_tool(
         (request_state && (!json_is_string(request_state) ||
             json_string_length(request_state) == 0u ||
             maelys_mcp_json_string_has_nul(request_state))) ||
-        ((!request->modern || !maelys_mcp_runtime_module_enabled(
-            runtime, MAELYS_MCP_MODULE_MRTR)) && (input_responses || request_state))) {
+        (!maelys_mcp_runtime_module_enabled(runtime, MAELYS_MCP_MODULE_MRTR) &&
+            (input_responses || request_state))) {
         return maelys_mcp_error_response(request->id, JSONRPC_INVALID_PARAMS,
             "Invalid tool call", NULL);
     }
@@ -366,7 +374,7 @@ static json_t *call_tool(
     json_t *required_capabilities = NULL;
     if (status == MAELYS_MCP_OK) {
         status = validate_provider_result(runtime, tool, &provider_result,
-            request->modern, client_capabilities, &required_capabilities, &error);
+            client_capabilities, &required_capabilities, &error);
     }
     audit(runtime, request, tool, status);
     json_t *response;

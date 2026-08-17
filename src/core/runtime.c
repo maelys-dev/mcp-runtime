@@ -368,6 +368,19 @@ static json_t *initialize(
     }
     (void)snprintf(channel->legacy_protocol_version,
         sizeof(channel->legacy_protocol_version), "%s", json_string_value(version));
+    /*
+     * Legacy revisions declare client capabilities once, here, under the same
+     * top-level keys (elicitation, sampling, roots) that modern per-request
+     * _meta.clientCapabilities carries. Storing this lets a legacy channel use
+     * input_required/MRTR under its own negotiated revision, per the spec's
+     * compatibility matrix ("Legacy | Dual-era: the server ... serves the
+     * client according to the negotiated legacy revision") instead of being
+     * unconditionally denied for not being modern.
+     */
+    json_t *capabilities = json_object_get(params, "capabilities");
+    if (json_is_object(capabilities)) {
+        channel->legacy_capabilities = json_incref(capabilities);
+    }
     json_t *client = json_object_get(params, "clientInfo");
     json_t *name = json_is_object(client) ? json_object_get(client, "name") : NULL;
     (void)snprintf(channel->legacy_client_name, sizeof(channel->legacy_client_name),
@@ -501,6 +514,16 @@ json_t *maelys_mcp_runtime_dispatch(
         channel->legacy_client_name);
     (void)snprintf(legacy_protocol_version, sizeof(legacy_protocol_version), "%s",
         channel->legacy_protocol_version);
+    /*
+     * Borrowed, not owned: this channel field is written once (initialize())
+     * and freed only at channel_destroy(), which waits for every in-flight
+     * operation on this channel to drain first. Reading the pointer value
+     * under the channel mutex is enough to make the read itself race-free;
+     * the object's lifetime for the remainder of this synchronous dispatch is
+     * already guaranteed by the operations_inflight count channel_handle()
+     * incremented before calling here.
+     */
+    json_t *legacy_capabilities = channel->legacy_capabilities;
     pthread_mutex_unlock(&channel->mutex);
 
     /*
@@ -535,6 +558,7 @@ json_t *maelys_mcp_runtime_dispatch(
         .params = params,
         .protocol_version = modern ? modern_version : legacy_protocol_version,
         .client_name = modern ? client_name_from_params(params) : legacy_client_name,
+        .legacy_capabilities = legacy_capabilities,
         .modern = modern,
         .post_enqueue_subscription_id = out_post_enqueue_subscription_id
     };

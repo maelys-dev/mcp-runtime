@@ -6,6 +6,7 @@
 
 typedef struct resource_state {
     int reads;
+    int saw_client_capabilities;
 } resource_state_t;
 
 static maelys_mcp_result_t read_resource(
@@ -23,6 +24,29 @@ static maelys_mcp_result_t read_resource(
     if (strncmp(request->uri, "hermes://repository/assets/", 27u) == 0) {
         result->contents = json_pack("[{s:s,s:s,s:s}]",
             "uri", request->uri, "mimeType", "application/octet-stream", "blob", "aGVsbG8=");
+        return result->contents ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+    }
+    if (strcmp(request->uri, "hermes://repository/gated.mdx") == 0) {
+        /*
+         * Wire-level check, not just mcp-runtime's internal gate: a real
+         * out-of-process provider only ever sees what travels over
+         * maelys-provider/3, so the fix must put the legacy-declared
+         * capability where the provider can actually read it.
+         */
+        if (json_is_object(request->client_capabilities) &&
+            json_is_object(json_object_get(request->client_capabilities, "roots"))) {
+            state->saw_client_capabilities = 1;
+        }
+        if (!request->input_responses) {
+            result->type = MAELYS_MCP_RESOURCE_RESULT_INPUT_REQUIRED;
+            result->input_requests = json_pack("{s:{s:s,s:{}}}",
+                "hermes_roots", "method", "roots/list", "params");
+            result->request_state = json_string("state-1");
+            return result->input_requests && result->request_state ?
+                MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+        }
+        result->contents = json_pack("[{s:s,s:s,s:s}]",
+            "uri", request->uri, "mimeType", "text/markdown", "text", "# Gated");
         return result->contents ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
     }
     if (out_error) *out_error = strdup("resource not found");
@@ -159,6 +183,73 @@ static int test_resource_module(void) {
     return 0;
 }
 
+static int test_legacy_resource_mrtr_capability_negotiation(void) {
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "resources", .server_version = "0.4.0"
+    };
+    maelys_mcp_runtime_t *runtime = NULL;
+    ASSERT_TRUE(maelys_mcp_runtime_create(&config, &runtime) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime,
+        MAELYS_MCP_MODULE_RESOURCES) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime,
+        MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
+    resource_state_t state = {0};
+    maelys_mcp_provider_t *value = provider(&state);
+    ASSERT_TRUE(value != NULL);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, value, NULL) == MAELYS_MCP_OK);
+
+    /* Legacy channel, elicitation/roots declared at initialize. */
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
+    json_t *init = json_pack("{s:s,s:{s:{}},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities", "roots",
+        "clientInfo", "name", "legacy-resource-reader", "version", "1");
+    json_t *response = dispatch(channel, "initialize", init);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = json_pack("{s:s,s:s}", "jsonrpc", "2.0",
+        "method", "notifications/initialized");
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+
+    json_t *params = json_pack("{s:s}", "uri", "hermes://repository/gated.mdx");
+    response = dispatch(channel, "resources/read", params);
+    json_t *result = json_object_get(response, "result");
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "resultType")),
+        "input_required") == 0);
+    json_t *hermes_roots = json_object_get(json_object_get(result, "inputRequests"),
+        "hermes_roots");
+    ASSERT_TRUE(json_is_object(hermes_roots));
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(hermes_roots, "method")),
+        "roots/list") == 0);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "requestState")),
+        "state-1") == 0);
+    json_decref(response);
+    /* The declared capability actually reached the provider over the wire. */
+    ASSERT_TRUE(state.saw_client_capabilities == 1);
+
+    params = json_pack("{s:s,s:{s:{s:[]}},s:s}",
+        "uri", "hermes://repository/gated.mdx",
+        "inputResponses", "hermes_roots", "roots",
+        "requestState", "state-1");
+    response = dispatch(channel, "resources/read", params);
+    result = json_object_get(response, "result");
+    /*
+     * Legacy channels never carry resultType/server-identity _meta on a
+     * complete result - that wire convention is gated on request->modern by
+     * design (see docs/architecture.md). A legacy complete result is just
+     * the bare contents array.
+     */
+    ASSERT_TRUE(json_object_get(result, "resultType") == NULL);
+    json_t *content = json_array_get(json_object_get(result, "contents"), 0);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(content, "text")), "# Gated") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
 static int test_resource_content_validation(void) {
     char *error = NULL;
     json_t *valid = json_pack("[{s:s,s:s,s:s}]",
@@ -179,6 +270,8 @@ int main(void) {
     static const maelys_test_case_t tests[] = {
         {"opaque URI facade and templates", test_uri_facade},
         {"resources list, templates and read", test_resource_module},
+        {"legacy channel resources/read MRTR capability negotiation",
+            test_legacy_resource_mrtr_capability_negotiation},
         {"resource content validation", test_resource_content_validation}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));

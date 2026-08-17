@@ -426,6 +426,7 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
         maelys_mcp_subscription_clear(&channel->subscriptions[index]);
     }
     free(channel->subscriptions);
+    if (channel->legacy_capabilities) json_decref(channel->legacy_capabilities);
     pthread_cond_destroy(&channel->idle);
     pthread_mutex_destroy(&channel->mutex);
     free(channel);
