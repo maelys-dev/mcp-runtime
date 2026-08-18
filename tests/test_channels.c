@@ -985,6 +985,199 @@ static int test_zero_channel_event_and_argument_contracts(void) {
     return 0;
 }
 
+/*
+ * The steady state an HTTP transport produces, which no test above covers.
+ *
+ * Each pairwise interaction is already exercised: fanout versus close,
+ * fanout versus destroy, concurrent activation, concurrent creation. What
+ * has never run is the combination - many channels dispatching against one
+ * runtime and one in-process provider, while fanout targets them and other
+ * channels are created and destroyed underneath. That is exactly what a
+ * channel-per-connection HTTP transport does on every request, and the
+ * in-process provider call path has no lock of its own (unlike an
+ * out-of-process one, serialised by exchange_mutex), so concurrent entry
+ * into a provider's call function is itself newly exercised here.
+ *
+ * Backpressure and empty-registry outcomes are tolerated deliberately: with
+ * a bounded outbox, a fanout thread running flat out and channels churning,
+ * a close legitimately times out and a fanout legitimately finds no live
+ * channel. Asserting otherwise would make this flaky. The strict assertions
+ * are that no operation returns a status outside those, and that real work
+ * happened; race detection is TSan's job, which is why this belongs in
+ * `make tsan` as much as in `make check`.
+ */
+typedef struct churn_context {
+    maelys_mcp_runtime_t *runtime;
+    int iterations;
+    atomic_int dispatched;
+    atomic_int unexpected;
+} churn_context_t;
+
+typedef struct churn_event_context {
+    maelys_mcp_provider_t *provider;
+    atomic_int delivered;
+    atomic_int unexpected;
+    atomic_int stop;
+} churn_event_context_t;
+
+static maelys_mcp_result_t churn_call(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    (void)context; (void)request; (void)out_error;
+    out_result->type = MAELYS_MCP_PROVIDER_RESULT_COMPLETE;
+    out_result->structured_content = json_pack("{s:b}", "ok", 1);
+    return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+}
+
+static json_t *churn_call_request(json_int_t id) {
+    return json_pack("{s:s,s:I,s:s,s:{s:s,s:{},s:o}}",
+        "jsonrpc", "2.0", "id", id, "method", "tools/call",
+        "params", "name", "churn.noop", "arguments", "_meta", modern_meta());
+}
+
+/* Only these can arise once a bounded outbox meets a saturating fanout. */
+static int churn_tolerated(maelys_mcp_result_t status) {
+    return status == MAELYS_MCP_OK || status == MAELYS_MCP_ERR_CLOSED ||
+        status == MAELYS_MCP_ERR_TIMEOUT || status == MAELYS_MCP_ERR_STATE;
+}
+
+/* Unlike emit_many_events, this tolerates NOT_FOUND: the workers destroy and
+ * recreate channels constantly, so there are instants with no live channel at
+ * all, which snapshot_channels reports as NOT_FOUND. That is the fanout
+ * equivalent of an HTTP server between requests, not a failure. It runs until
+ * told to stop, so it spans exactly the workers' lifetime. */
+static void *churn_events(void *opaque) {
+    churn_event_context_t *context = opaque;
+    maelys_mcp_provider_event_t event = {
+        .kind = MAELYS_MCP_PROVIDER_EVENT_RESOURCE_UPDATED,
+        .resource_uri = "test://fanout/value"
+    };
+    while (!atomic_load(&context->stop)) {
+        maelys_mcp_result_t status = maelys_mcp_provider_emit_event(
+            context->provider, &event);
+        if (status == MAELYS_MCP_OK) {
+            atomic_fetch_add(&context->delivered, 1);
+        } else if (status != MAELYS_MCP_ERR_NOT_FOUND &&
+                   status != MAELYS_MCP_ERR_CLOSED &&
+                   status != MAELYS_MCP_ERR_TIMEOUT) {
+            atomic_fetch_add(&context->unexpected, 1);
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* new_channel hardcodes a two-second close timeout. This test deliberately
+ * abandons an outbox the fanout thread keeps filling, so a close that does
+ * time out has to be cheap rather than dominate the run. */
+static maelys_mcp_channel_t *churn_channel(maelys_mcp_runtime_t *runtime) {
+    maelys_mcp_channel_config_t config = {
+        .max_messages = 32u,
+        .max_bytes = 1024u * 1024u,
+        .response_burst = 8u,
+        .admission_timeout_ms = 100u,
+        .close_timeout_ms = 100u
+    };
+    maelys_mcp_channel_t *channel = NULL;
+    return maelys_mcp_channel_create(runtime, &config, &channel) == MAELYS_MCP_OK ?
+        channel : NULL;
+}
+
+static void *churn_worker(void *opaque) {
+    churn_context_t *context = opaque;
+    for (int index = 0; index < context->iterations; ++index) {
+        maelys_mcp_channel_t *channel = churn_channel(context->runtime);
+        if (!channel) {
+            atomic_fetch_add(&context->unexpected, 1);
+            return NULL;
+        }
+        /* Subscribe, so fanout genuinely targets this channel while it is
+         * dispatching rather than skipping it. */
+        maelys_mcp_result_t status = handle(channel,
+            listen_request(json_string("churn"), "test://fanout"));
+        if (!churn_tolerated(status)) atomic_fetch_add(&context->unexpected, 1);
+
+        status = handle(channel, churn_call_request((json_int_t)index + 1));
+        if (!churn_tolerated(status)) atomic_fetch_add(&context->unexpected, 1);
+        if (status == MAELYS_MCP_OK) atomic_fetch_add(&context->dispatched, 1);
+
+        /* Drain the listen ack, the call response and whatever fanout landed,
+         * so close usually has nothing left to wait for. Bounded, because the
+         * fanout thread keeps producing for as long as it runs. */
+        for (int drained = 0; drained < 64; ++drained) {
+            json_t *message = next_message(channel, 20u);
+            if (!message) break;
+            json_decref(message);
+        }
+        /* A timeout is the documented outcome when the outbox still holds
+         * messages no consumer will take: channel_destroy aborts and consumes
+         * ownership regardless. Against a saturating fanout that is a
+         * legitimate race, not a defect. */
+        maelys_mcp_result_t destroyed = maelys_mcp_channel_destroy(channel);
+        if (destroyed != MAELYS_MCP_OK && destroyed != MAELYS_MCP_ERR_TIMEOUT) {
+            atomic_fetch_add(&context->unexpected, 1);
+        }
+    }
+    return NULL;
+}
+
+static int test_concurrent_channels_dispatch_under_fanout(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+
+    maelys_mcp_tool_t tool = {
+        .name = "churn.noop",
+        .title = "No-op",
+        .description = "Returns a constant so the dispatch path reaches a provider.",
+        .effect = MAELYS_MCP_EFFECT_READ
+    };
+    tool.input_schema = json_pack("{s:s}", "type", "object");
+    ASSERT_TRUE(tool.input_schema != NULL);
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "churn-provider", .version = "1",
+        .tools = &tool, .tool_count = 1,
+        .call = churn_call
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    maelys_mcp_result_t created = maelys_mcp_provider_create(&provider_config, &provider);
+    json_decref(tool.input_schema);
+    ASSERT_TRUE(created == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) == MAELYS_MCP_OK);
+
+    enum { WORKERS = 6, ITERATIONS = 25 };
+    churn_context_t context = {.runtime = runtime, .iterations = ITERATIONS};
+    atomic_init(&context.dispatched, 0);
+    atomic_init(&context.unexpected, 0);
+    churn_event_context_t events = {.provider = provider};
+    atomic_init(&events.delivered, 0);
+    atomic_init(&events.unexpected, 0);
+    atomic_init(&events.stop, 0);
+
+    pthread_t workers[WORKERS];
+    pthread_t event_thread;
+    ASSERT_TRUE(pthread_create(&event_thread, NULL, churn_events, &events) == 0);
+    for (size_t index = 0; index < WORKERS; ++index) {
+        ASSERT_TRUE(pthread_create(&workers[index], NULL, churn_worker, &context) == 0);
+    }
+    for (size_t index = 0; index < WORKERS; ++index) {
+        ASSERT_TRUE(pthread_join(workers[index], NULL) == 0);
+    }
+    atomic_store(&events.stop, 1);
+    ASSERT_TRUE(pthread_join(event_thread, NULL) == 0);
+
+    ASSERT_TRUE(atomic_load(&context.unexpected) == 0);
+    ASSERT_TRUE(atomic_load(&events.unexpected) == 0);
+    /* Guards against a vacuous pass: if every channel had faulted at once, or
+     * fanout had never reached a live channel, nothing would be proven. */
+    ASSERT_TRUE(atomic_load(&context.dispatched) > (WORKERS * ITERATIONS) / 2);
+    ASSERT_TRUE(atomic_load(&events.delivered) > 0);
+
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"same JSON-RPC id is isolated with exact fanout",
@@ -1013,7 +1206,9 @@ int main(void) {
         {"destroy during fanout keeps other channel live",
             test_destroy_during_fanout_keeps_other_channel_live},
         {"zero-channel event and argument contracts",
-            test_zero_channel_event_and_argument_contracts}
+            test_zero_channel_event_and_argument_contracts},
+        {"concurrent channels dispatch under fanout",
+            test_concurrent_channels_dispatch_under_fanout}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }
