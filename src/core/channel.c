@@ -252,17 +252,48 @@ maelys_mcp_result_t maelys_mcp_channel_enqueue_take_until(
     return status;
 }
 
-maelys_mcp_result_t maelys_mcp_channel_handle(
+static maelys_mcp_result_t outbox_sink_emit(void *context, json_t *message) {
+    return maelys_mcp_channel_enqueue_take((maelys_mcp_channel_t *)context,
+        message, MAELYS_MCP_OUTBOX_NOTIFICATION, NULL, 1);
+}
+
+static maelys_mcp_result_t outbox_sink_complete(void *context, json_t *response) {
+    return maelys_mcp_channel_enqueue_take((maelys_mcp_channel_t *)context,
+        response, MAELYS_MCP_OUTBOX_RESPONSE, NULL, 1);
+}
+
+static int outbox_sink_cancelled(void *context) {
+    maelys_mcp_channel_t *channel = context;
+    pthread_mutex_lock(&channel->mutex);
+    int cancelled = channel->state != MAELYS_MCP_CHANNEL_ACTIVE;
+    pthread_mutex_unlock(&channel->mutex);
+    return cancelled;
+}
+
+maelys_mcp_response_sink_t maelys_mcp_channel_outbox_sink(
+    maelys_mcp_channel_t *channel) {
+    maelys_mcp_response_sink_t sink = {
+        .emit = outbox_sink_emit,
+        .complete = outbox_sink_complete,
+        .cancelled = outbox_sink_cancelled,
+        .context = channel
+    };
+    return sink;
+}
+
+maelys_mcp_result_t maelys_mcp_channel_handle_with_sink(
     maelys_mcp_channel_t *channel,
-    json_t *request) {
-    if (!channel || !request) return MAELYS_MCP_ERR_ARGUMENT;
+    json_t *request,
+    const maelys_mcp_response_sink_t *sink) {
+    if (!channel || !request || !sink || !sink->complete) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
     maelys_mcp_result_t status = begin_operation(channel);
     if (status != MAELYS_MCP_OK) return status;
     json_t *activate_id = NULL;
     json_t *response = maelys_mcp_runtime_dispatch(channel, request, &activate_id);
     if (response) {
-        status = maelys_mcp_channel_enqueue_take(channel, response,
-            MAELYS_MCP_OUTBOX_RESPONSE, NULL, 1);
+        status = sink->complete(sink->context, response);
         if (status != MAELYS_MCP_OK) json_decref(response);
     }
     if (activate_id) {
@@ -275,6 +306,14 @@ maelys_mcp_result_t maelys_mcp_channel_handle(
     }
     maelys_mcp_channel_release_operation(channel);
     return status;
+}
+
+maelys_mcp_result_t maelys_mcp_channel_handle(
+    maelys_mcp_channel_t *channel,
+    json_t *request) {
+    if (!channel || !request) return MAELYS_MCP_ERR_ARGUMENT;
+    maelys_mcp_response_sink_t sink = maelys_mcp_channel_outbox_sink(channel);
+    return maelys_mcp_channel_handle_with_sink(channel, request, &sink);
 }
 
 maelys_mcp_result_t maelys_mcp_channel_next(

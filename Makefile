@@ -145,6 +145,14 @@ $(BIN)/test-channels: $(OBJ)/tests/test_channels.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
+$(BIN)/test-channel-perf: $(OBJ)/tests/test_channel_perf.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+$(BIN)/test-provider-perf: $(OBJ)/tests/test_provider_perf.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
 $(OBJ)/%.o: %.c
 	@mkdir -p $(@D)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -157,7 +165,7 @@ $(NO_THREAD_BIN): tests/test_channel_no_thread.c $(LIB_SOURCES)
 test-channel-no-thread-nosanitize: $(NO_THREAD_BIN)
 	$(NO_THREAD_BIN)
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -166,9 +174,11 @@ test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-p
 	$(BIN)/test-outbox
 	$(BIN)/test-subscriptions
 	$(BIN)/test-channels
+	$(BIN)/test-channel-perf
 	$(BIN)/test-runtime
 	$(BIN)/test-runtime-protocol
 	$(BIN)/test-provider-sdk
+	$(BIN)/test-provider-perf $(abspath $(BIN)/example-provider)
 	$(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/bad-json-provider) $(abspath $(BIN)/bad-envelope-provider) \
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
@@ -229,13 +239,14 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-process-provider $(BIN)/test-provider-sdk \
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-process-provider $(BIN)/test-provider-sdk \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
 		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channels
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channel-perf
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-provider-sdk
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/bad-json-provider) $(abspath $(BIN)/bad-envelope-provider) \

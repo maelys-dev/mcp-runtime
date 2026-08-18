@@ -172,6 +172,33 @@ struct maelys_mcp_channel {
     size_t subscription_count;
 };
 
+/*
+ * Transport-neutral delivery seam for one dispatched request.
+ *
+ * A request resolves to exactly one of:
+ *   - a single buffered response (one `complete`, no `emit`) - what every
+ *     request does today over stdio, and what an HTTP `application/json`
+ *     reply carries;
+ *   - a stream (zero or more `emit` calls carrying request-scoped
+ *     notifications, then one `complete`) - what an HTTP `text/event-stream`
+ *     reply carries, and what `subscriptions/listen` needs;
+ *   - a stream relayed from an upstream MCP server, once this runtime can
+ *     act as a gateway: the same shape, with frames originating elsewhere.
+ *
+ * Keeping this seam here rather than inside a transport is what makes the
+ * transport itself a thin, replaceable shell.
+ *
+ * Ownership follows the outbox convention (see
+ * maelys_mcp_outbox_enqueue_take): `emit` and `complete` steal the caller's
+ * reference on success and leave it with the caller on failure.
+ */
+typedef struct maelys_mcp_response_sink {
+    maelys_mcp_result_t (*emit)(void *context, json_t *message);
+    maelys_mcp_result_t (*complete)(void *context, json_t *response);
+    int (*cancelled)(void *context);
+    void *context;
+} maelys_mcp_response_sink_t;
+
 typedef struct maelys_mcp_module_request {
     maelys_mcp_channel_t *channel;
     json_t *id;
@@ -308,6 +335,16 @@ json_t *maelys_mcp_runtime_dispatch(
     maelys_mcp_channel_t *channel,
     json_t *request,
     json_t **out_post_enqueue_subscription_id);
+/* The sink every channel uses today: emit and complete both land in that
+ * channel's outbox, which its writer thread drains. */
+maelys_mcp_response_sink_t maelys_mcp_channel_outbox_sink(
+    maelys_mcp_channel_t *channel);
+/* maelys_mcp_channel_handle() is exactly this against the outbox sink; a
+ * transport that delivers a request's response itself (HTTP) passes its own. */
+maelys_mcp_result_t maelys_mcp_channel_handle_with_sink(
+    maelys_mcp_channel_t *channel,
+    json_t *request,
+    const maelys_mcp_response_sink_t *sink);
 maelys_mcp_result_t maelys_mcp_channel_enqueue_take(
     maelys_mcp_channel_t *channel,
     json_t *message,
