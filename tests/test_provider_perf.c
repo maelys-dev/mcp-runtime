@@ -30,6 +30,15 @@
 #include <string.h>
 #include <time.h>
 
+/* Every failure path names itself. A measurement that returns a bare
+ * sentinel makes an intermittent CI failure undiagnosable after the fact -
+ * which is exactly what happened once during development, where the reason
+ * was filtered out of the log and could not be recovered. */
+#define FAIL(reason) do { \
+    fprintf(stderr, "   measurement failed: %s\n", (reason)); \
+    return -1.0; \
+} while (0)
+
 #define WARMUP 200
 #define ITERATIONS 2000
 /* See the header comment: loose on purpose. */
@@ -63,21 +72,21 @@ static double drive(maelys_mcp_channel_t *channel, const char *tool_name) {
     struct timespec start, end;
     memset(&start, 0, sizeof(start));
     for (int index = 0; index < WARMUP + ITERATIONS; ++index) {
-        if (index == WARMUP && clock_gettime(CLOCK_MONOTONIC, &start) != 0) return -1.0;
+        if (index == WARMUP && clock_gettime(CLOCK_MONOTONIC, &start) != 0) FAIL("clock_gettime at start");
         json_t *request = json_loads(request_text, 0, NULL);
-        if (!request) return -2.0;
+        if (!request) FAIL("could not build the request");
         maelys_mcp_result_t status = maelys_mcp_channel_handle(channel, request);
         json_decref(request);
-        if (status != MAELYS_MCP_OK) return -3.0;
+        if (status != MAELYS_MCP_OK) FAIL("channel_handle rejected the call");
         json_t *response = NULL;
-        if (maelys_mcp_channel_next(channel, 5000u, &response) != MAELYS_MCP_OK) return -4.0;
+        if (maelys_mcp_channel_next(channel, 5000u, &response) != MAELYS_MCP_OK) FAIL("no response within 5s");
         /* Time the success path, not an error path that silently replaced it. */
         int well_formed = json_is_object(json_object_get(response, "result")) &&
             !json_object_get(response, "error");
         json_decref(response);
-        if (!well_formed) return -5.0;
+        if (!well_formed) FAIL("response carried an error rather than a result");
     }
-    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) return -6.0;
+    if (clock_gettime(CLOCK_MONOTONIC, &end) != 0) FAIL("clock_gettime at end");
     double microseconds = ((double)(end.tv_sec - start.tv_sec) * 1e9 +
         (double)(end.tv_nsec - start.tv_nsec)) / 1000.0;
     return microseconds / ITERATIONS;
@@ -90,20 +99,20 @@ static double measure_out_of_process(void) {
             &provider, &error) != MAELYS_MCP_OK) {
         fprintf(stderr, "   spawn failed: %s\n", error ? error : "(no detail)");
         free(error);
-        return -1.0;
+        return -1.0;  /* the reason is printed just above */
     }
     maelys_mcp_runtime_config_t config = {
         .server_name = "provider-perf", .server_version = "1"
     };
     maelys_mcp_runtime_t *runtime = NULL;
-    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) return -2.0;
-    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK) return -3.0;
+    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) FAIL("runtime_create (out of process)");
+    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK) FAIL("enable tools (out of process)");
     /* The example provider also declares resources and templates, and
      * add_provider rejects a provider whose surface has no enabled module. */
-    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) != MAELYS_MCP_OK) return -4.0;
-    if (maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) return -5.0;
+    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) != MAELYS_MCP_OK) FAIL("enable resources (out of process)");
+    if (maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) FAIL("add_provider (out of process)");
     maelys_mcp_channel_t *channel = NULL;
-    if (maelys_mcp_channel_create(runtime, NULL, &channel) != MAELYS_MCP_OK) return -6.0;
+    if (maelys_mcp_channel_create(runtime, NULL, &channel) != MAELYS_MCP_OK) FAIL("channel_create (out of process)");
     double per_call = drive(channel, "example.echo");
     (void)maelys_mcp_channel_destroy(channel);
     (void)maelys_mcp_runtime_destroy(runtime);
@@ -118,7 +127,7 @@ static double measure_in_process(void) {
         .effect = MAELYS_MCP_EFFECT_READ
     };
     tool.input_schema = json_pack("{s:s}", "type", "object");
-    if (!tool.input_schema) return -1.0;
+    if (!tool.input_schema) FAIL("could not build the tool schema");
     maelys_mcp_provider_config_t config = {
         .name = "perf-inproc", .version = "1",
         .tools = &tool, .tool_count = 1,
@@ -127,17 +136,17 @@ static double measure_in_process(void) {
     maelys_mcp_provider_t *provider = NULL;
     maelys_mcp_result_t created = maelys_mcp_provider_create(&config, &provider);
     json_decref(tool.input_schema);
-    if (created != MAELYS_MCP_OK) return -2.0;
+    if (created != MAELYS_MCP_OK) FAIL("provider_create (in process)");
 
     maelys_mcp_runtime_config_t runtime_config = {
         .server_name = "provider-perf", .server_version = "1"
     };
     maelys_mcp_runtime_t *runtime = NULL;
-    if (maelys_mcp_runtime_create(&runtime_config, &runtime) != MAELYS_MCP_OK) return -3.0;
-    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK) return -4.0;
-    if (maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) return -5.0;
+    if (maelys_mcp_runtime_create(&runtime_config, &runtime) != MAELYS_MCP_OK) FAIL("runtime_create (in process)");
+    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK) FAIL("enable tools (in process)");
+    if (maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) FAIL("add_provider (in process)");
     maelys_mcp_channel_t *channel = NULL;
-    if (maelys_mcp_channel_create(runtime, NULL, &channel) != MAELYS_MCP_OK) return -6.0;
+    if (maelys_mcp_channel_create(runtime, NULL, &channel) != MAELYS_MCP_OK) FAIL("channel_create (in process)");
     double per_call = drive(channel, "perf.noop");
     (void)maelys_mcp_channel_destroy(channel);
     (void)maelys_mcp_runtime_destroy(runtime);
