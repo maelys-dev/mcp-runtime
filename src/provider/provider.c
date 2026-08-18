@@ -100,6 +100,51 @@ void maelys_mcp_provider_bind_event_sink(
     pthread_mutex_unlock(&provider->event_mutex);
 }
 
+maelys_mcp_result_t maelys_mcp_provider_report_progress(
+    maelys_mcp_progress_reporter_t *reporter,
+    double progress,
+    double total,
+    const char *message) {
+    /* A NULL reporter means the client asked for no progress, so a provider
+     * may report unconditionally. Not an error, and nothing to send. */
+    if (!reporter) return MAELYS_MCP_OK;
+    if (!reporter->sink || !reporter->sink->emit || !reporter->token) {
+        return MAELYS_MCP_ERR_STATE;
+    }
+    json_t *params = json_object();
+    json_t *notification = json_object();
+    if (!params || !notification) goto failed;
+    /* progressToken and progress are the only required params; total and
+     * message are omitted rather than sent empty when not supplied. */
+    if (json_object_set(params, "progressToken", reporter->token) != 0 ||
+        json_object_set_new(params, "progress", json_real(progress)) != 0 ||
+        (total >= 0.0 &&
+            json_object_set_new(params, "total", json_real(total)) != 0) ||
+        (message &&
+            json_object_set_new(params, "message", json_string(message)) != 0)) {
+        goto failed;
+    }
+    if (json_object_set_new(notification, "jsonrpc", json_string("2.0")) != 0 ||
+        json_object_set_new(notification, "method",
+            json_string("notifications/progress")) != 0) {
+        goto failed;
+    }
+    /* set_new consumes the reference whether or not it succeeds, so `params`
+     * must stop being ours the moment it is handed over - not one branch
+     * earlier, which would have leaked it when either set_new above failed. */
+    int attached = json_object_set_new(notification, "params", params) == 0;
+    params = NULL;
+    if (!attached) goto failed;
+    maelys_mcp_result_t status = reporter->sink->emit(
+        reporter->sink->context, notification);
+    if (status != MAELYS_MCP_OK) json_decref(notification);
+    return status;
+failed:
+    if (params) json_decref(params);
+    if (notification) json_decref(notification);
+    return MAELYS_MCP_ERR_MEMORY;
+}
+
 maelys_mcp_result_t maelys_mcp_provider_emit_event(
     maelys_mcp_provider_t *provider,
     const maelys_mcp_provider_event_t *event) {

@@ -253,8 +253,20 @@ maelys_mcp_result_t maelys_mcp_channel_enqueue_take_until(
 }
 
 static maelys_mcp_result_t outbox_sink_emit(void *context, json_t *message) {
+    /*
+     * RESPONSE, not NOTIFICATION, despite this being a JSON-RPC notification:
+     * the outbox classes are scheduling classes, not message shapes.
+     * NOTIFICATION is the coalescible lane for fanout that relates to no
+     * particular request, and select_next deliberately prefers responses over
+     * it - which would let a request's final response overtake the
+     * request-scoped notifications that must precede it. Over SSE that is not
+     * merely out of order: the final response terminates the stream, so those
+     * notifications would be dropped outright. The response lane preserves
+     * FIFO order with the response they belong to, and forbids coalescing,
+     * which is exactly what request-scoped output needs.
+     */
     return maelys_mcp_channel_enqueue_take((maelys_mcp_channel_t *)context,
-        message, MAELYS_MCP_OUTBOX_NOTIFICATION, NULL, 1);
+        message, MAELYS_MCP_OUTBOX_RESPONSE, NULL, 1);
 }
 
 static maelys_mcp_result_t outbox_sink_complete(void *context, json_t *response) {
@@ -291,7 +303,7 @@ maelys_mcp_result_t maelys_mcp_channel_handle_with_sink(
     maelys_mcp_result_t status = begin_operation(channel);
     if (status != MAELYS_MCP_OK) return status;
     json_t *activate_id = NULL;
-    json_t *response = maelys_mcp_runtime_dispatch(channel, request, &activate_id);
+    json_t *response = maelys_mcp_runtime_dispatch(channel, request, sink, &activate_id);
     if (response) {
         status = sink->complete(sink->context, response);
         if (status != MAELYS_MCP_OK) json_decref(response);
