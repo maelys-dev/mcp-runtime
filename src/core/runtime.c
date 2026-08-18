@@ -474,6 +474,7 @@ static json_t *validate_modern_metadata(json_t *id, json_t *params, const char *
 json_t *maelys_mcp_runtime_dispatch(
     maelys_mcp_channel_t *channel,
     json_t *request,
+    const maelys_mcp_response_sink_t *sink,
     json_t **out_post_enqueue_subscription_id) {
     if (out_post_enqueue_subscription_id) *out_post_enqueue_subscription_id = NULL;
     if (!channel || !json_is_object(request)) {
@@ -554,6 +555,7 @@ json_t *maelys_mcp_runtime_dispatch(
     }
     maelys_mcp_module_request_t module_request = {
         .channel = channel,
+        .sink = sink,
         .id = id,
         .params = params,
         .protocol_version = modern ? modern_version : legacy_protocol_version,

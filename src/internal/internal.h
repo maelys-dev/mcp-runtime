@@ -199,8 +199,24 @@ typedef struct maelys_mcp_response_sink {
     void *context;
 } maelys_mcp_response_sink_t;
 
+/*
+ * Binds a progress token to the sink of the request that carried it. Both
+ * members are borrowed and outlive this struct, which the dispatching module
+ * builds on its stack for exactly one provider callback.
+ */
+struct maelys_mcp_progress_reporter {
+    const maelys_mcp_response_sink_t *sink;
+    json_t *token;
+};
+
 typedef struct maelys_mcp_module_request {
     maelys_mcp_channel_t *channel;
+    /* Where this request's own output goes. Borrowed from the caller, valid
+     * for the duration of the dispatch. A module that produces nothing but a
+     * final result never touches it - handle_with_sink completes on its
+     * behalf - but a module that emits request-scoped notifications ahead of
+     * that result (progress) needs it. */
+    const maelys_mcp_response_sink_t *sink;
     json_t *id;
     json_t *params;
     const char *protocol_version;
@@ -334,6 +350,7 @@ void maelys_mcp_activate_subscription(
 json_t *maelys_mcp_runtime_dispatch(
     maelys_mcp_channel_t *channel,
     json_t *request,
+    const maelys_mcp_response_sink_t *sink,
     json_t **out_post_enqueue_subscription_id);
 /* The sink every channel uses today: emit and complete both land in that
  * channel's outbox, which its writer thread drains. */

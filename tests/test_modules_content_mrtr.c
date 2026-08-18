@@ -353,11 +353,147 @@ static int test_legacy_mrtr_capability_negotiation(void) {
     return 0;
 }
 
+/*
+ * notifications/progress, and above all its ordering.
+ *
+ * The ordering assertion is the point. Progress is a JSON-RPC notification,
+ * so routing it through the outbox's NOTIFICATION class looks right and is
+ * wrong: that lane is the coalescible one for fanout unrelated to any
+ * request, and select_next deliberately prefers responses over it, so the
+ * call's final response overtakes the progress that preceded it. Over SSE
+ * that is not just reordering - the final response terminates the stream, so
+ * the progress would be dropped entirely. This test fails against that
+ * mistake and passes only when request-scoped output shares the ordered lane
+ * with the response it belongs to.
+ */
+typedef struct progress_state {
+    int reports;
+    int saw_reporter;
+} progress_state_t;
+
+static maelys_mcp_result_t progress_call(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *result,
+    char **out_error) {
+    progress_state_t *state = context;
+    if (request->progress) state->saw_reporter = 1;
+    /* Reported unconditionally: a NULL reporter is the documented way to say
+     * "the client asked for none", so a provider never has to test first. */
+    for (int step = 0; step <= 2; ++step) {
+        if (maelys_mcp_provider_report_progress(request->progress,
+                step * 50.0, 100.0, NULL) == MAELYS_MCP_OK) {
+            if (request->progress) state->reports++;
+        }
+    }
+    (void)out_error;
+    result->content = json_pack("[{s:s,s:s}]", "type", "text", "text", "done");
+    return result->content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+}
+
+static json_t *progress_params(json_t *token) {
+    json_t *params = json_pack("{s:s,s:{},s:{s:s,s:{s:s,s:s},s:{}}}",
+        "name", "test.progress", "arguments",
+        "_meta",
+        "io.modelcontextprotocol/protocolVersion", MAELYS_MCP_PROTOCOL_MODERN,
+        "io.modelcontextprotocol/clientInfo", "name", "test", "version", "1",
+        "io.modelcontextprotocol/clientCapabilities");
+    if (params && token) {
+        (void)json_object_set_new(json_object_get(params, "_meta"),
+            "progressToken", token);
+    } else if (token) {
+        json_decref(token);
+    }
+    return params;
+}
+
+static int test_progress_notifications(void) {
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "progress", .server_version = "1"
+    };
+    maelys_mcp_runtime_t *core = NULL;
+    ASSERT_TRUE(maelys_mcp_runtime_create(&config, &core) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
+
+    progress_state_t state = {0};
+    maelys_mcp_tool_t tool = {
+        .name = "test.progress",
+        .title = "Reports progress",
+        .description = "Emits three progress reports, then completes.",
+        .effect = MAELYS_MCP_EFFECT_READ
+    };
+    tool.input_schema = json_pack("{s:s}", "type", "object");
+    ASSERT_TRUE(tool.input_schema != NULL);
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "progress-provider", .version = "1",
+        .tools = &tool, .tool_count = 1,
+        .call = progress_call, .context = &state
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    maelys_mcp_result_t created = maelys_mcp_provider_create(&provider_config, &provider);
+    json_decref(tool.input_schema);
+    ASSERT_TRUE(created == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(core, provider, NULL) == MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel) == MAELYS_MCP_OK);
+
+    /* With a token: three progress notifications, then the response. */
+    json_t *owned = request("tools/call", progress_params(json_string("tok-1")));
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, owned) == MAELYS_MCP_OK);
+    json_decref(owned);
+    ASSERT_TRUE(state.saw_reporter == 1);
+    ASSERT_TRUE(state.reports == 3);
+
+    for (int index = 0; index <= 2; ++index) {
+        json_t *message = NULL;
+        ASSERT_TRUE(maelys_mcp_channel_next(channel, 1000u, &message) == MAELYS_MCP_OK);
+        /*
+         * Ordering: every progress must arrive before the response. Checked
+         * as "is this a notification at all" first, so that a regression
+         * putting the response ahead of them fails with a readable assertion
+         * instead of crashing in strcmp on a NULL method.
+         */
+        json_t *method = json_object_get(message, "method");
+        ASSERT_TRUE(json_is_string(method));
+        ASSERT_TRUE(strcmp(json_string_value(method), "notifications/progress") == 0);
+        json_t *params = json_object_get(message, "params");
+        ASSERT_TRUE(strcmp(json_string_value(
+            json_object_get(params, "progressToken")), "tok-1") == 0);
+        ASSERT_TRUE(json_number_value(json_object_get(params, "progress")) == index * 50.0);
+        ASSERT_TRUE(json_number_value(json_object_get(params, "total")) == 100.0);
+        /* Omitted, not sent empty, when the provider passes none. */
+        ASSERT_TRUE(json_object_get(params, "message") == NULL);
+        json_decref(message);
+    }
+    json_t *response = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_next(channel, 1000u, &response) == MAELYS_MCP_OK);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+
+    /* Without a token the provider gets no reporter, and nothing is emitted:
+     * the very next message is the response itself. */
+    state.reports = 0;
+    state.saw_reporter = 0;
+    owned = request("tools/call", progress_params(NULL));
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, owned) == MAELYS_MCP_OK);
+    json_decref(owned);
+    ASSERT_TRUE(state.saw_reporter == 0);
+    ASSERT_TRUE(state.reports == 0);
+    ASSERT_TRUE(maelys_mcp_channel_next(channel, 1000u, &response) == MAELYS_MCP_OK);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(core) == MAELYS_MCP_OK);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"content block validation", test_content_validation},
         {"module registry, rich content, and MRTR", test_modules_rich_content_and_mrtr},
-        {"legacy channel MRTR capability negotiation", test_legacy_mrtr_capability_negotiation}
+        {"legacy channel MRTR capability negotiation", test_legacy_mrtr_capability_negotiation},
+        {"progress notifications and their ordering", test_progress_notifications}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }

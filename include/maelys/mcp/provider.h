@@ -61,12 +61,38 @@ typedef enum maelys_mcp_provider_result_type {
     MAELYS_MCP_PROVIDER_RESULT_INPUT_REQUIRED = 1
 } maelys_mcp_provider_result_type_t;
 
+/*
+ * Opaque handle for reporting progress on a long-running call. Owned by the
+ * runtime and valid only for the duration of the callback it arrives in.
+ */
+typedef struct maelys_mcp_progress_reporter maelys_mcp_progress_reporter_t;
+
+/*
+ * Emits one notifications/progress for the call this reporter belongs to.
+ * `progress` should increase across calls even when the total is unknown;
+ * pass a negative `total` to omit it, and NULL `message` to omit that.
+ *
+ * Passing a NULL reporter is not an error: it is how "the client asked for
+ * no progress" is expressed (see maelys_mcp_provider_request_t.progress), so
+ * a provider can report unconditionally without testing first. Delivery is
+ * best effort - progress is advisory, and a failure to enqueue it must never
+ * fail the call it describes.
+ */
+maelys_mcp_result_t maelys_mcp_provider_report_progress(
+    maelys_mcp_progress_reporter_t *reporter,
+    double progress,
+    double total,
+    const char *message);
+
 typedef struct maelys_mcp_provider_request {
     const char *tool_name;
     json_t *arguments;
     json_t *input_responses;
     json_t *request_state;
     json_t *client_capabilities;
+    /* NULL unless the client supplied params._meta.progressToken - the spec
+     * makes progress opt-in per request, so NULL means "do not bother". */
+    maelys_mcp_progress_reporter_t *progress;
 } maelys_mcp_provider_request_t;
 
 typedef struct maelys_mcp_provider_result {

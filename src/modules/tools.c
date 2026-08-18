@@ -359,12 +359,31 @@ static json_t *call_tool(
         return maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
             "Policy denied", NULL);
     }
+    /*
+     * params._meta.progressToken is a bare key in both eras - the modern
+     * _meta namespaces its own fields but not this one - so a single lookup
+     * serves legacy and modern alike. The spec types it as string or
+     * integer; anything else is ignored rather than rejected, since progress
+     * is advisory and must not fail an otherwise valid call. The reporter
+     * lives on this stack frame and is handed to exactly one callback.
+     */
+    json_t *progress_token = json_is_object(meta) ?
+        json_object_get(meta, "progressToken") : NULL;
+    int token_usable = (json_is_string(progress_token) &&
+            !maelys_mcp_json_string_has_nul(progress_token)) ||
+        json_is_integer(progress_token);
+    maelys_mcp_progress_reporter_t progress_reporter = {
+        .sink = request->sink,
+        .token = progress_token
+    };
     maelys_mcp_provider_request_t provider_request = {
         .tool_name = tool->name,
         .arguments = arguments,
         .input_responses = input_responses,
         .request_state = request_state,
-        .client_capabilities = client_capabilities
+        .client_capabilities = client_capabilities,
+        .progress = (token_usable && request->sink && request->sink->emit) ?
+            &progress_reporter : NULL
     };
     maelys_mcp_provider_result_t provider_result;
     maelys_mcp_provider_result_init(&provider_result);
