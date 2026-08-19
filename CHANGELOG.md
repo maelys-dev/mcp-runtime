@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.1 - 2026-08-20
+
+- **Fix**: the release build's Linux (GCC) runners failed on
+  `-Werror=format-truncation=` in `host/manifest.c` — GCC sizes `%zu` at its
+  theoretical worst case (up to 20 digits for a 64-bit `size_t`), which
+  exceeded the buffer used to format `allowEffects[N]` error locations. clang
+  (the regular CI checks, local macOS builds) never flagged it, so it shipped
+  undetected in 0.13.0. No behavioural change; v0.13.0's tag was never
+  followed by a GitHub Release (its Linux builds failed, so publishing was
+  skipped) — this is the first release actually carrying 0.13.0's features.
+
 ## 0.13.0 - 2026-08-20
 
 - **MCP proxy provider**: federate any third-party MCP server over stdio. mcp-runtime
