@@ -275,7 +275,12 @@ static maelys_mcp_result_t validate_manifest(json_t *root, char **out_error) {
         }
         size_t effect_count = json_array_size(allow_effects);
         for (size_t index = 0; index < effect_count; ++index) {
-            char location[32];
+            /* 48, not 32: GCC's -Wformat-truncation= sizes %zu at its
+             * theoretical max width (a 64-bit size_t can print up to 20
+             * digits), and "allowEffects[" + 20 digits + "]" + NUL is 35 -
+             * 32 falls just short of GCC's worst case, even though no real
+             * manifest will ever have anywhere near 1e20 allowEffects. */
+            char location[48];
             (void)snprintf(location, sizeof(location), "allowEffects[%zu]", index);
             status = validate_effect_string(
                 json_array_get(allow_effects, index), location, 1, out_error);
