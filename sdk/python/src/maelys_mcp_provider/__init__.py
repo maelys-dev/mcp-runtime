@@ -8,7 +8,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, TextIO
 
-PROTOCOL = "maelys-provider/3"
+PROTOCOL = "maelys-provider/4"
+# The version every provider speaks, and the one the host opens with until
+# this SDK declares the newer one in a response.
+PROTOCOL_FLOOR = "maelys-provider/3"
 TOOL_EFFECTS = ("read", "preview", "apply", "commit", "execute")
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -143,6 +146,29 @@ class ProviderEvents:
                     "provider events are unavailable before activation or after shutdown")
             self._writer({"protocol": PROTOCOL, "method": method,
                 "params": params or {}})
+
+    def report_progress(
+        self,
+        progress: float,
+        total: float | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Reports progress for the call being handled.
+
+        Request-scoped, unlike the events below: the host routes it to the one
+        call in flight, so it must only be sent from inside a tool handler. No
+        progress token is carried - the host holds it, which is what stops a
+        provider addressing progress at a request that is not its own.
+
+        Best effort: a host whose client asked for no progress simply drops
+        it, so a handler may report unconditionally.
+        """
+        params: JsonObject = {"progress": progress}
+        if total is not None:
+            params["total"] = total
+        if message is not None:
+            params["message"] = message
+        self._emit("provider/notifications/progress", params)
 
     def resource_updated(self, uri: str) -> None:
         self._emit("provider/notifications/resources/updated",
@@ -403,7 +429,9 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
     request_id = request.get("id")
     if isinstance(request_id, bool) or not isinstance(request_id, int):
         raise TypeError("provider request id must be an integer")
-    if request.get("protocol") != PROTOCOL:
+    # The host opens at the floor and only speaks the current version once we
+    # have declared it in a response, so both are valid inbound.
+    if request.get("protocol") not in (PROTOCOL, PROTOCOL_FLOOR):
         raise TypeError("unsupported provider protocol")
     params = _object(request.get("params", {}), "provider request params")
     method = request.get("method")

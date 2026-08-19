@@ -23,8 +23,8 @@ The policy is:
 - adding fields directly to an existing public structure is an ABI break; a compatible
   extension uses a new structure or a new versioned constructor;
 - public stateful objects never expose their storage layout;
-- the private `maelys-provider/3` process protocol is versioned separately and does not
-  share the native C ABI.
+- the private `maelys-provider` process protocol is versioned separately, is
+  negotiated per provider rather than fixed, and does not share the native C ABI.
 
 The build exports a static library today. This policy also applies if a shared-library
 artifact is introduced later.

@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import sys
+import time
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "sdk" / "python" / "src"))
@@ -92,6 +93,24 @@ def capability_aware_input(_arguments: dict[str, object], context: object):
     return input_required_result(input_requests=requests)
 
 
+def tool_with_progress(_arguments: dict[str, object], _context: object):
+    """The official scenario expects 0/100, 50/100 and 100/100 with roughly
+    50ms between them.
+
+    It phrases this as "if _meta.progressToken is provided", but a provider
+    never sees the token: the host holds it and drops progress when the client
+    asked for none. Reporting unconditionally is therefore both correct and
+    what the scenario observes, since the client only sees frames when it
+    supplied a token.
+    """
+    for step in (0.0, 50.0, 100.0):
+        PROVIDER.events.report_progress(step, 100.0)
+        time.sleep(0.05)
+    return complete_result(content=[{
+        "type": "text", "text": "Progress test completed",
+    }])
+
+
 def intentional_error(_arguments: dict[str, object], _context: object) -> object:
     raise RuntimeError("This tool intentionally returns an error for testing")
 
@@ -139,6 +158,10 @@ PROVIDER = create_provider(
         Tool(name="test_input_required_result_capabilities", title="Respect capabilities",
             description="Capability-aware MRTR fixture.", input_schema=EMPTY_OBJECT_SCHEMA,
             effect="read", handler=capability_aware_input),
+        Tool(name="test_tool_with_progress", title="Report progress",
+            description="Reports three progress steps before completing.",
+            input_schema=EMPTY_OBJECT_SCHEMA, effect="read",
+            handler=tool_with_progress),
         Tool(
             name="test_error_handling",
             title="Return a tool error",

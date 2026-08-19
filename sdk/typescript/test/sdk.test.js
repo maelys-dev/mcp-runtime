@@ -38,7 +38,7 @@ test("persistent messages preserve protocol and integer ids", async () => {
     method: "provider/call",
     params: { name: "fixture.echo", arguments: { message: "hello" } },
   });
-  assert.deepEqual(response, { protocol: "maelys-provider/3", id: 7, result: {
+  assert.deepEqual(response, { protocol: "maelys-provider/4", id: 7, result: {
     resultType: "complete", structuredContent: { message: "hello" },
   } });
   await assert.rejects(() => handleProviderMessage(provider, {

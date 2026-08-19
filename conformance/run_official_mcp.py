@@ -72,6 +72,7 @@ MODERN_SCENARIOS = (
     "tools-call-embedded-resource",
     "tools-call-mixed-content",
     "tools-call-error",
+    "tools-call-with-progress",
     "resources-list",
     "resources-read-text",
     "resources-read-binary",
@@ -91,7 +92,6 @@ LEGACY_EXCLUDED = {
     "ping": "no ping handler",
     "completion-complete": "no completion module",
     "tools-call-with-logging": "no logging notifications",
-    "tools-call-with-progress": "no progress-token/notification support",
     "prompts-list": "no prompts module",
     "prompts-get-simple": "no prompts module",
     "prompts-get-with-args": "no prompts module",
@@ -221,7 +221,17 @@ class StdioBridge:
         self._output: BinaryIO = self._process.stdout
         self._lock = threading.Lock()
 
-    def request(self, body: bytes) -> bytes | None:
+    def request(self, body: bytes) -> list[bytes] | None:
+        """Returns every line the runtime emits for this request, the final
+        response last.
+
+        A request can produce request-scoped notifications - progress - ahead
+        of its response. Reading exactly one line would hand the caller the
+        first notification as if it were the response, and leave the rest to
+        corrupt the next request; that is precisely what happened when
+        tools-call-with-progress was first enabled. Lines are therefore read
+        until the one carrying this request's id arrives.
+        """
         with self._lock:
             if self._process.poll() is not None:
                 raise RuntimeError(f"runtime exited with status {self._process.returncode}")
@@ -230,12 +240,22 @@ class StdioBridge:
             self._input.flush()
             if _is_notification(body):
                 return None
-            response = self._output.readline(MAX_BODY_BYTES + 1)
-            if not response:
-                raise RuntimeError("runtime closed stdout without a response")
-            if len(response) > MAX_BODY_BYTES:
-                raise RuntimeError("runtime response exceeds the bridge limit")
-            return response.rstrip(b"\r\n")
+            wanted = json.loads(body).get("id")
+            lines: list[bytes] = []
+            while True:
+                line = self._output.readline(MAX_BODY_BYTES + 1)
+                if not line:
+                    raise RuntimeError("runtime closed stdout without a response")
+                if len(line) > MAX_BODY_BYTES:
+                    raise RuntimeError("runtime response exceeds the bridge limit")
+                line = line.rstrip(b"\r\n")
+                lines.append(line)
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    raise RuntimeError("runtime emitted a line that is not JSON")
+                if isinstance(parsed, dict) and parsed.get("id") == wanted:
+                    return lines
 
     def close(self) -> None:
         process = getattr(self, "_process", None)
@@ -270,7 +290,7 @@ def handler_for(bridge: StdioBridge) -> type[BaseHTTPRequestHandler]:
                 parsed = json.loads(body)
                 if not isinstance(parsed, dict):
                     raise ValueError("request body must be a JSON object")
-                response = bridge.request(body)
+                lines = bridge.request(body)
             except (ValueError, json.JSONDecodeError) as error:
                 payload = json.dumps({"error": str(error)}).encode()
                 self._send(400, payload)
@@ -279,24 +299,23 @@ def handler_for(bridge: StdioBridge) -> type[BaseHTTPRequestHandler]:
                 payload = json.dumps({"error": str(error)}).encode()
                 self._send(502, payload)
                 return
-            if response is None:
+            if lines is None:
                 # Notification: no JSON-RPC reply, per the Streamable HTTP spec.
                 self._send(202, b"")
                 return
-            try:
-                envelope = json.loads(response)
-                if not isinstance(envelope, dict):
-                    raise ValueError("runtime response must be a JSON object")
-            except (ValueError, json.JSONDecodeError) as error:
-                payload = json.dumps({"error": str(error)}).encode()
-                self._send(502, payload)
+            if len(lines) == 1:
+                self._send(200, lines[0])
                 return
-            self._send(200, response)
+            # Notifications preceded the response, so the spec requires this
+            # exchange to be an SSE stream rather than a single JSON object.
+            payload = b"".join(b"data: " + line + b"\r\n\r\n" for line in lines)
+            self._send(200, payload, content_type="text/event-stream")
 
-        def _send(self, status: int, payload: bytes) -> None:
+        def _send(self, status: int, payload: bytes,
+                  content_type: str = "application/json") -> None:
             self.send_response(status)
             if payload:
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             if payload:
@@ -405,8 +424,11 @@ def check_exclusions_still_hold(runtime: Path, provider: Path) -> list[str]:
             request = json.dumps({
                 "jsonrpc": "2.0", "id": index, "method": method, "params": {},
             }).encode()
-            response = bridge.request(request)
-            envelope = json.loads(response) if response else {}
+            # request() returns every line for the exchange, the response
+            # last; a probe never produces notifications, but read it that way
+            # regardless rather than assuming.
+            lines = bridge.request(request)
+            envelope = json.loads(lines[-1]) if lines else {}
             code = envelope.get("error", {}).get("code")
             if code != -32601:
                 stale.append(

@@ -1,10 +1,25 @@
-# Provider protocol `maelys-provider/3`
+# Provider protocol `maelys-provider/4`
 
 External providers are persistent child processes connected through a private
 bidirectional socket mapped to stdin and stdout. Messages are UTF-8 JSON Lines.
-Provider stdout is protocol-only; diagnostics use stderr. Version 3 retains the
-explicit version 2 result model and adds activation plus provider-originated
-asynchronous events. Versions 1 and 2 are not accepted.
+Provider stdout is protocol-only; diagnostics use stderr. Version 3 retained the
+explicit version 2 result model and added activation plus provider-originated
+asynchronous events. Version 4 adds request-scoped progress. Versions 1 and 2
+are not accepted.
+
+## Version negotiation
+
+The version is negotiated, not fixed. Every SDK compares the protocol string
+exactly, so a host that simply began sending a newer one would break every
+existing provider on every request. Instead the host opens at the floor,
+`maelys-provider/3`, reads the version the provider declares in its own
+responses - providers state theirs rather than echoing the host's - and speaks
+that version from then on.
+
+A version 3 provider therefore keeps working untouched and is never sent
+anything it would reject; only a version 4 provider may send progress. This
+mirrors how MCP's own dated revisions are negotiated rather than matched
+(`is_supported_legacy_version`).
 
 Native providers should use the public C provider SDK
 (`maelys/mcp/provider_sdk.h`) rather than writing this protocol loop by hand. The
@@ -40,19 +55,45 @@ lost.
 Requests remain serialized with at most one response outstanding. A dedicated host
 reader is nevertheless always active and accepts id-less events between, before or
 during normal responses. Unknown methods, malformed event parameters, duplicate JSON
-keys, an unexpected response id or any non-v3 envelope fail the provider transport.
+keys, an unexpected response id or an envelope whose version is not supported fail
+the provider transport.
 
 The supported event envelopes are:
 
 ```json
-{"protocol":"maelys-provider/3","method":"provider/notifications/resources/updated","params":{"uri":"hermes://repository/course.mdx"}}
-{"protocol":"maelys-provider/3","method":"provider/notifications/resources/list_changed","params":{}}
-{"protocol":"maelys-provider/3","method":"provider/notifications/tools/list_changed","params":{}}
+{"protocol":"maelys-provider/4","method":"provider/notifications/resources/updated","params":{"uri":"hermes://repository/course.mdx"}}
+{"protocol":"maelys-provider/4","method":"provider/notifications/resources/list_changed","params":{}}
+{"protocol":"maelys-provider/4","method":"provider/notifications/tools/list_changed","params":{}}
 ```
 
 Resource URIs pass through the same bounded `maelys-uri` normalization as native
 events. The runtime then applies negotiated subscription filters, causal coalescence
 and Outbox backpressure. Events are notifications: they have no private response.
+
+## Progress (version 4)
+
+A provider may report progress on the call it is currently handling:
+
+```json
+{"protocol":"maelys-provider/4","method":"provider/notifications/progress","params":{"progress":50,"total":100,"message":"halfway"}}
+```
+
+`progress` is required; `total` and `message` are optional. This frame differs
+from the events above in two ways that matter:
+
+- **It is request-scoped, not fanned out.** The host routes it to the one call
+  in flight rather than to every subscriber. That is unambiguous because
+  provider calls are strictly single-outstanding, so no correlation table is
+  needed - which is also why it is only valid while a call is being handled.
+- **It carries no progress token.** The host holds the token the client
+  supplied and fills it in. A provider therefore cannot address progress at a
+  request that is not its own, and cannot forge one for a client that asked for
+  none - such frames are simply dropped.
+
+The host never emits these from its reader thread. They are queued and drained
+by the thread handling the call, so every emission passes through that
+request's response sink in order, ahead of its final result, rather than around
+it.
 
 ## `provider/describe`
 

@@ -33,6 +33,9 @@ printf '%s\n' \
 test ! -s "$tmp_dir/legacy-err"
 test "$(wc -l <"$tmp_dir/legacy" | tr -d ' ')" = 2
 grep '"id":10' "$tmp_dir/legacy" | grep -q '"protocolVersion":"2025-11-25"'
-test "$(grep '"id":11' "$tmp_dir/legacy" | grep -o '"name":"example\.[^"]*"' | wc -l | tr -d ' ')" = 2
+# echo, sum and progress. Not events: its execute effect is filtered out of
+# tools/list unless the host is started with --allow-effect execute. Update
+# alongside providers/example/main.c.
+test "$(grep '"id":11' "$tmp_dir/legacy" | grep -o '"name":"example\.[^"]*"' | wc -l | tr -d ' ')" = 3
 
 echo "test_stdio: OK"

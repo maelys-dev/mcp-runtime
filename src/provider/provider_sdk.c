@@ -435,7 +435,8 @@ static json_t *handle_message(maelys_mcp_provider_sdk_t *sdk, json_t *message) {
     json_t *method = json_is_object(message) ? json_object_get(message, "method") : NULL;
     json_t *params = json_is_object(message) ? json_object_get(message, "params") : NULL;
     if (!json_is_integer(id) ||
-        !maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL) ||
+        !(maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL) ||
+          maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR)) ||
         !json_is_string(method) || maelys_mcp_json_string_has_nul(method) ||
         (params && !json_is_object(params))) {
         return error_response(json_is_integer(id) ? id : NULL,
@@ -468,6 +469,38 @@ static json_t *handle_message(maelys_mcp_provider_sdk_t *sdk, json_t *message) {
         return success_response(id, json_object());
     }
     return error_response(id, "provider_error", "method not found");
+}
+
+maelys_mcp_result_t maelys_mcp_provider_sdk_report_progress(
+    maelys_mcp_provider_sdk_t *sdk,
+    double progress,
+    double total,
+    const char *message) {
+    if (!sdk) return MAELYS_MCP_ERR_ARGUMENT;
+    json_t *params = json_object();
+    json_t *notification = json_object();
+    if (!params || !notification) goto failed;
+    if (json_object_set_new(params, "progress", json_real(progress)) != 0 ||
+        (total >= 0.0 && json_object_set_new(params, "total", json_real(total)) != 0) ||
+        (message && json_object_set_new(params, "message", json_string(message)) != 0)) {
+        goto failed;
+    }
+    if (json_object_set_new(notification, "protocol",
+            json_string(MAELYS_MCP_PROVIDER_PROTOCOL)) != 0 ||
+        json_object_set_new(notification, "method",
+            json_string("provider/notifications/progress")) != 0) {
+        goto failed;
+    }
+    int attached = json_object_set_new(notification, "params", params) == 0;
+    params = NULL;
+    if (!attached) goto failed;
+    maelys_mcp_result_t status = write_message(sdk, notification);
+    json_decref(notification);
+    return status;
+failed:
+    if (params) json_decref(params);
+    if (notification) json_decref(notification);
+    return MAELYS_MCP_ERR_MEMORY;
 }
 
 maelys_mcp_result_t maelys_mcp_provider_sdk_emit_event(

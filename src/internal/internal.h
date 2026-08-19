@@ -264,6 +264,23 @@ typedef struct maelys_mcp_process_context {
     char *failure_message;
     unsigned long long expected_id;
     json_t *pending_response;
+    /*
+     * The version this provider actually speaks. Opens at the floor and is
+     * raised once the provider declares a newer one in a response, so a /3
+     * provider is never sent something it would reject. Guarded by
+     * state_mutex.
+     */
+    char negotiated_protocol[32];
+    /*
+     * Progress frames the reader has taken off the wire but not yet
+     * delivered. The reader never emits them itself: the sink belongs to the
+     * calling thread's stack frame, and its lifetime is only guaranteed while
+     * that thread is inside the call. The caller drains this queue while it
+     * waits, so every emission happens on the thread that owns the sink, and
+     * passes through sink->emit rather than around it - which is what keeps
+     * progress interceptable by a middleware sink instead of bypassing it.
+     */
+    json_t *pending_progress;
     struct maelys_mcp_provider *owner;
 } maelys_mcp_process_context_t;
 

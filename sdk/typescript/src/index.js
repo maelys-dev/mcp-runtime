@@ -1,6 +1,9 @@
 import readline from "node:readline";
 
-export const PROTOCOL = "maelys-provider/3";
+export const PROTOCOL = "maelys-provider/4";
+/* The version every provider speaks, and the one the host opens with until
+   this SDK declares the newer one in a response. */
+export const PROTOCOL_FLOOR = "maelys-provider/3";
 export const TOOL_EFFECTS = Object.freeze(["read", "preview", "apply", "commit", "execute"]);
 const EVENT_CONTROL = Symbol("maelys-provider-event-control");
 
@@ -240,7 +243,11 @@ function validateProviderResult(result) {
 export async function handleProviderMessage(provider, message) {
   const request = objectValue(message, "provider request");
   if (typeof request.id !== "number" || !Number.isInteger(request.id)) throw new TypeError("provider request id must be an integer");
-  if (request.protocol !== PROTOCOL) throw new TypeError("unsupported provider protocol");
+  /* The host opens at the floor and only speaks the current version once we
+   have declared it in a response, so both are valid inbound. */
+  if (request.protocol !== PROTOCOL && request.protocol !== PROTOCOL_FLOOR) {
+    throw new TypeError("unsupported provider protocol");
+  }
   const params = objectValue(request.params ?? {}, "provider request params");
   let result;
   if (request.method === "provider/describe") {

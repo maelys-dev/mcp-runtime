@@ -11,10 +11,11 @@ The first milestone provides:
 - a static C library, `libmaelys_mcp.a`;
 - the `maelys-mcp` stdio host;
 - injectable in-process providers;
-- persistent out-of-process providers using the explicit `maelys-provider/3` result contract;
+- persistent out-of-process providers using the explicit `maelys-provider` result contract;
 - provider-originated resource and catalog events over a bidirectional, single-reader
   process channel;
-- a public C provider SDK for `maelys-provider/3` process providers;
+- request-scoped `notifications/progress`, opted into per request by the client;
+- a public C provider SDK for `maelys-provider` process providers;
 - MCP `2026-07-28` stateless requests and `server/discover`;
 - legacy MCP `2025-11-25` initialization for compatibility;
 - an explicit module registry with independently enabled Tools, Resources, MRTR and
@@ -130,7 +131,7 @@ src/provider/        in-process and process-provider adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
 providers/example/   independent reference provider
-conformance/          black-box maelys-provider/3 runner and official MCP adapter
+conformance/          black-box maelys-provider runner and official MCP adapter
 sdk/c/                public C process-provider SDK notes
 sdk/typescript/       dependency-free TypeScript/JavaScript provider SDK
 sdk/python/           dependency-free Python provider SDK
@@ -155,10 +156,12 @@ subscriptions and legacy client state; provider events fan out through retained 
 references, so a slow or closing channel cannot suspend its peers. The outbox is now a
 passive bounded queue and stdio owns the only writer thread. This is an intentional
 pre-1.0 API break: embedders must migrate from `runtime_handle` and outbox attach/detach
-to channel create/handle/next/close/destroy. Provider SDKs and `maelys-provider/3` are
-unchanged. Provider calls remain synchronous in this release. Streamable HTTP,
-prompts, Tasks, progress, dynamic provider reload, full JSON Schema 2020-12 and
-Windows support are not implemented yet. The pre-1.0 ABI policy is documented and
+to channel create/handle/next/close/destroy. Provider calls remain synchronous in
+this release. `maelys-provider` is now negotiated rather than fixed: the host opens
+at the version 3 floor and speaks whatever version the provider declares, so an
+unchanged version 3 provider keeps working and only a version 4 one may report
+progress. Streamable HTTP, prompts, Tasks, dynamic provider reload, full JSON
+Schema 2020-12 and Windows support are not implemented yet. The pre-1.0 ABI policy is documented and
 versioned; same-major ABI stability begins with 1.0.
 
 The source is available under the [MIT License](LICENSE).

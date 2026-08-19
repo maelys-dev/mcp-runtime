@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box conformance runner for persistent maelys-provider/3 executables."""
+"""Black-box conformance runner for persistent maelys-provider executables."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# The runner opens at the floor, like the host does, and accepts either
+# version back: a provider declares its own in responses rather than echoing
+# ours, which is how the host learns whether it may send progress.
 PROTOCOL = "maelys-provider/3"
+SUPPORTED_PROTOCOLS = ("maelys-provider/3", "maelys-provider/4")
 EFFECTS = {"read", "preview", "apply", "commit", "execute"}
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -120,7 +124,7 @@ def request(request_id: int, method: str, params: dict[str, Any] | None = None) 
 def validate_envelope(response: Any, request_id: int, expect_error: bool) -> Any:
     if not isinstance(response, dict):
         raise ConformanceError(f"response {request_id} must be an object")
-    if response.get("protocol") != PROTOCOL or response.get("id") != request_id:
+    if response.get("protocol") not in SUPPORTED_PROTOCOLS or response.get("id") != request_id:
         raise ConformanceError(f"response {request_id} does not preserve protocol and id")
     has_result = "result" in response
     has_error = "error" in response
@@ -136,8 +140,9 @@ def validate_envelope(response: Any, request_id: int, expect_error: bool) -> Any
 
 
 def validate_event(message: Any) -> None:
-    if not isinstance(message, dict) or message.get("protocol") != PROTOCOL or "id" in message:
-        raise ConformanceError("provider event must be an id-less provider/3 envelope")
+    if (not isinstance(message, dict) or
+            message.get("protocol") not in SUPPORTED_PROTOCOLS or "id" in message):
+        raise ConformanceError("provider event must be an id-less provider envelope")
     method = message.get("method")
     params = message.get("params", {})
     if not isinstance(params, dict):
