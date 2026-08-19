@@ -327,3 +327,60 @@ half.
 - `⑥` needs a contract: `complete` forwarded exactly once (a middleware that
   swallows it wedges the request, and the runtime should detect that),
   `cancelled` passed through by default, wrapping order the reverse of ④'s.
+
+## Checked against the proxy ecosystem
+
+The hook set was confronted with five shipping proxies and gateways:
+punkpeye/mcp-proxy (transport bridge), MCPProxy (retrieval-first routing),
+Mozilla mcpd (declarative multi-server daemon), Bifrost (commercial gateway:
+explicit execution, agent mode, code mode, per-key filtering, OAuth
+federation), and the permit.io gateway-versus-proxy criteria.
+
+Every headline feature of those five maps onto the hooks without adding one:
+
+| Ecosystem feature | Where it lands here |
+|---|---|
+| Per-key / per-team tool filtering (Bifrost, mcpd) | ⑦ filtering per channel, driven by the channel context |
+| Hidden credential injection, per-user OAuth (Bifrost) | ⑦ hides the argument, ① injects from the channel context |
+| Retrieval-first meta-tools, top-K ranking (MCPProxy) | ⑦ replaces the catalog with synthetic tools; ranking is adapter code; the post-resolution-identity amendment already covers their calls |
+| Quarantine of new upstreams, tool poisoning (MCPProxy) | ② deny on the pinned `(upstream-id, name)` snapshot — the TOCTOU amendment is the stronger form of the same defense |
+| Explicit execution by default (Bifrost) | the orchestrator suspends before `channel_handle` — already this design's REQUIRE_CONFIRMATION position |
+| Output truncation (MCPProxy), redaction (regulated use) | ④, plus ⑥ for streams |
+| Tamper-evident audit (regulated use) | ⑤ with both views |
+| Aggregating many servers behind one endpoint (mcpd) | native: the runtime already hosts multiple providers in one catalog; name collisions are ⑦/① renames with an upstream prefix |
+| Rate limiting per key (mcpd) | ② with a counter behind the adapter's own lock |
+
+Two structural notes fall out of the comparison:
+
+- **In-band elicitation is a genuine differentiator.** punkpeye/mcp-proxy
+  documents that elicitation cannot cross its proxy: on a shared upstream
+  connection, a separate server→client request cannot be routed to the right
+  downstream client. Under `2026-07-28` the interaction rides *inside the
+  result* as `inputRequests`, so it crosses this proxy with no machinery at
+  all. The era choice does the work.
+- **Bifrost's code mode confirms the re-entry concern, and offers the cheap
+  answer.** Their sandbox does not re-enter dispatch: they parse the script,
+  extract every `server.tool()` call, and validate all of them upfront
+  against the same allowlist — auto-execute only if every call passes.
+  Static pre-validation instead of dynamic re-entry sidesteps the
+  exchange-mutex deadlock and the lock-hierarchy surgery entirely. Its known
+  weakness is dynamic dispatch inside the script, which their no-import
+  Starlark subset mostly forecloses. If code mode is ever built here, this
+  is the shape to start from.
+
+What the ecosystem has that this design does not, both already named: a
+transport bridge to HTTP upstreams needs the HTTP client leg (a later
+milestone), and the MRTR continuation hole is not solved by anything
+surveyed — Bifrost's upfront validation does not see continuations either.
+
+Configuration lesson, from mcpd: the declarative surface ("requirements.txt
+for agents" — pinned upstreams, exposed tool lists, per-channel policy
+defaults) belongs in the **host**, as a config file replacing today's CLI
+flags. The library keeps mechanism only; a config format is host policy.
+
+System-level cost contract: an empty chain must be exactly today's code path
+— hook dispatch happens only if a chain is registered, and a hook returning
+NULL means "unchanged, zero copy". The chain being immutable after `serve`
+keeps the hot path lock-free. That, plus the measured baselines (42 µs
+out-of-process round trip, ~0.4 µs channel create), is the efficiency
+argument no surveyed implementation (Node, Go, Python) competes with.
