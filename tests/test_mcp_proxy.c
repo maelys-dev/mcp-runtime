@@ -102,6 +102,15 @@ static const char *first_text(json_t *response) {
     return json_is_string(text) ? json_string_value(text) : NULL;
 }
 
+/* Every existing caller wants no skipped-tool report; the new schema-policy
+ * tests that do want one call maelys_mcp_provider_proxy_spawn directly. */
+static maelys_mcp_result_t spawn_proxy(
+    const maelys_mcp_proxy_options_t *options,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error) {
+    return maelys_mcp_provider_proxy_spawn(options, out_provider, NULL, out_error);
+}
+
 /* Reaches the provider callback directly, below the registry. */
 static maelys_mcp_result_t call_directly(
     maelys_mcp_provider_t *provider,
@@ -144,7 +153,7 @@ static int test_dogfood(const char *host, const char *example_provider) {
     };
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_OK);
     ASSERT_TRUE(provider != NULL);
     free(error);
@@ -251,7 +260,7 @@ static int test_legacy_upstream(const char *upstream) {
     };
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_OK);
     free(error);
     harness_t harness = {0};
@@ -285,7 +294,7 @@ static int test_erroring_upstream(const char *upstream) {
     };
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_OK);
     free(error);
     harness_t harness = {0};
@@ -316,7 +325,7 @@ static int test_chatty_upstream(const char *upstream) {
     };
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_OK);
     free(error);
     harness_t harness = {0};
@@ -344,7 +353,7 @@ static int test_dying_upstream(const char *upstream) {
     };
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_OK);
     free(error);
     error = NULL;
@@ -364,20 +373,170 @@ static int test_dying_upstream(const char *upstream) {
     return 0;
 }
 
+/*
+ * schema_policy (docs/mcp-proxy.md, "Schema policy"): the exotic-schema
+ * upstream advertises one valid tool (proxy.good) and one whose inputSchema
+ * maelys_mcp_validate_schema_definition rejects (proxy.exotic, an empty
+ * oneOf). Default STRICT keeps failing the whole connect; SKIP and
+ * PASSTHROUGH are the two alternatives this change adds.
+ */
+static int test_schema_policy_strict(const char *upstream) {
+    maelys_mcp_proxy_options_t options = {
+        .executable_path = upstream,
+        .connect_timeout_ms = 30000u,
+        .call_timeout_ms = 30000u,
+        .default_effect = MAELYS_MCP_EFFECT_READ
+        /* schema_policy left unset: MAELYS_MCP_PROXY_SCHEMA_STRICT is 0. */
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    char *error = NULL;
+    ASSERT_TRUE(spawn_proxy(&options, &provider, &error) == MAELYS_MCP_ERR_PROTOCOL);
+    ASSERT_TRUE(provider == NULL);
+    ASSERT_TRUE(error != NULL);
+    free(error);
+    return 0;
+}
+
+static int test_schema_policy_skip(const char *upstream) {
+    maelys_mcp_proxy_options_t options = {
+        .executable_path = upstream,
+        .connect_timeout_ms = 30000u,
+        .call_timeout_ms = 30000u,
+        .default_effect = MAELYS_MCP_EFFECT_READ,
+        .schema_policy = MAELYS_MCP_PROXY_SCHEMA_SKIP
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    char *error = NULL;
+    char *skipped = NULL;
+    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+        &options, &provider, &skipped, &error) == MAELYS_MCP_OK);
+    free(error);
+    error = NULL;
+    ASSERT_TRUE(skipped != NULL && strcmp(skipped, "proxy.exotic") == 0);
+    free(skipped);
+
+    harness_t harness = {0};
+    ASSERT_TRUE(harness_open(&harness, provider) == 0);
+    json_t *response = dispatch(harness.channel,
+        request_with(1, "tools/list", json_object()));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(find_tool(response, "proxy.good") != NULL);
+    ASSERT_TRUE(find_tool(response, "proxy.exotic") == NULL);
+    ASSERT_TRUE(json_array_size(json_object_get(
+        json_object_get(response, "result"), "tools")) == 1u);
+    json_decref(response);
+
+    response = dispatch(harness.channel, request_with(2, "tools/call",
+        json_pack("{s:s,s:{}}", "name", "proxy.good", "arguments")));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(first_text(response) != NULL &&
+        strcmp(first_text(response), "good-ok") == 0);
+    json_decref(response);
+
+    /* Absent from the snapshot: refused inside the provider, before any byte
+     * reaches the upstream - the same pinned-identity path test_dogfood
+     * exercises for an ordinary unknown name. */
+    ASSERT_TRUE(call_directly(provider, "proxy.exotic", &error) ==
+        MAELYS_MCP_ERR_NOT_FOUND);
+    ASSERT_TRUE(error != NULL && strstr(error, "pinned upstream catalog") != NULL);
+    free(error);
+
+    ASSERT_TRUE(harness_close(&harness) == 0);
+    return 0;
+}
+
+static int test_schema_policy_skip_nothing_skipped(
+    const char *host, const char *example_provider) {
+    char *const upstream_argv[] = {
+        (char *)host, (char *)"--provider", (char *)example_provider, NULL
+    };
+    maelys_mcp_proxy_options_t options = {
+        .executable_path = host,
+        .argv = upstream_argv,
+        .connect_timeout_ms = 30000u,
+        .call_timeout_ms = 30000u,
+        .default_effect = MAELYS_MCP_EFFECT_READ,
+        .schema_policy = MAELYS_MCP_PROXY_SCHEMA_SKIP
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    char *error = NULL;
+    char *skipped = (char *)0x1; /* poisoned: spawn must set this to NULL */
+    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+        &options, &provider, &skipped, &error) == MAELYS_MCP_OK);
+    free(error);
+    ASSERT_TRUE(skipped == NULL);
+    maelys_mcp_provider_destroy(provider);
+    return 0;
+}
+
+static int test_schema_policy_passthrough(const char *upstream) {
+    maelys_mcp_proxy_options_t options = {
+        .executable_path = upstream,
+        .connect_timeout_ms = 30000u,
+        .call_timeout_ms = 30000u,
+        .default_effect = MAELYS_MCP_EFFECT_READ,
+        .schema_policy = MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    char *error = NULL;
+    ASSERT_TRUE(spawn_proxy(&options, &provider, &error) == MAELYS_MCP_OK);
+    free(error);
+    error = NULL;
+
+    harness_t harness = {0};
+    ASSERT_TRUE(harness_open(&harness, provider) == 0);
+    json_t *response = dispatch(harness.channel,
+        request_with(1, "tools/list", json_object()));
+    ASSERT_TRUE(response != NULL);
+    json_t *exotic = find_tool(response, "proxy.exotic");
+    ASSERT_TRUE(exotic != NULL);
+    /* The permissive schema this runtime's own validator accepts, not the
+     * upstream's unsupported one. */
+    json_t *schema = json_object_get(exotic, "inputSchema");
+    ASSERT_TRUE(json_is_object(schema));
+    ASSERT_TRUE(json_object_size(schema) == 1u);
+    ASSERT_TRUE(string_is(json_object_get(schema, "type"), "object"));
+    ASSERT_TRUE(find_tool(response, "proxy.good") != NULL);
+    ASSERT_TRUE(json_array_size(json_object_get(
+        json_object_get(response, "result"), "tools")) == 2u);
+    json_decref(response);
+
+    /* Callable - arguments go upstream as-is, and this fixture's upstream is
+     * the one that rejects them, standing in for real upstream validation. */
+    response = dispatch(harness.channel, request_with(2, "tools/call",
+        json_pack("{s:s,s:{}}", "name", "proxy.exotic", "arguments")));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(json_is_true(json_object_get(
+        json_object_get(response, "result"), "isError")));
+    ASSERT_TRUE(first_text(response) != NULL &&
+        strcmp(first_text(response), "exotic tool arguments rejected by upstream") == 0);
+    json_decref(response);
+
+    response = dispatch(harness.channel, request_with(3, "tools/call",
+        json_pack("{s:s,s:{}}", "name", "proxy.good", "arguments")));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(first_text(response) != NULL &&
+        strcmp(first_text(response), "good-ok") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(harness_close(&harness) == 0);
+    return 0;
+}
+
 static int test_arguments(const char *upstream) {
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
     maelys_mcp_proxy_options_t options = {
         .executable_path = "relative/path", .default_effect = MAELYS_MCP_EFFECT_READ
     };
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_ERR_ARGUMENT);
     ASSERT_TRUE(provider == NULL && error != NULL);
     free(error);
     error = NULL;
     options.executable_path = upstream;
     options.tool_prefix = "";
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) == MAELYS_MCP_ERR_ARGUMENT);
     free(error);
     error = NULL;
@@ -385,7 +544,7 @@ static int test_arguments(const char *upstream) {
     options.tool_prefix = NULL;
     options.executable_path = "/usr/bin/false";
     options.connect_timeout_ms = 5000u;
-    ASSERT_TRUE(maelys_mcp_provider_proxy_spawn(
+    ASSERT_TRUE(spawn_proxy(
         &options, &provider, &error) != MAELYS_MCP_OK);
     ASSERT_TRUE(provider == NULL && error != NULL);
     free(error);
@@ -393,13 +552,17 @@ static int test_arguments(const char *upstream) {
 }
 
 int main(int argc, char **argv) {
-    ASSERT_TRUE(argc == 7);
+    ASSERT_TRUE(argc == 8);
     ASSERT_TRUE(test_arguments(argv[3]) == 0);
     ASSERT_TRUE(test_dogfood(argv[1], argv[2]) == 0);
     ASSERT_TRUE(test_legacy_upstream(argv[3]) == 0);
     ASSERT_TRUE(test_erroring_upstream(argv[4]) == 0);
     ASSERT_TRUE(test_chatty_upstream(argv[5]) == 0);
     ASSERT_TRUE(test_dying_upstream(argv[6]) == 0);
+    ASSERT_TRUE(test_schema_policy_strict(argv[7]) == 0);
+    ASSERT_TRUE(test_schema_policy_skip(argv[7]) == 0);
+    ASSERT_TRUE(test_schema_policy_skip_nothing_skipped(argv[1], argv[2]) == 0);
+    ASSERT_TRUE(test_schema_policy_passthrough(argv[7]) == 0);
     puts("test_mcp_proxy: OK");
     return 0;
 }

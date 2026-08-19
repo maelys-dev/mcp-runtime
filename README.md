@@ -143,7 +143,7 @@ See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-prot
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
 [C API and ABI policy](docs/abi-policy.md),
 [Passive outbox](docs/outbox.md), [Subscriptions](docs/subscriptions.md),
-[MCP proxy provider](docs/mcp-proxy.md),
+[MCP proxy provider](docs/mcp-proxy.md), [Host provider manifest](docs/manifest.md),
 [Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
 Client setup examples are in [Codex and Claude clients](docs/clients.md).
 The scope and limitations of the upstream test suite are in

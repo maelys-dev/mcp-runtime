@@ -172,6 +172,29 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
 #define MAELYS_MCP_DEFAULT_PROXY_CONNECT_TIMEOUT_MS 10000u
 
 /*
+ * What happens when an upstream tool's inputSchema fails
+ * maelys_mcp_validate_schema_definition. See docs/mcp-proxy.md.
+ *
+ * STRICT is the zero value, deliberately, so an options struct that leaves
+ * this field unset keeps the behaviour this provider shipped with: nobody
+ * loses schema validation on a tool without asking for that trade-off.
+ */
+typedef enum maelys_mcp_proxy_schema_policy {
+    /* Default: a tool this runtime cannot validate fails the whole connect,
+     * naming the tool. */
+    MAELYS_MCP_PROXY_SCHEMA_STRICT = 0,
+    /* The tool is dropped from the exposed catalog; a call naming it fails as
+     * an unknown tool, before any byte reaches the upstream. */
+    MAELYS_MCP_PROXY_SCHEMA_SKIP = 1,
+    /* The tool is exposed with the permissive schema {"type":"object"} (which
+     * this runtime's validator accepts) and arguments are forwarded as-is;
+     * the upstream is the authority on its own schema and validates on its
+     * side. Effect gating, policy and audit still apply - only local
+     * argument validation is delegated. */
+    MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH = 2
+} maelys_mcp_proxy_schema_policy_t;
+
+/*
  * Options for federating a third-party MCP server: the runtime spawns it over
  * stdio, speaks real MCP to it as a client, and re-exposes the tools it finds
  * as an ordinary provider, so effect gating, schema validation, policy and
@@ -197,11 +220,24 @@ typedef struct maelys_mcp_proxy_options {
     /* Optional: "gh." exposes upstream "search" as "gh.search"; the prefix is
      * stripped again when the call is forwarded. NULL exposes names verbatim. */
     const char *tool_prefix;
+    /* What to do with a tool whose inputSchema this runtime cannot validate.
+     * Zero (MAELYS_MCP_PROXY_SCHEMA_STRICT) keeps today's behaviour. */
+    maelys_mcp_proxy_schema_policy_t schema_policy;
 } maelys_mcp_proxy_options_t;
 
+/*
+ * `out_skipped_tools` may be NULL. When schema_policy is
+ * MAELYS_MCP_PROXY_SCHEMA_SKIP and at least one upstream tool was dropped
+ * from the catalog for an unvalidatable schema, and out_skipped_tools is
+ * non-NULL, this sets *out_skipped_tools to a caller-owned (free() it),
+ * comma-separated list of the skipped tools' upstream names. Set to NULL
+ * when nothing was skipped, or when the call does not return
+ * MAELYS_MCP_OK.
+ */
 maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     const maelys_mcp_proxy_options_t *options,
     maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
     char **out_error);
 
 void maelys_mcp_provider_destroy(maelys_mcp_provider_t *provider);

@@ -47,6 +47,14 @@ typedef enum proxy_era {
 typedef struct proxy_binding {
     char *exposed_name;
     char *upstream_name;
+    /* Index of this tool's description inside the tools/list snapshot's
+     * "tools" array - no longer the same as this binding's own index once
+     * MAELYS_MCP_PROXY_SCHEMA_SKIP can drop entries out of the middle. */
+    size_t source_index;
+    /* Set when schema_policy is MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH and this
+     * tool's own inputSchema failed validation: the catalog exposes the
+     * permissive {"type":"object"} schema for it instead. */
+    int passthrough;
 } proxy_binding_t;
 
 typedef struct proxy_context {
@@ -875,15 +883,37 @@ static char *join_prefix(const char *prefix, const char *name) {
     return joined;
 }
 
+/* Grows *list into "a,b,c" as each skipped tool is found. *list starts NULL
+ * (nothing skipped yet) and stays the caller's to free either way. */
+static maelys_mcp_result_t append_skipped_tool(char **list, const char *name) {
+    size_t existing = *list ? strlen(*list) : 0u;
+    size_t addition = strlen(name);
+    char *grown = realloc(*list, existing + (existing ? 1u : 0u) + addition + 1u);
+    if (!grown) return MAELYS_MCP_ERR_MEMORY;
+    if (existing) grown[existing++] = ',';
+    memcpy(grown + existing, name, addition + 1u);
+    *list = grown;
+    return MAELYS_MCP_OK;
+}
+
 /*
  * The catalog snapshot. Listed once, at connect, and never again: this array
  * is the pinned identity every later call is resolved against.
+ *
+ * schema_policy governs a tool whose inputSchema this runtime cannot
+ * validate: STRICT fails the whole connect (see docs/mcp-proxy.md), SKIP
+ * drops just that tool and records its upstream name in *out_skipped_tools,
+ * PASSTHROUGH keeps the tool but exposes it with the permissive
+ * {"type":"object"} schema instead. A tool whose schema does validate is
+ * unaffected by the policy either way.
  */
 static maelys_mcp_result_t snapshot_catalog(
     proxy_context_t *proxy,
     const char *tool_prefix,
+    maelys_mcp_proxy_schema_policy_t schema_policy,
     uint64_t deadline_ms,
     json_t **out_listing,
+    char **out_skipped_tools,
     char **out_error) {
     json_t *params = proxy_request_params(proxy);
     if (!params) return MAELYS_MCP_ERR_MEMORY;
@@ -903,6 +933,7 @@ static maelys_mcp_result_t snapshot_catalog(
         json_decref(result);
         return MAELYS_MCP_ERR_MEMORY;
     }
+    size_t kept = 0u;
     for (size_t index = 0; index < count; ++index) {
         json_t *tool = json_array_get(tools, index);
         json_t *name = json_is_object(tool) ? json_object_get(tool, "name") : NULL;
@@ -921,32 +952,54 @@ static maelys_mcp_result_t snapshot_catalog(
             replace_error(out_error, "upstream MCP tool description is invalid");
             return MAELYS_MCP_ERR_PROTOCOL;
         }
-        /*
-         * A schema this runtime cannot validate fails the connect rather than
-         * being dropped from the catalog: a silently shorter tool list is the
-         * kind of difference nobody notices until a call goes missing.
-         */
         char *schema_error = NULL;
-        if (maelys_mcp_validate_schema_definition(
-            input_schema, 1, &schema_error) != MAELYS_MCP_OK) {
-            json_decref(result);
-            replace_error(out_error, schema_error ?
-                schema_error : "upstream MCP tool schema is unsupported");
+        maelys_mcp_result_t schema_status = maelys_mcp_validate_schema_definition(
+            input_schema, 1, &schema_error);
+        int passthrough = 0;
+        if (schema_status != MAELYS_MCP_OK) {
+            if (schema_policy == MAELYS_MCP_PROXY_SCHEMA_STRICT) {
+                /*
+                 * A schema this runtime cannot validate fails the connect
+                 * rather than being dropped from the catalog: a silently
+                 * shorter tool list is the kind of difference nobody notices
+                 * until a call goes missing. This is the default - an unset
+                 * schema_policy field keeps this behaviour.
+                 */
+                json_decref(result);
+                replace_error(out_error, schema_error ?
+                    schema_error : "upstream MCP tool schema is unsupported");
+                free(schema_error);
+                return MAELYS_MCP_ERR_PROTOCOL;
+            }
             free(schema_error);
-            return MAELYS_MCP_ERR_PROTOCOL;
+            if (schema_policy == MAELYS_MCP_PROXY_SCHEMA_SKIP) {
+                if (append_skipped_tool(out_skipped_tools,
+                    json_string_value(name)) != MAELYS_MCP_OK) {
+                    json_decref(result);
+                    return MAELYS_MCP_ERR_MEMORY;
+                }
+                continue;
+            }
+            /* MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH: keep the tool, but the
+             * catalog will expose {"type":"object"} for it instead of the
+             * schema that failed validation. */
+            passthrough = 1;
+        } else {
+            free(schema_error);
         }
-        free(schema_error);
-        proxy->bindings[index].upstream_name = maelys_mcp_strdup(json_string_value(name));
-        proxy->bindings[index].exposed_name = join_prefix(
-            tool_prefix, json_string_value(name));
-        proxy->binding_count = index + 1u;
-        if (!proxy->bindings[index].upstream_name ||
-            !proxy->bindings[index].exposed_name) {
+        proxy_binding_t *binding = &proxy->bindings[kept];
+        binding->upstream_name = maelys_mcp_strdup(json_string_value(name));
+        binding->exposed_name = join_prefix(tool_prefix, json_string_value(name));
+        binding->source_index = index;
+        binding->passthrough = passthrough;
+        ++kept;
+        proxy->binding_count = kept;
+        if (!binding->upstream_name || !binding->exposed_name) {
             json_decref(result);
             return MAELYS_MCP_ERR_MEMORY;
         }
     }
-    proxy->binding_count = count;
+    proxy->binding_count = kept;
     *out_listing = result;
     return MAELYS_MCP_OK;
 }
@@ -954,7 +1007,9 @@ static maelys_mcp_result_t snapshot_catalog(
 maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     const maelys_mcp_proxy_options_t *options,
     maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
     char **out_error) {
+    if (out_skipped_tools) *out_skipped_tools = NULL;
     if (!options || !options->executable_path ||
         options->executable_path[0] != '/' || !out_provider ||
         (options->tool_prefix && !*options->tool_prefix)) {
@@ -1007,9 +1062,11 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
         return status;
     }
     json_t *listing = NULL;
-    status = snapshot_catalog(proxy, normalized.tool_prefix, deadline_ms,
-        &listing, out_error);
+    char *skipped_tools = NULL;
+    status = snapshot_catalog(proxy, normalized.tool_prefix,
+        normalized.schema_policy, deadline_ms, &listing, &skipped_tools, out_error);
     if (status != MAELYS_MCP_OK) {
+        free(skipped_tools);
         proxy_destroy(proxy);
         return status;
     }
@@ -1017,21 +1074,40 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     size_t count = proxy->binding_count;
     maelys_mcp_tool_t *tools = count ? calloc(count, sizeof(*tools)) : NULL;
     if (count && !tools) {
+        free(skipped_tools);
         json_decref(listing);
         proxy_destroy(proxy);
         return MAELYS_MCP_ERR_MEMORY;
     }
+    /* Shared by every MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH tool. One ref of
+     * our own, released after maelys_mcp_provider_create has taken its own
+     * (via json_incref) for each tool that points at it. */
+    json_t *permissive_schema = NULL;
     for (size_t index = 0; index < count; ++index) {
-        json_t *tool = json_array_get(tools_json, index);
+        const proxy_binding_t *binding = &proxy->bindings[index];
+        json_t *tool = json_array_get(tools_json, binding->source_index);
         json_t *title = json_object_get(tool, "title");
         json_t *description = json_object_get(tool, "description");
+        json_t *schema = json_object_get(tool, "inputSchema");
+        if (binding->passthrough) {
+            if (!permissive_schema) permissive_schema = json_pack("{s:s}", "type", "object");
+            schema = permissive_schema;
+        }
+        if (!schema) {
+            free(skipped_tools);
+            json_decref(listing);
+            if (permissive_schema) json_decref(permissive_schema);
+            free(tools);
+            proxy_destroy(proxy);
+            return MAELYS_MCP_ERR_MEMORY;
+        }
         tools[index] = (maelys_mcp_tool_t){
-            .name = proxy->bindings[index].exposed_name,
+            .name = binding->exposed_name,
             .title = json_is_string(title) ? json_string_value(title) :
-                proxy->bindings[index].exposed_name,
+                binding->exposed_name,
             .description = json_is_string(description) ?
                 json_string_value(description) : "",
-            .input_schema = json_object_get(tool, "inputSchema"),
+            .input_schema = schema,
             /* No outputSchema is republished: this proxy passes the upstream
              * result through, and advertising a schema it does not itself
              * enforce would claim a guarantee it cannot make. */
@@ -1050,11 +1126,16 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     };
     status = maelys_mcp_provider_create(&config, out_provider);
     free(tools);
+    if (permissive_schema) json_decref(permissive_schema);
     json_decref(listing);
     if (status != MAELYS_MCP_OK) {
+        free(skipped_tools);
         replace_error(out_error,
             "upstream MCP catalog cannot be republished by this runtime");
         proxy_destroy(proxy);
+        return status;
     }
+    if (out_skipped_tools) *out_skipped_tools = skipped_tools;
+    else free(skipped_tools);
     return status;
 }

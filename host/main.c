@@ -1,5 +1,6 @@
 #include "maelys/mcp.h"
 #include "src/internal/internal.h"
+#include "host/manifest.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -25,12 +26,18 @@ static int authorize(void *context, const maelys_mcp_request_context_t *request)
 
 static void usage(FILE *stream) {
     fprintf(stream,
-        "Usage: maelys-mcp --provider /absolute/path [--provider /absolute/path ...]\n"
+        "Usage: maelys-mcp [--provider /absolute/path ...] [--manifest /absolute/path]\n"
         "                  [--allow-effect apply|commit|execute ...]\n"
         "                  [--provider-describe-timeout-ms N]\n"
         "                  [--provider-call-timeout-ms N]\n"
         "                  [--provider-shutdown-timeout-ms N]\n"
-        "                  [--stdio-write-timeout-ms N]\n");
+        "                  [--stdio-write-timeout-ms N]\n"
+        "\n"
+        "At least one --provider or a --manifest with at least one provider is\n"
+        "required. --manifest (docs/manifest.md) declares a whole provider set,\n"
+        "including federated mcp-proxy providers that --provider alone cannot;\n"
+        "its providers are added after --provider's, in the manifest's order.\n"
+        "Its \"allowEffects\" is OR-ed with --allow-effect rather than replacing it.\n");
 }
 
 static int parse_timeout(const char *value, unsigned int *out) {
@@ -48,6 +55,7 @@ int main(int argc, char **argv) {
     if (!provider_paths) return 1;
     size_t provider_count = 0;
     host_policy_t policy = {0};
+    const char *manifest_path = NULL;
     unsigned int describe_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS;
     unsigned int call_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS;
     unsigned int shutdown_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS;
@@ -55,6 +63,8 @@ int main(int argc, char **argv) {
     for (int index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--provider") == 0 && index + 1 < argc) {
             provider_paths[provider_count++] = argv[++index];
+        } else if (strcmp(argv[index], "--manifest") == 0 && index + 1 < argc) {
+            manifest_path = argv[++index];
         } else if (strcmp(argv[index], "--allow-effect") == 0 && index + 1 < argc) {
             maelys_mcp_tool_effect_t effect = MAELYS_MCP_EFFECT_UNSPECIFIED;
             if (maelys_mcp_tool_effect_parse(argv[++index], &effect) != MAELYS_MCP_OK ||
@@ -82,9 +92,28 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (provider_count == 0) {
-        fprintf(stderr, "At least one --provider is required.\n");
+
+    manifest_t manifest = {0};
+    if (manifest_path) {
+        char *error = NULL;
+        maelys_mcp_result_t manifest_status = manifest_load(manifest_path, &manifest, &error);
+        if (manifest_status != MAELYS_MCP_OK) {
+            fprintf(stderr, "Cannot load manifest %s: %s%s%s\n",
+                manifest_path, maelys_mcp_result_string(manifest_status),
+                error ? ": " : "", error ? error : "");
+            free(error);
+            free(provider_paths);
+            return 2;
+        }
+        free(error);
+        /* --allow-effect and the manifest's allowEffects are additive, never
+         * one replacing the other - see the usage text above. */
+        policy.allowed_effects |= manifest.allowed_effects;
+    }
+    if (provider_count == 0 && manifest.provider_count == 0) {
+        fprintf(stderr, "At least one --provider or a --manifest provider is required.\n");
         usage(stderr);
+        manifest_clear(&manifest);
         free(provider_paths);
         return 2;
     }
@@ -93,6 +122,7 @@ int main(int argc, char **argv) {
     maelys_mcp_result_t status = maelys_mcp_isolate_stdout(&transport_fd);
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "Cannot isolate MCP stdout: %s\n", maelys_mcp_result_string(status));
+        manifest_clear(&manifest);
         free(provider_paths);
         return 1;
     }
@@ -101,7 +131,7 @@ int main(int argc, char **argv) {
         .server_name = "maelys-mcp",
         .server_version = MAELYS_MCP_VERSION,
         .instructions = "A policy-enforced local MCP runtime for explicitly configured providers.",
-        .max_providers = provider_count,
+        .max_providers = provider_count + manifest.provider_count,
         .max_message_bytes = MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES,
         .authorize = authorize,
         .policy_context = &policy
@@ -111,6 +141,7 @@ int main(int argc, char **argv) {
     if (status != MAELYS_MCP_OK) {
         fprintf(stderr, "Cannot create runtime: %s\n", maelys_mcp_result_string(status));
         close(transport_fd);
+        manifest_clear(&manifest);
         free(provider_paths);
         return 1;
     }
@@ -133,6 +164,7 @@ int main(int argc, char **argv) {
                 maelys_mcp_result_string(destroy_status));
         }
         close(transport_fd);
+        manifest_clear(&manifest);
         free(provider_paths);
         return 1;
     }
@@ -163,12 +195,72 @@ int main(int argc, char **argv) {
                     maelys_mcp_result_string(destroy_status));
             }
             close(transport_fd);
+            manifest_clear(&manifest);
             free(provider_paths);
             return 1;
         }
         free(error);
     }
     free(provider_paths);
+    /* Manifest providers are added after --provider's, in the manifest's own
+     * order - see the usage text. */
+    for (size_t index = 0; index < manifest.provider_count; ++index) {
+        const manifest_provider_t *entry = &manifest.providers[index];
+        maelys_mcp_provider_t *provider = NULL;
+        char *error = NULL;
+        char *skipped_tools = NULL;
+        if (entry->type == MANIFEST_PROVIDER_NATIVE) {
+            maelys_mcp_provider_process_options_t options = {
+                .executable_path = entry->path,
+                .max_message_bytes = entry->max_message_bytes,
+                .describe_timeout_ms = entry->describe_timeout_ms,
+                .call_timeout_ms = entry->call_timeout_ms,
+                .shutdown_timeout_ms = entry->shutdown_timeout_ms
+            };
+            status = maelys_mcp_provider_spawn_with_options(&options, &provider, &error);
+        } else {
+            maelys_mcp_proxy_options_t options = {
+                .executable_path = entry->path,
+                .argv = entry->argv,
+                .max_message_bytes = entry->max_message_bytes,
+                .connect_timeout_ms = entry->connect_timeout_ms,
+                .call_timeout_ms = entry->call_timeout_ms,
+                .default_effect = entry->default_effect,
+                .tool_prefix = entry->tool_prefix,
+                .schema_policy = entry->schema_policy
+            };
+            status = maelys_mcp_provider_proxy_spawn(
+                &options, &provider, &skipped_tools, &error);
+        }
+        if (status == MAELYS_MCP_OK) {
+            status = maelys_mcp_runtime_add_provider(runtime, provider, &error);
+        }
+        if (status != MAELYS_MCP_OK) {
+            fprintf(stderr, "Cannot load manifest provider %s: %s%s%s\n",
+                entry->path, maelys_mcp_result_string(status),
+                error ? ": " : "", error ? error : "");
+            if (provider) maelys_mcp_provider_destroy(provider);
+            free(error);
+            free(skipped_tools);
+            maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+            if (destroy_status != MAELYS_MCP_OK) {
+                fprintf(stderr, "Cannot destroy runtime: %s\n",
+                    maelys_mcp_result_string(destroy_status));
+            }
+            close(transport_fd);
+            manifest_clear(&manifest);
+            return 1;
+        }
+        free(error);
+        /* Guarded so a clean run keeps stderr empty (scripts/test_stdio.sh
+         * asserts that): only printed when a tool was actually skipped. */
+        if (skipped_tools) {
+            fprintf(stderr, "Provider %s skipped tools with unsupported schemas: %s\n",
+                entry->path, skipped_tools);
+            free(skipped_tools);
+        }
+    }
+    manifest_clear(&manifest);
     maelys_mcp_stdio_options_t stdio_options = {
         .write_timeout_ms = stdio_write_timeout_ms
     };
