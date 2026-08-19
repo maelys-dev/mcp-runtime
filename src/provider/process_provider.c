@@ -322,10 +322,25 @@ static maelys_mcp_result_t process_exchange(
     json_t *response = process->pending_response;
     process->pending_response = NULL;
     process->waiting = 0;
+    /*
+     * Take whatever progress is still queued along with the response. The loop
+     * above exits the moment pending_response is set, so a provider that wrote
+     * its progress and its result before this thread woke even once would
+     * otherwise leave those frames undelivered - and the client would see the
+     * response first, which is exactly the ordering the queue exists to
+     * prevent. Emitted below, still ahead of the response: this function only
+     * returns the result, and completing it happens further up the stack.
+     */
+    json_t *trailing_progress = process->pending_progress;
+    process->pending_progress = NULL;
     maelys_mcp_result_t failure_status = process->failure_status;
     char *failure_message = maelys_mcp_strdup(process->failure_message);
     int closing = process->closing;
     pthread_mutex_unlock(&process->state_mutex);
+    if (trailing_progress) {
+        emit_pending_progress(reporter, trailing_progress);
+        json_decref(trailing_progress);
+    }
     if (closing) (void)shutdown(process->fd, SHUT_RDWR);
     if (!response) {
         replace_error(out_error, failure_message ? failure_message :
