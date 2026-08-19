@@ -16,7 +16,7 @@ maelys_mcp_proxy_options_t options = {
 };
 maelys_mcp_provider_t *provider = NULL;
 char *error = NULL;
-maelys_mcp_provider_proxy_spawn(&options, &provider, &error);
+maelys_mcp_provider_proxy_spawn(&options, &provider, NULL, &error);
 ```
 
 ## Era negotiation
@@ -51,11 +51,26 @@ provider, before any byte reaches the upstream.
 `tool_prefix` applies to the **exposed** name only (`"gh."` exposes upstream
 `search` as `gh.search`) and is stripped again when the call is forwarded.
 
-A tool whose `inputSchema` this runtime cannot validate fails the connect,
-naming the tool, rather than being quietly dropped from the catalog: a silently
-shorter tool list is the kind of difference nobody notices until a call goes
-missing. No `outputSchema` is republished — the proxy passes the upstream result
+No `outputSchema` is republished — the proxy passes the upstream result
 through and will not advertise a guarantee it does not itself enforce.
+
+## Schema policy
+
+Some upstream `inputSchema` values fall outside the subset
+`maelys_mcp_validate_schema_definition` supports. `schema_policy` decides what
+happens to a tool whose schema is one of those, and does not affect a tool
+whose schema validates fine:
+
+| Policy | Behaviour | Trade-off |
+|---|---|---|
+| `MAELYS_MCP_PROXY_SCHEMA_STRICT` (0, default) | The whole connect fails, naming the tool. | Nothing federates until every tool's schema is one this runtime can check locally. Safest, but one exotic tool blocks the entire upstream. |
+| `MAELYS_MCP_PROXY_SCHEMA_SKIP` | The tool is absent from the exposed catalog. A call naming it fails as an unknown tool, before any byte reaches the upstream. `maelys_mcp_provider_proxy_spawn`'s optional `out_skipped_tools` parameter reports the dropped names as a caller-owned, comma-separated list (NULL when nothing was skipped). | The rest of the upstream federates; the dropped tool is simply unavailable, and a caller that does not check `out_skipped_tools` gets a silently shorter catalog. |
+| `MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH` | The tool is exposed with the permissive schema `{"type":"object"}` (which this runtime's validator accepts), and arguments are forwarded as-is. | The upstream becomes the sole authority on its own argument shape; this runtime validates nothing about the call's arguments locally. Effect gating, policy and audit still apply to the call - only local argument validation is delegated. |
+
+`STRICT` is the zero value of `maelys_mcp_proxy_schema_policy_t`, so an
+options struct that leaves `schema_policy` unset keeps the behaviour this
+provider shipped with: nobody loses schema validation on a tool without
+asking for that trade-off.
 
 ## Effect mapping
 

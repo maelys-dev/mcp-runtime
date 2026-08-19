@@ -64,7 +64,7 @@ LIB_SOURCES := \
 	src/transport/stdio.c \
 	src/transport/stdio_isolation.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJ)/%.o)
-DEPENDENCY_SOURCES := $(LIB_SOURCES) host/main.c providers/example/main.c \
+DEPENDENCY_SOURCES := $(LIB_SOURCES) host/main.c host/manifest.c providers/example/main.c \
 	$(wildcard tests/*.c) tests/helpers/adversarial_provider.c
 DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
@@ -83,7 +83,7 @@ $(LIB)/libmaelys_mcp.a: $(LIB_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
 
-$(BIN)/maelys-mcp: $(OBJ)/host/main.o $(LIB)/libmaelys_mcp.a
+$(BIN)/maelys-mcp: $(OBJ)/host/main.o $(OBJ)/host/manifest.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -95,7 +95,7 @@ $(BIN)/adversarial-provider: $(OBJ)/tests/helpers/adversarial_provider.o
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream: $(BIN)/adversarial-provider
+$(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream: $(BIN)/adversarial-provider
 	ln -sf $(notdir $<) $@
 
 $(BIN)/test-runtime: $(OBJ)/tests/test_runtime.o $(LIB)/libmaelys_mcp.a
@@ -111,6 +111,13 @@ $(BIN)/test-process-provider: $(OBJ)/tests/test_process_provider.o $(LIB)/libmae
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 $(BIN)/test-mcp-proxy: $(OBJ)/tests/test_mcp_proxy.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+# host/manifest.o is host-level, not part of libmaelys_mcp.a (see
+# docs/manifest.md: the public library surface does not grow for it), so the
+# test binary links the object directly - the same seam the host binary uses.
+$(BIN)/test-manifest: $(OBJ)/tests/test_manifest.o $(OBJ)/host/manifest.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -170,7 +177,7 @@ $(NO_THREAD_BIN): tests/test_channel_no_thread.c $(LIB_SOURCES)
 test-channel-no-thread-nosanitize: $(NO_THREAD_BIN)
 	$(NO_THREAD_BIN)
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -191,7 +198,9 @@ test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-p
 		$(abspath $(BIN)/fd-check-provider) $(abspath $(BIN)/stubborn-provider)
 	$(BIN)/test-mcp-proxy $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
-		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream)
+		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream) \
+		$(abspath $(BIN)/exotic-schema-mcp-upstream)
+	$(BIN)/test-manifest
 	scripts/test_stdio.sh $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider)
 
 audit:
@@ -251,7 +260,8 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
 		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider \
-		$(BIN)/maelys-mcp $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream
+		$(BIN)/maelys-mcp $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream \
+		$(BIN)/exotic-schema-mcp-upstream
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channels
@@ -264,7 +274,8 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 		$(abspath $(BIN)/fd-check-provider) $(abspath $(BIN)/stubborn-provider)
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-mcp-proxy $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
-		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream)
+		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream) \
+		$(abspath $(BIN)/exotic-schema-mcp-upstream)
 
 FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer

@@ -55,7 +55,11 @@ typedef enum mcp_upstream_mode {
     MCP_UPSTREAM_LEGACY,
     MCP_UPSTREAM_ERRORING,
     MCP_UPSTREAM_CHATTY,
-    MCP_UPSTREAM_DYING
+    MCP_UPSTREAM_DYING,
+    /* One valid tool alongside one whose inputSchema
+     * maelys_mcp_validate_schema_definition rejects (an empty oneOf) - the
+     * upstream for the proxy's schema_policy tests (docs/mcp-proxy.md). */
+    MCP_UPSTREAM_EXOTIC_SCHEMA
 } mcp_upstream_mode_t;
 
 /* The proxy writes jsonrpc, id, method, params in that order and never nests
@@ -63,6 +67,14 @@ typedef enum mcp_upstream_mode {
 static long request_id(const char *request) {
     const char *marker = strstr(request, "\"id\":");
     return marker ? strtol(marker + 5, NULL, 10) : 0;
+}
+
+/* Whitebox by design, like request_id above: matches the tool name a
+ * tools/call request names, without parsing the request as JSON. */
+static int request_names_tool(const char *request, const char *name) {
+    char needle[128];
+    (void)snprintf(needle, sizeof(needle), "\"name\":\"%s\"", name);
+    return strstr(request, needle) != NULL;
 }
 
 static int mcp_upstream(mcp_upstream_mode_t mode) {
@@ -84,15 +96,39 @@ static int mcp_upstream(mcp_upstream_mode_t mode) {
                 "\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":"
                 "{\"name\":\"legacy-upstream\",\"version\":\"1\"}}}\n", id);
         } else if (strstr(request, "\"tools/list\"")) {
-            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"tools\":[{\"name\":\"%s\","
-                "\"title\":\"Fixture tool\",\"description\":\"A fixture upstream tool.\","
-                "\"inputSchema\":{\"type\":\"object\"}}]}}\n", id, tool);
+            if (mode == MCP_UPSTREAM_EXOTIC_SCHEMA) {
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"tools\":["
+                    "{\"name\":\"proxy.good\",\"title\":\"Good tool\","
+                    "\"description\":\"A fixture tool with a valid schema.\","
+                    "\"inputSchema\":{\"type\":\"object\"}},"
+                    "{\"name\":\"proxy.exotic\",\"title\":\"Exotic tool\","
+                    "\"description\":\"A fixture tool with an unsupported schema.\","
+                    "\"inputSchema\":{\"type\":\"object\",\"oneOf\":[]}}"
+                    "]}}\n", id);
+            } else {
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"tools\":[{\"name\":\"%s\","
+                    "\"title\":\"Fixture tool\",\"description\":\"A fixture upstream tool.\","
+                    "\"inputSchema\":{\"type\":\"object\"}}]}}\n", id, tool);
+            }
         } else if (strstr(request, "\"tools/call\"")) {
             if (mode == MCP_UPSTREAM_DYING) {
                 (void)fflush(stdout);
                 _exit(0);
             }
-            if (mode == MCP_UPSTREAM_ERRORING) {
+            if (mode == MCP_UPSTREAM_EXOTIC_SCHEMA) {
+                /* proxy.exotic is only ever called under
+                 * MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH, which forwards
+                 * arguments without local validation - this upstream is the
+                 * one that rejects them, standing in for real argument
+                 * validation an upstream would do itself. */
+                if (request_names_tool(request, "proxy.exotic")) {
+                    printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{\"code\":-32000,"
+                        "\"message\":\"exotic tool arguments rejected by upstream\"}}\n", id);
+                } else {
+                    printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"content\":"
+                        "[{\"type\":\"text\",\"text\":\"good-ok\"}]}}\n", id);
+                }
+            } else if (mode == MCP_UPSTREAM_ERRORING) {
                 printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{\"code\":-32000,"
                     "\"message\":\"upstream refused the call\"}}\n", id);
             } else if (mode == MCP_UPSTREAM_CHATTY) {
@@ -130,6 +166,7 @@ int main(int argc, char **argv) {
     if (strstr(argv[0], "erroring-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_ERRORING);
     if (strstr(argv[0], "chatty-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_CHATTY);
     if (strstr(argv[0], "dying-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_DYING);
+    if (strstr(argv[0], "exotic-schema-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_EXOTIC_SCHEMA);
     if (strstr(argv[0], "fd-check")) {
 #if !defined(MAELYS_TEST_ADDRESS_SANITIZER) && \
     !defined(MAELYS_TEST_THREAD_SANITIZER)
