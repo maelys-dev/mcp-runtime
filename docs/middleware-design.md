@@ -96,6 +96,34 @@ change**, not the status quo. It is wanted — a denied caller should not be
 able to probe argument schemas through validation error details — but it must
 ship as a named change, not slip in as a side effect.
 
+## Checked against real transformation use cases
+
+The hook set was validated against FastMCP's own worked examples, not only
+against this codebase. Four of five map cleanly: renaming arguments is ⑦ plus
+①; a hidden argument with a constant default is ⑦ removing it from the
+published schema and ① injecting it; a `default_factory` is the same with ①
+computing per call; a per-user tool is ⑦ filtering the catalog per channel and
+① injecting from that channel's context.
+
+That last one is worth noting: FastMCP builds one tool object per user at
+registration, which suits one server per user. It is **unimplementable in a
+multi-client runtime without the per-channel context** — the strongest
+justification that decision has. It also confirms the audit amendment, since
+FastMCP's canonical hidden-argument example is literally an `api_key`: an
+audit seeing only post-injection state would log it.
+
+Two precisions the examples force, neither of which was stated above:
+
+- **① must emit arguments valid against the *real* schema.** Validation runs
+  after ① and checks the underlying tool's schema, not the published one. A
+  transform that changes an argument's *type* must therefore convert in ①;
+  rewriting the type in ⑦ alone makes validation reject every call.
+- **The `forward()` pattern survives but splits in two.** FastMCP expresses
+  "validate, maybe raise, then call the original with remapped arguments" as
+  one function. Here it is ① for the remapping and ③ for the short circuit.
+  That is the price of ③'s const arguments, and it is a real ergonomic cost,
+  not a wash.
+
 ## Why hooks rather than one `call_next`
 
 An onion wrapper subsumes the flat hooks: it can rewrite arguments before
