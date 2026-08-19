@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.13.0 - 2026-08-20
+
+- **MCP proxy provider**: federate any third-party MCP server over stdio. mcp-runtime
+  spawns it, negotiates its era (modern `2026-07-28` or a legacy dated revision),
+  snapshots its tool catalog once at connect, and re-exposes those tools through the
+  normal provider pipeline — effect gating, schema validation, policy and audit all
+  apply to traffic this runtime did not originate. The catalog snapshot is pinned:
+  calls resolve only against it, never against a fresh list, so a renamed or
+  disappeared upstream tool cannot be silently substituted. Progress notifications
+  relay end to end, correlated on the caller's own client token, never the upstream's.
+- **Schema policy for the proxy**: an upstream tool whose `inputSchema` this runtime's
+  strict validator cannot handle no longer has to fail the whole connection. Three
+  policies — `strict` (default: fails connect, unchanged from initial release),
+  `skip` (the tool is dropped from the catalog and reported by name; the rest of the
+  upstream stays usable), `passthrough` (the tool is exposed with a permissive schema
+  and the upstream validates its own arguments; effect gating, policy and audit still
+  apply).
+- **Provider manifest**: `--manifest /absolute/path.json` declares a whole provider
+  set — native and proxy providers alike, plus `allowEffects` — instead of one
+  `--provider` flag per process. Strict two-phase validation rejects any unknown key
+  by name and location; nothing is constructed from a partially validated document.
+  Composes with `--provider`/`--allow-effect` rather than replacing them. See
+  `docs/manifest.md`.
+- **`notifications/progress` support**, end to end. In-process and out-of-process
+  providers can report progress on a long-running call; the bare `_meta.progressToken`
+  key (identical across both protocol eras) opts a call in, and progress frames are
+  delivered in strict order ahead of the call's final response — including over the
+  provider wire, which required negotiating `maelys-provider/3` → `/4` (a provider
+  declares its own version in responses; the host never requires an upgrade, so an
+  unmodified `/3` provider keeps working exactly as before). Closes the official
+  conformance suite's `tools-call-with-progress` scenario in both the modern and
+  legacy requirement sets.
+- **Response sink**: dispatch now delivers through a transport-neutral sink
+  (`emit`/`complete`/`cancelled`) instead of assuming a single buffered reply. Pure
+  internal refactor with no behavioural change on its own — the foundation the
+  progress and (future) HTTP streaming work build on.
+- Official conformance coverage extended to the legacy `2025-11-25` requirement set,
+  fetched live from the official tool rather than hand-copied, plus a permanent
+  concurrent-dispatch test and channel/provider performance baselines that now run on
+  every `make check`/`make tsan`.
+
 ## 0.12.2 - 2026-08-17
 
 - Legacy clients (`2024-11-05` through `2025-11-25`) can now use `input_required`/MRTR
