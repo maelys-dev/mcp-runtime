@@ -169,6 +169,41 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     maelys_mcp_provider_t **out_provider,
     char **out_error);
 
+#define MAELYS_MCP_DEFAULT_PROXY_CONNECT_TIMEOUT_MS 10000u
+
+/*
+ * Options for federating a third-party MCP server: the runtime spawns it over
+ * stdio, speaks real MCP to it as a client, and re-exposes the tools it finds
+ * as an ordinary provider, so effect gating, schema validation, policy and
+ * audit apply to them unchanged. See docs/mcp-proxy.md.
+ */
+typedef struct maelys_mcp_proxy_options {
+    /* Absolute, like maelys_mcp_provider_spawn. */
+    const char *executable_path;
+    /* NULL-terminated argv for the upstream, or NULL for {executable_path}. */
+    char *const *argv;
+    size_t max_message_bytes;
+    /* Covers spawn, era negotiation and the one tools/list together. */
+    unsigned int connect_timeout_ms;
+    unsigned int call_timeout_ms;
+    /*
+     * MCP has no effect classes, so this one is assigned to every upstream
+     * tool. UNSPECIFIED is treated as EXECUTE, not READ: hosts gate
+     * apply/commit/execute behind --allow-effect, so the conservative value a
+     * caller should pass - and the one an unset field falls back to - is a
+     * gated class rather than an ungated one.
+     */
+    maelys_mcp_tool_effect_t default_effect;
+    /* Optional: "gh." exposes upstream "search" as "gh.search"; the prefix is
+     * stripped again when the call is forwarded. NULL exposes names verbatim. */
+    const char *tool_prefix;
+} maelys_mcp_proxy_options_t;
+
+maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
+    const maelys_mcp_proxy_options_t *options,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error);
+
 void maelys_mcp_provider_destroy(maelys_mcp_provider_t *provider);
 
 #ifdef __cplusplus

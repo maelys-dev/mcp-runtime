@@ -59,6 +59,7 @@ LIB_SOURCES := \
 	src/modules/subscriptions.c \
 	src/provider/provider.c \
 	src/provider/process_provider.c \
+	src/provider/mcp_proxy.c \
 	src/provider/provider_sdk.c \
 	src/transport/stdio.c \
 	src/transport/stdio_isolation.c
@@ -94,7 +95,7 @@ $(BIN)/adversarial-provider: $(OBJ)/tests/helpers/adversarial_provider.o
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider: $(BIN)/adversarial-provider
+$(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream: $(BIN)/adversarial-provider
 	ln -sf $(notdir $<) $@
 
 $(BIN)/test-runtime: $(OBJ)/tests/test_runtime.o $(LIB)/libmaelys_mcp.a
@@ -106,6 +107,10 @@ $(BIN)/test-runtime-protocol: $(OBJ)/tests/test_runtime_protocol.o $(LIB)/libmae
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 $(BIN)/test-process-provider: $(OBJ)/tests/test_process_provider.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+$(BIN)/test-mcp-proxy: $(OBJ)/tests/test_mcp_proxy.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -165,7 +170,7 @@ $(NO_THREAD_BIN): tests/test_channel_no_thread.c $(LIB_SOURCES)
 test-channel-no-thread-nosanitize: $(NO_THREAD_BIN)
 	$(NO_THREAD_BIN)
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -184,6 +189,9 @@ test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-p
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
 		$(abspath $(BIN)/environment-provider) $(abspath $(BIN)/slow-describe-provider) \
 		$(abspath $(BIN)/fd-check-provider) $(abspath $(BIN)/stubborn-provider)
+	$(BIN)/test-mcp-proxy $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider) \
+		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
+		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream)
 	scripts/test_stdio.sh $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider)
 
 audit:
@@ -239,10 +247,11 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-process-provider $(BIN)/test-provider-sdk \
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
-		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider
+		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider \
+		$(BIN)/maelys-mcp $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channels
@@ -253,6 +262,9 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
 		$(abspath $(BIN)/environment-provider) $(abspath $(BIN)/slow-describe-provider) \
 		$(abspath $(BIN)/fd-check-provider) $(abspath $(BIN)/stubborn-provider)
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-mcp-proxy $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider) \
+		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
+		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream)
 
 FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
