@@ -40,8 +40,9 @@ typedef struct maelys_mcp_request_context {
 ```
 
 `authorize()` returns an int over that metadata alone — no arguments, no
-result. `audit()` is void and fire-and-forget. Four call sites, one callback
-each, no chain and no mutation. `policy_context` is **runtime-global**;
+result. `audit()` is void and fire-and-forget. **Five decision points**, one
+callback each, no chain and no mutation: `tools.c:88` (list) and `:356`
+(call), `resources.c:93` (list), `:127` (templates) and `:240` (read). `policy_context` is **runtime-global**;
 `maelys_mcp_channel_config_t` carries only queue and timeout settings.
 
 The response sink already exists and is in use, its first consumer being
@@ -140,6 +141,16 @@ per-principal, per-session mechanism: the runtime carries the pointer and never
 interprets it. It is read-only from the runtime's side; an adapter needing
 mutability owns its own locking behind that pointer.
 
+The runtime has no write API because it has nothing of its own to write:
+modern-protocol identity is client-asserted per request and defaults to
+unknown, so the embedder-bound pointer is the only anchor worth
+authenticating against — middleware must never base a decision on
+`client_name`. Two obligations follow, neither checkable by the runtime: the
+box is freed only after `channel_destroy` returns, and one channel maps to one
+principal. One API gap follows too: `serve_stdio` creates its channel
+internally, so there is currently no seam to bind the context when using the
+stock transport.
+
 Without it no chain can distinguish two clients sharing one runtime, however
 many hooks it has. It is a prerequisite, not a later refinement.
 
@@ -167,11 +178,35 @@ What remains genuinely reverse:
 
 **The two directions have different threading contracts, and conflating them
 would be a trap.** Inbound hooks run on the thread handling one request,
-serialized within that request. A fanout hook runs on whatever thread called
-`notify_*`, concurrently across every targeted channel, and on a path that
-deliberately holds no runtime or channel lock while enqueuing. So a fanout hook
-must be non-blocking and reentrant across channels, which an inbound hook need
-not be.
+serialized within that request, and may block. A fanout hook must be
+**non-blocking and reentrant across channels**, for two distinct reasons:
+
+- *Reentrant*, because `notify_*` may be called concurrently by several
+  producers, so the same hook is entered concurrently for different channels.
+- *Reentrant for the **same** channel too*, not merely across channels:
+  concurrent producers — the provider event thread plus any embedder thread
+  calling `notify_*` — each walk the full channel list.
+- *Non-blocking*, because `emit_event` walks the targeted channels
+  **sequentially**.
+
+Be precise about what that second point protects, because the obvious
+justification is wrong twice over. It is not lock contention: the channel
+mutex is released before the message is built and enqueued
+(`emit_event_to_channel`). Nor is it a no-stall invariant — **there is no such
+invariant today**. `maelys_mcp_outbox_enqueue_take` waits for admission up to
+`admission_timeout_ms`, 5000 ms by default, inside that sequential walk, so a
+congested channel already delays every peer after it by up to five seconds per
+event. `docs/subscriptions.md` claims only that channel *close* never stops
+fanout to peers, which is a different guarantee.
+
+The contract therefore exists to avoid **converting a bounded stall into an
+unbounded one**, not to preserve a property the runtime does not have.
+
+Fanout also enqueues with `fault_on_timeout` cleared, unlike the request path —
+a slow consumer does not fault its channel here — and fanout messages coalesce
+by key, so a later event can replace one already queued. A fanout hook
+therefore cannot serve as a delivery audit: "the hook approved it" does not
+mean "the client received it".
 
 They therefore get separate types with separate documented contracts, not one
 interface used in two places. `wrap_sink` covers per-request outbound frames;
@@ -190,7 +225,9 @@ borrow the request-scoped contract.
   reproduces today's behaviour, so migration is mechanical.
 - Registering "just an authorizer" must stay as ergonomic as today's two
   function pointers. If the degenerate case gets harder, the replacement was
-  botched.
+  botched. Note the compat middleware reproduces today's *decision surface*,
+  not today's observable ordering — the policy/validation reorder above is a
+  deliberate, named change.
 
 ## Known holes, named rather than hidden
 
@@ -198,18 +235,38 @@ borrow the request-scoped contract.
   `resources/updated`. This is now in scope rather than a hole — see "Both
   directions" above — but it is the piece with the hardest contract, because
   it runs concurrently on a producer thread rather than on a request thread.
-- **`tools/list_changed` has no trigger.** If ⑦'s output depends on middleware
-  state or an upstream's live catalog, nothing can fire the change
-  notification.
+- **Nothing ties `tools/list_changed` to middleware state.** The trigger
+  itself exists (`maelys_mcp_runtime_notify_tools_list_changed`, fired by
+  provider events); what is missing is any way for a change in ⑦'s output, or
+  in an upstream's live catalog, to fire it.
 - **Result-schema validation versus ④.** `validate_provider_result` runs on the
   provider's result. A ④ that rewrites afterwards yields a result checked
   against no schema — or, if ⑦ rewrote the advertised `outputSchema`, against
   the wrong one. The runtime validates the real result against the real schema;
   keeping ⑦ and ④ consistent is the middleware author's responsibility and the
   runtime cannot check it.
-- **The resource path needs the same treatment.** Two of the four policy call
-  sites are in `resources.c`; without URI rewriting and read-result redaction,
-  MITM has a hole half its width.
+- **The resource path needs the same treatment, and this is a hard sequencing
+  constraint, not a nicety.** *Three of the five* policy decision points are in
+  `resources.c`. Because the chain **replaces** `authorize`/`audit`, shipping
+  it before resource hooks exist would silently remove resource authorization
+  altogether — the compat middleware would have nowhere to hang it. Resource
+  hooks must land in the same release as the replacement.
+- **MRTR continuation traffic is invisible to every hook.** `requestState` is
+  an opaque provider blob round-tripped through the client, and
+  `inputResponses` carries elicitation answers and sampling completions — the
+  most sensitive inbound payloads in the protocol. Both are siblings of
+  `arguments`, and ① as specified sees only name and arguments. A continuation
+  can also arrive on a *different* channel than the one that issued it, so the
+  per-channel context cannot fence a stolen or stale `requestState`: the
+  "swap anonymous for authenticated" scenario leaves pre-auth continuations
+  valid after the swap. ① and ② must see the full call params, or a
+  continuation hook must exist. This is the largest genuine gap in the design.
+- **`server/discover` and `initialize` sit outside every hook and every policy
+  point.** Consistent with today, but a MITM claiming to govern what a
+  principal may know should name it.
+- **Close-time subscription completions bypass both directions.**
+  `maelys_mcp_channel_complete_subscriptions_until` enqueues responses
+  directly, and the originating request's sink is long gone.
 
 ## Out of scope, and why
 
