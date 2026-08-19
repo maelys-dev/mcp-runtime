@@ -10,7 +10,7 @@ extern "C" {
  */
 #define MAELYS_MCP_VERSION_MAJOR 0u
 #define MAELYS_MCP_VERSION_MINOR 13u
-#define MAELYS_MCP_VERSION_PATCH 0u
+#define MAELYS_MCP_VERSION_PATCH 1u
 
 /*
  * The ABI number changes whenever a released public C layout or calling
