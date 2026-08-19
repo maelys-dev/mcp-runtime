@@ -71,6 +71,37 @@ static int provider_event_from_message(
     return 0;
 }
 
+/* Accepts either version: the floor every provider speaks, or the current
+ * one. Anything else is still a protocol failure. */
+static int supported_provider_protocol(const json_t *protocol) {
+    return maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL) ||
+        maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR);
+}
+
+/* Beyond this many undelivered frames the oldest are dropped. Progress is
+ * advisory and monotonic, so a subset in order is still correct, whereas an
+ * unbounded queue would hand a flooding provider a memory leak. */
+#define MAX_PENDING_PROGRESS 256
+
+/* Called only from the thread inside the provider call, never from the
+ * reader: `reporter` points into that thread's stack frame. */
+static void emit_pending_progress(
+    maelys_mcp_progress_reporter_t *reporter,
+    json_t *frames) {
+    size_t index;
+    json_t *frame;
+    json_array_foreach(frames, index, frame) {
+        json_t *progress = json_object_get(frame, "progress");
+        json_t *total = json_object_get(frame, "total");
+        json_t *message = json_object_get(frame, "message");
+        if (!json_is_number(progress)) continue;
+        (void)maelys_mcp_provider_report_progress(reporter,
+            json_number_value(progress),
+            json_is_number(total) ? json_number_value(total) : -1.0,
+            json_is_string(message) ? json_string_value(message) : NULL);
+    }
+}
+
 static void *process_reader_main(void *opaque) {
     maelys_mcp_process_context_t *process = opaque;
     for (;;) {
@@ -93,7 +124,7 @@ static void *process_reader_main(void *opaque) {
         json_t *protocol = json_is_object(message) ?
             json_object_get(message, "protocol") : NULL;
         json_t *id = json_is_object(message) ? json_object_get(message, "id") : NULL;
-        if (!maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL)) {
+        if (!supported_provider_protocol(protocol)) {
             json_decref(message);
             pthread_mutex_lock(&process->state_mutex);
             set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
@@ -116,6 +147,30 @@ static void *process_reader_main(void *opaque) {
             process->pending_response = message;
             pthread_cond_broadcast(&process->response_ready);
             pthread_mutex_unlock(&process->state_mutex);
+            continue;
+        }
+        /* Progress is request-scoped, unlike the fanout events below: it is
+         * queued for the thread inside the call rather than broadcast, so it
+         * cannot reach a channel that did not ask for it. The provider never
+         * names a token - the host holds it - so a provider cannot address
+         * progress at a request that is not its own. */
+        if (!id && maelys_mcp_json_string_equals(
+                json_object_get(message, "method"),
+                "provider/notifications/progress")) {
+            json_t *frame = json_object_get(message, "params");
+            pthread_mutex_lock(&process->state_mutex);
+            if (process->waiting && json_is_object(frame)) {
+                if (!process->pending_progress) process->pending_progress = json_array();
+                if (process->pending_progress) {
+                    while (json_array_size(process->pending_progress) >= MAX_PENDING_PROGRESS) {
+                        (void)json_array_remove(process->pending_progress, 0);
+                    }
+                    (void)json_array_append(process->pending_progress, frame);
+                    pthread_cond_broadcast(&process->response_ready);
+                }
+            }
+            pthread_mutex_unlock(&process->state_mutex);
+            json_decref(message);
             continue;
         }
         maelys_mcp_provider_event_t event;
@@ -164,6 +219,7 @@ static maelys_mcp_result_t process_exchange(
     const char *method,
     unsigned int timeout_ms,
     json_t *params,
+    maelys_mcp_progress_reporter_t *reporter,
     json_t **out_result,
     char **out_error) {
     if (!process || process->fd < 0 || !method || !out_result) return MAELYS_MCP_ERR_ARGUMENT;
@@ -196,7 +252,12 @@ static maelys_mcp_result_t process_exchange(
         pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_MEMORY;
     }
-    if (json_object_set_new(request, "protocol", json_string(MAELYS_MCP_PROVIDER_PROTOCOL)) != 0 ||
+    pthread_mutex_lock(&process->state_mutex);
+    char outbound_protocol[sizeof(process->negotiated_protocol)];
+    (void)snprintf(outbound_protocol, sizeof(outbound_protocol), "%s",
+        process->negotiated_protocol);
+    pthread_mutex_unlock(&process->state_mutex);
+    if (json_object_set_new(request, "protocol", json_string(outbound_protocol)) != 0 ||
         json_object_set_new(request, "id", json_integer((json_int_t)id)) != 0 ||
         json_object_set_new(request, "method", json_string(method)) != 0 ||
         json_object_set_new(request, "params", params ? json_incref(params) : json_object()) != 0) {
@@ -231,6 +292,18 @@ static maelys_mcp_result_t process_exchange(
     }
     pthread_mutex_lock(&process->state_mutex);
     while (!process->pending_response && !process->failed) {
+        /* Deliver whatever the reader queued, on this thread and outside the
+         * lock: emit can block on outbox admission, and the reporter is only
+         * ours to use. */
+        if (process->pending_progress) {
+            json_t *frames = process->pending_progress;
+            process->pending_progress = NULL;
+            pthread_mutex_unlock(&process->state_mutex);
+            emit_pending_progress(reporter, frames);
+            json_decref(frames);
+            pthread_mutex_lock(&process->state_mutex);
+            continue;
+        }
         int waited = pthread_cond_timedwait(
             &process->response_ready, &process->state_mutex, &deadline);
         if (waited == ETIMEDOUT) {
@@ -265,11 +338,20 @@ static maelys_mcp_result_t process_exchange(
     json_t *response_id = json_object_get(response, "id");
     json_t *protocol = json_object_get(response, "protocol");
     if (!json_is_integer(response_id) || (unsigned long long)json_integer_value(response_id) != id ||
-        !maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL)) {
+        !supported_provider_protocol(protocol)) {
         json_decref(response);
         replace_error(out_error, "provider returned an invalid response envelope");
         pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_PROTOCOL;
+    }
+    /* The SDKs declare their own version in responses rather than echoing
+     * ours, so the first response is enough to learn what this provider
+     * speaks and to stop addressing it at the floor. */
+    if (maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL)) {
+        pthread_mutex_lock(&process->state_mutex);
+        (void)snprintf(process->negotiated_protocol,
+            sizeof(process->negotiated_protocol), "%s", MAELYS_MCP_PROVIDER_PROTOCOL);
+        pthread_mutex_unlock(&process->state_mutex);
     }
     json_t *error = json_object_get(response, "error");
     json_t *result = json_object_get(response, "result");
@@ -317,7 +399,8 @@ static maelys_mcp_result_t process_call(
     }
     json_t *wire_result = NULL;
     maelys_mcp_result_t result = process_exchange(
-        process, "provider/call", process->call_timeout_ms, params, &wire_result, out_error);
+        process, "provider/call", process->call_timeout_ms, params,
+        request->progress, &wire_result, out_error);
     json_decref(params);
     if (result != MAELYS_MCP_OK) return result;
     json_t *type = json_is_object(wire_result) ?
@@ -386,7 +469,7 @@ static maelys_mcp_result_t process_read_resource(
     }
     json_t *wire = NULL;
     maelys_mcp_result_t status = process_exchange(process, "provider/readResource",
-        process->call_timeout_ms, params, &wire, out_error);
+        process->call_timeout_ms, params, NULL, &wire, out_error);
     json_decref(params);
     if (status != MAELYS_MCP_OK) return status;
     json_t *type = json_is_object(wire) ? json_object_get(wire, "resultType") : NULL;
@@ -451,7 +534,7 @@ static maelys_mcp_result_t process_activate(void *context, char **out_error) {
     pthread_mutex_unlock(&process->state_mutex);
     json_t *result = NULL;
     maelys_mcp_result_t status = process_exchange(process, "provider/activate",
-        process->describe_timeout_ms, NULL, &result, out_error);
+        process->describe_timeout_ms, NULL, NULL, &result, out_error);
     if (status == MAELYS_MCP_OK && !json_is_object(result)) {
         replace_error(out_error, "provider activation result must be an object");
         status = MAELYS_MCP_ERR_PROTOCOL;
@@ -472,7 +555,7 @@ static void process_destroy(void *context) {
         json_t *ignored = NULL;
         char *error = NULL;
         (void)process_exchange(process, "provider/shutdown",
-            process->shutdown_timeout_ms, NULL, &ignored, &error);
+            process->shutdown_timeout_ms, NULL, NULL, &ignored, &error);
         if (ignored) json_decref(ignored);
         free(error);
         pthread_mutex_lock(&process->state_mutex);
@@ -498,6 +581,7 @@ static void process_destroy(void *context) {
         free(process->reader);
     }
     if (process->pending_response) json_decref(process->pending_response);
+    if (process->pending_progress) json_decref(process->pending_progress);
     free(process->failure_message);
     if (process->response_ready_initialized) {
         pthread_cond_destroy(&process->response_ready);
@@ -620,6 +704,11 @@ static maelys_mcp_result_t spawn_process(
     process->pid = pid;
     process->fd = sockets[0];
     process->max_message_bytes = options->max_message_bytes;
+    /* Open at the floor: until this provider tells us otherwise, assume it
+     * only understands the version every provider understands. */
+    (void)snprintf(process->negotiated_protocol,
+        sizeof(process->negotiated_protocol), "%s",
+        MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR);
     process->describe_timeout_ms = options->describe_timeout_ms;
     process->call_timeout_ms = options->call_timeout_ms;
     process->shutdown_timeout_ms = options->shutdown_timeout_ms;
@@ -767,8 +856,8 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     if (status != MAELYS_MCP_OK) return status;
 
     json_t *description = NULL;
-    status = process_exchange(process, "provider/describe",
-        process->describe_timeout_ms, NULL, &description, out_error);
+    status = process_exchange(process, "provider/describe", 
+        process->describe_timeout_ms, NULL, NULL, &description, out_error);
     if (status != MAELYS_MCP_OK) {
         process_destroy(process);
         return status;

@@ -12,7 +12,17 @@ extern "C" {
 
 typedef struct maelys_mcp_provider maelys_mcp_provider_t;
 
-#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/3"
+/*
+ * The wire is negotiated, not hard-matched, for the same reason MCP's own
+ * legacy revisions are (see is_supported_legacy_version): every SDK compares
+ * the protocol string exactly, so a host that simply started sending a newer
+ * one would break every existing provider on every request. The host opens at
+ * the floor, reads the version the provider declares in its own responses,
+ * and speaks that from then on. A /3 provider therefore keeps working
+ * untouched; only a /4 one may send progress.
+ */
+#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/4"
+#define MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR "maelys-provider/3"
 #define MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS 5000u
 #define MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS 300000u
 #define MAELYS_MCP_DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS 2000u

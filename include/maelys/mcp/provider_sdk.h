@@ -75,6 +75,23 @@ maelys_mcp_result_t maelys_mcp_provider_sdk_serve(
     const maelys_mcp_provider_sdk_config_t *config,
     const maelys_mcp_provider_sdk_options_t *options);
 
+/*
+ * Reports progress for the call currently being handled. Unlike an event,
+ * this is request-scoped: the host routes it to the one call in flight, so
+ * it must only be sent from inside a tool handler. No progress token is
+ * carried - the host holds it, which is what stops a provider addressing
+ * progress at a request that is not its own.
+ *
+ * Best effort: progress is advisory, and a host that did not ask for it (no
+ * progressToken on the request) simply drops it. Pass a negative `total` to
+ * omit it, and NULL `message` to omit that.
+ */
+maelys_mcp_result_t maelys_mcp_provider_sdk_report_progress(
+    maelys_mcp_provider_sdk_t *sdk,
+    double progress,
+    double total,
+    const char *message);
+
 maelys_mcp_result_t maelys_mcp_provider_sdk_emit_event(
     maelys_mcp_provider_sdk_t *sdk,
     const maelys_mcp_provider_event_t *event);

@@ -166,6 +166,60 @@ int main(int argc, char **argv) {
         "external-resource") == 0);
     json_decref(response);
 
+    /*
+     * Progress across the process boundary. The strict part is the ordering:
+     * the reader queues frames, but the thread inside the call drains and
+     * emits them, so they land in the ordered lane ahead of the response
+     * rather than racing it. A provider never names a token - the host holds
+     * it - so this also confirms the host attaches the right one.
+     */
+    params = json_pack("{s:s,s:{},s:{s:s,s:{s:s,s:s},s:{},s:s}}",
+        "name", "example.progress",
+        "arguments",
+        "_meta",
+            "io.modelcontextprotocol/protocolVersion", MAELYS_MCP_PROTOCOL_MODERN,
+            "io.modelcontextprotocol/clientInfo", "name", "test", "version", "1",
+            "io.modelcontextprotocol/clientCapabilities",
+            "progressToken", "wire-token");
+    request = json_pack("{s:s,s:i,s:s,s:o}",
+        "jsonrpc", "2.0", "id", 7, "method", "tools/call", "params", params);
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, request) == MAELYS_MCP_OK);
+    json_decref(request);
+    for (int step = 0; step <= 2; ++step) {
+        json_t *frame = next_message(channel);
+        ASSERT_TRUE(frame != NULL);
+        json_t *frame_method = json_object_get(frame, "method");
+        ASSERT_TRUE(json_is_string(frame_method));
+        ASSERT_TRUE(strcmp(json_string_value(frame_method), "notifications/progress") == 0);
+        json_t *frame_params = json_object_get(frame, "params");
+        ASSERT_TRUE(strcmp(json_string_value(
+            json_object_get(frame_params, "progressToken")), "wire-token") == 0);
+        ASSERT_TRUE(json_number_value(json_object_get(frame_params, "progress")) == step * 50.0);
+        ASSERT_TRUE(json_number_value(json_object_get(frame_params, "total")) == 100.0);
+        json_decref(frame);
+    }
+    response = next_message(channel);
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(json_integer_value(json_object_get(response, "id")) == 7);
+    json_decref(response);
+
+    /* No token, no frames: the very next message is the response itself. */
+    params = json_pack("{s:s,s:{},s:{s:s,s:{s:s,s:s},s:{}}}",
+        "name", "example.progress",
+        "arguments",
+        "_meta",
+            "io.modelcontextprotocol/protocolVersion", MAELYS_MCP_PROTOCOL_MODERN,
+            "io.modelcontextprotocol/clientInfo", "name", "test", "version", "1",
+            "io.modelcontextprotocol/clientCapabilities");
+    request = json_pack("{s:s,s:i,s:s,s:o}",
+        "jsonrpc", "2.0", "id", 8, "method", "tools/call", "params", params);
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, request) == MAELYS_MCP_OK);
+    json_decref(request);
+    response = next_message(channel);
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(json_integer_value(json_object_get(response, "id")) == 8);
+    json_decref(response);
+
     params = json_pack("{s:s,s:{},s:{s:s,s:{s:s,s:s},s:{}}}",
         "name", "example.events",
         "arguments",

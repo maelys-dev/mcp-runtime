@@ -1,7 +1,7 @@
 # Codex and Claude clients
 
 Codex and Claude are MCP clients. They launch the native `maelys-mcp` host; they do not
-connect directly to the private `maelys-provider/3` process protocol.
+connect directly to the private `maelys-provider` process protocol.
 
 Build the host and every selected provider first. All executable paths should be
 absolute so the same configuration works independently of the current directory.

@@ -33,11 +33,17 @@ response. URI filters are canonicalized and match the exact resource or a descen
 Prompt list-change filters are syntactically checked but not accepted because Prompts
 is not implemented.
 
+`notifications/progress` is supported. A client opts in per request with
+`params._meta.progressToken` — a bare key in both eras — and the runtime routes
+the provider's reports to that request, ahead of its final result. Providers
+never see the token: the host holds it, so progress cannot be addressed at
+another request, and reports for a client that asked for none are dropped.
+
 Process providers may originate resource updates and Tools/Resources list changes
-through the private `maelys-provider/3` protocol. These events enter the same filtered,
+through the private `maelys-provider` protocol. These events enter the same filtered,
 bounded subscription and Outbox path as native producers.
 
-Prompts, Tasks, progress, Streamable HTTP,
+Prompts, Tasks, Streamable HTTP,
 HTTP header routing, and authorization transports are not implemented. Resource *content blocks* returned
 by a tool remain distinct from the independently enabled MCP Resources capability.
 

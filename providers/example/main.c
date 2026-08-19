@@ -101,6 +101,21 @@ static maelys_mcp_result_t call_tool(
         out_result->structured_content = json_pack("{s:i}", "emitted", 3);
         return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
     }
+    if (strcmp(request->tool_name, "example.progress") == 0) {
+        /* Reported unconditionally: the host drops progress when the client
+         * asked for none, so a provider never has to know whether anyone is
+         * listening. */
+        for (int step = 0; step <= 2; ++step) {
+            if (maelys_mcp_provider_sdk_report_progress(sdk,
+                    step * 50.0, 100.0, NULL) != MAELYS_MCP_OK) {
+                set_error(out_error, "cannot report progress");
+                return MAELYS_MCP_ERR_IO;
+            }
+        }
+        out_result->type = MAELYS_MCP_PROVIDER_RESULT_COMPLETE;
+        out_result->structured_content = json_pack("{s:b}", "done", 1);
+        return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+    }
     set_error(out_error, "unknown tool");
     return MAELYS_MCP_ERR_NOT_FOUND;
 }
@@ -168,6 +183,13 @@ int main(void) {
             .description = "Emits resource and catalog change events before completing.",
             .input_schema = context.events_input,
             .effect = MAELYS_MCP_EFFECT_EXECUTE
+        },
+        {
+            .name = "example.progress",
+            .title = "Report progress",
+            .description = "Reports three progress steps before completing.",
+            .input_schema = context.events_input,
+            .effect = MAELYS_MCP_EFFECT_READ
         }
     };
     const maelys_mcp_resource_t resources[] = {

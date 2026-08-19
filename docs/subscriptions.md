@@ -30,7 +30,7 @@ maelys_mcp_runtime_notify_tools_list_changed(runtime);
 ```
 
 An opaque in-process provider may call `maelys_mcp_provider_emit_event`. Process
-providers use the equivalent activation-gated `maelys-provider/3` notifications; the
+providers use the equivalent activation-gated `maelys-provider` notifications; the
 runtime validates them and enters this same API path.
 
 Every matching client receives its own notification tagged with
