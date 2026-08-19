@@ -135,13 +135,48 @@ Three amendments to that rule:
 
 The chain is registered before `serve` and immutable thereafter, so the hot
 path needs no locking. Per-channel state is one **opaque slot bound at channel
-creation** and passed to every hook. That slot is the per-principal, per-
-session mechanism: the runtime carries the pointer and never interprets it. It
-is read-only from the runtime's side; an adapter needing mutability owns its
-own locking behind that pointer.
+creation** and passed to every hook, in **both directions**. That slot is the
+per-principal, per-session mechanism: the runtime carries the pointer and never
+interprets it. It is read-only from the runtime's side; an adapter needing
+mutability owns its own locking behind that pointer.
 
 Without it no chain can distinguish two clients sharing one runtime, however
 many hooks it has. It is a prerequisite, not a later refinement.
+
+## Both directions, and why they cannot be one interface
+
+The chain is bidirectional. The inbound half is ①–⑤; the outbound half is ⑥
+plus a hook on **fanout**, which is the genuinely reverse path.
+
+It is worth being precise about how much reverse traffic actually exists here,
+because it is less than a FastMCP comparison suggests. In FastMCP, sampling and
+elicitation are separate server→client requests needing their own forwarding
+path. In `2026-07-28` they travel *inside* the result as `inputRequests`, so
+they already pass through ④ and the sink. The resumable MRTR pattern this
+runtime kept is what makes that true.
+
+What remains genuinely reverse:
+
+- **Subscription fanout**, which bypasses the sink entirely today
+  (`notify_resource_updated` snapshots the channel list and enqueues straight
+  into each channel's outbox). This is where a MITM filtering *which resources
+  a principal may even know changed* has to live.
+- **A proxied legacy upstream.** A `2025-11-25` upstream may send real nested
+  server→client requests. Translating them into the resumable shape is the
+  proxy provider's job, but a middleware may legitimately want to see them.
+
+**The two directions have different threading contracts, and conflating them
+would be a trap.** Inbound hooks run on the thread handling one request,
+serialized within that request. A fanout hook runs on whatever thread called
+`notify_*`, concurrently across every targeted channel, and on a path that
+deliberately holds no runtime or channel lock while enqueuing. So a fanout hook
+must be non-blocking and reentrant across channels, which an inbound hook need
+not be.
+
+They therefore get separate types with separate documented contracts, not one
+interface used in two places. `wrap_sink` covers per-request outbound frames;
+fanout is scoped to a channel and a subscription, not to a request, and cannot
+borrow the request-scoped contract.
 
 ## Decisions taken
 
@@ -159,11 +194,10 @@ many hooks it has. It is a prerequisite, not a later refinement.
 
 ## Known holes, named rather than hidden
 
-- **Subscription fanout bypasses the sink.** `notify_resource_updated`
-  snapshots the channel list and enqueues straight into each channel's outbox,
-  so ⑥ does **not** cover `resources/updated`. Harmless today, but a MITM that
-  filters which resources a principal may even know changed cannot be built
-  until that lane is hookable.
+- **Subscription fanout bypasses the sink**, so ⑥ does not cover
+  `resources/updated`. This is now in scope rather than a hole — see "Both
+  directions" above — but it is the piece with the hardest contract, because
+  it runs concurrently on a producer thread rather than on a request thread.
 - **`tools/list_changed` has no trigger.** If ⑦'s output depends on middleware
   state or an upstream's live catalog, nothing can fire the change
   notification.
@@ -194,12 +228,9 @@ trip, so a script calling a tool on its own provider deadlocks), and the
 documented lock hierarchy has no reentrant path. Retrofitting reentrancy into
 a lock hierarchy is precisely the surgery this codebase is built to avoid.
 
-**The reverse direction is largely already covered, by choice of era.** In
-FastMCP, sampling and elicitation are separate server→client requests needing
-their own forwarding path. In `2026-07-28` they travel *inside* the result as
-`inputRequests`, so they pass through ④ and the sink with no dedicated hook.
-The resumable MRTR pattern this runtime kept is what makes that true. The only
-genuinely reverse, unhooked path is subscription fanout, above.
+The reverse direction is **in scope** — see "Both directions" above for what it
+actually amounts to, and why its threading contract differs from the inbound
+half.
 
 ## C-specific contracts to settle before writing code
 
