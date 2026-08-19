@@ -1178,6 +1178,42 @@ static int test_concurrent_channels_dispatch_under_fanout(void) {
     return 0;
 }
 
+static int test_channel_context_accessor(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+
+    maelys_mcp_channel_t *bare_channel = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(bare_channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_context(bare_channel) == NULL);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(bare_channel) == MAELYS_MCP_OK);
+
+    int sentinel = 0;
+    maelys_mcp_channel_config_t config = {
+        .max_messages = 8u,
+        .max_bytes = 1024u * 1024u,
+        .response_burst = 8u,
+        .admission_timeout_ms = 1000u,
+        .close_timeout_ms = 1000u,
+        .context = &sentinel
+    };
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_context(channel) == &sentinel);
+
+    ASSERT_TRUE(handle(channel, discover_request(1)) == MAELYS_MCP_OK);
+    json_t *response = next_message(channel, 1000u);
+    ASSERT_TRUE(response != NULL);
+    json_decref(response);
+
+    /* Same pointer, read again after a dispatch, for the channel's lifetime. */
+    ASSERT_TRUE(maelys_mcp_channel_context(channel) == &sentinel);
+    ASSERT_TRUE(maelys_mcp_channel_context(NULL) == NULL);
+
+    ASSERT_TRUE(destroy_channel_and_runtime(channel, runtime));
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"same JSON-RPC id is isolated with exact fanout",
@@ -1208,7 +1244,9 @@ int main(void) {
         {"zero-channel event and argument contracts",
             test_zero_channel_event_and_argument_contracts},
         {"concurrent channels dispatch under fanout",
-            test_concurrent_channels_dispatch_under_fanout}
+            test_concurrent_channels_dispatch_under_fanout},
+        {"channel context accessor is bound, read-back and NULL-safe",
+            test_channel_context_accessor}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }

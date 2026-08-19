@@ -43,9 +43,93 @@ static int describe_and_shutdown(const char *name, int stubborn) {
     return 0;
 }
 
+/*
+ * The modes below speak real MCP rather than the maelys-provider wire: they
+ * are upstreams for the stdio MCP proxy provider (docs/mcp-proxy.md). The
+ * dogfood rig for that provider is mcp-runtime proxying mcp-runtime, so these
+ * exist only for what the real host binary cannot be made to do - refuse
+ * server/discover, fail a call, open a server-to-client request, or die
+ * mid-call.
+ */
+typedef enum mcp_upstream_mode {
+    MCP_UPSTREAM_LEGACY,
+    MCP_UPSTREAM_ERRORING,
+    MCP_UPSTREAM_CHATTY,
+    MCP_UPSTREAM_DYING
+} mcp_upstream_mode_t;
+
+/* The proxy writes jsonrpc, id, method, params in that order and never nests
+ * an "id" in params, so the first occurrence is the request id. */
+static long request_id(const char *request) {
+    const char *marker = strstr(request, "\"id\":");
+    return marker ? strtol(marker + 5, NULL, 10) : 0;
+}
+
+static int mcp_upstream(mcp_upstream_mode_t mode) {
+    char request[8192];
+    const char *tool = mode == MCP_UPSTREAM_LEGACY ? "legacy.echo" : "proxy.probe";
+    while (fgets(request, sizeof(request), stdin)) {
+        long id = request_id(request);
+        if (strstr(request, "\"notifications/initialized\"")) continue;
+        if (strstr(request, "\"server/discover\"")) {
+            if (mode == MCP_UPSTREAM_LEGACY) {
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{\"code\":-32601,"
+                    "\"message\":\"Method not found\"}}\n", id);
+            } else {
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"supportedVersions\":"
+                    "[\"2026-07-28\",\"2025-11-25\"],\"capabilities\":{\"tools\":{}}}}\n", id);
+            }
+        } else if (strstr(request, "\"initialize\"")) {
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"protocolVersion\":"
+                "\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":"
+                "{\"name\":\"legacy-upstream\",\"version\":\"1\"}}}\n", id);
+        } else if (strstr(request, "\"tools/list\"")) {
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"tools\":[{\"name\":\"%s\","
+                "\"title\":\"Fixture tool\",\"description\":\"A fixture upstream tool.\","
+                "\"inputSchema\":{\"type\":\"object\"}}]}}\n", id, tool);
+        } else if (strstr(request, "\"tools/call\"")) {
+            if (mode == MCP_UPSTREAM_DYING) {
+                (void)fflush(stdout);
+                _exit(0);
+            }
+            if (mode == MCP_UPSTREAM_ERRORING) {
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{\"code\":-32000,"
+                    "\"message\":\"upstream refused the call\"}}\n", id);
+            } else if (mode == MCP_UPSTREAM_CHATTY) {
+                /* An id-less notification the proxy does not handle, then a
+                 * genuine server-to-client request it must refuse without
+                 * faulting the transport. */
+                printf("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","
+                    "\"params\":{\"level\":\"info\",\"data\":\"noise\"}}\n");
+                printf("{\"jsonrpc\":\"2.0\",\"id\":9001,\"method\":"
+                    "\"sampling/createMessage\",\"params\":{}}\n");
+                if (fflush(stdout) != 0) return 3;
+                char reply[8192];
+                const char *text = fgets(reply, sizeof(reply), stdin) &&
+                    strstr(reply, "-32601") && strstr(reply, "9001") ?
+                    "chatty-ok" : "chatty-unrefused";
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"content\":"
+                    "[{\"type\":\"text\",\"text\":\"%s\"}]}}\n", id, text);
+            } else {
+                printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"content\":"
+                    "[{\"type\":\"text\",\"text\":\"legacy-ok\"}]}}\n", id);
+            }
+        } else {
+            printf("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"error\":{\"code\":-32601,"
+                "\"message\":\"Method not found\"}}\n", id);
+        }
+        if (fflush(stdout) != 0) return 3;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     char request[4096];
+    if (strstr(argv[0], "legacy-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_LEGACY);
+    if (strstr(argv[0], "erroring-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_ERRORING);
+    if (strstr(argv[0], "chatty-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_CHATTY);
+    if (strstr(argv[0], "dying-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_DYING);
     if (strstr(argv[0], "fd-check")) {
 #if !defined(MAELYS_TEST_ADDRESS_SANITIZER) && \
     !defined(MAELYS_TEST_THREAD_SANITIZER)

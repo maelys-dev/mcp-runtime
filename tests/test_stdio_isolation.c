@@ -288,6 +288,73 @@ static int test_stdio_restores_output_descriptor_flags(void) {
     return 0;
 }
 
+/*
+ * Proves maelys_mcp_stdio_options_t.channel_config actually reaches the
+ * channel serve_stdio creates internally, rather than being ignored. There is
+ * no accessor into that internal channel from outside serve_stdio, so this
+ * is observed through a config field with an immediate, deterministic effect
+ * rather than through timing: maelys_mcp_outbox_enqueue_take_until rejects an
+ * outbound message larger than max_bytes with MAELYS_MCP_ERR_PROTOCOL before
+ * it ever waits on anything (src/core/outbox.c), so a max_bytes too small for
+ * any real response fails the very first dispatch on the spot. The default
+ * internal config (max_bytes = max_message_bytes * 4) could never reject a
+ * `server/discover` response, so MAELYS_MCP_ERR_PROTOCOL coming back here can
+ * only mean the small max_bytes in channel_config was the one actually used -
+ * if it were silently dropped, this would instead observe MAELYS_MCP_OK.
+ */
+static int test_stdio_channel_config_max_bytes_is_honored(void) {
+    static const char request[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\","
+        "\"params\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
+        "\"io.modelcontextprotocol/clientInfo\":{\"name\":\"stdio-channel-config\","
+        "\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}}}\n";
+    int input[2];
+    int output[2];
+    ASSERT_TRUE(pipe(input) == 0);
+    ASSERT_TRUE(pipe(output) == 0);
+    ASSERT_TRUE(write(input[1], request, sizeof(request) - 1u) ==
+        (ssize_t)(sizeof(request) - 1u));
+    ASSERT_TRUE(close(input[1]) == 0);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        close(output[0]);
+        maelys_mcp_runtime_config_t config = {
+            .server_name = "stdio-channel-config",
+            .server_version = "test"
+        };
+        maelys_mcp_runtime_t *runtime = NULL;
+        if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) _exit(50);
+        maelys_mcp_channel_config_t channel_config = {
+            .max_messages = 8u,
+            .max_bytes = 4u,
+            .response_burst = 8u,
+            .admission_timeout_ms = 1000u,
+            .close_timeout_ms = 1000u
+        };
+        maelys_mcp_stdio_options_t options = {.channel_config = &channel_config};
+        maelys_mcp_result_t status = maelys_mcp_runtime_serve_stdio_with_options(
+            runtime, input[0], output[1], &options);
+        maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+        close(input[0]);
+        close(output[1]);
+        if (destroy_status != MAELYS_MCP_OK) _exit(51);
+        _exit(status == MAELYS_MCP_ERR_PROTOCOL ? 0 : 52);
+    }
+    close(input[0]);
+    close(output[1]);
+    int status = 0;
+    int exited = wait_for_child(pid, &status, 2000u);
+    if (!exited) {
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+    }
+    close(output[0]);
+    ASSERT_TRUE(exited);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"stdout isolation argument contract", test_argument_contract},
@@ -301,7 +368,9 @@ int main(void) {
         {"EOF reports dequeued writer failure",
             test_eof_reports_dequeued_writer_failure},
         {"stdio restores output descriptor flags",
-            test_stdio_restores_output_descriptor_flags}
+            test_stdio_restores_output_descriptor_flags},
+        {"stdio channel_config option max_bytes is honored",
+            test_stdio_channel_config_max_bytes_is_honored}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }

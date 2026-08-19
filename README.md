@@ -127,7 +127,7 @@ library writes diagnostics with `printf()`.
 include/maelys/mcp/  public C API
 src/core/            MCP core, content, URI and schema validation
 src/modules/         capability registry, Tools, Resources, MRTR and Subscriptions
-src/provider/        in-process and process-provider adapters
+src/provider/        in-process, process-provider and MCP proxy adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable
 providers/example/   independent reference provider
@@ -143,6 +143,7 @@ See [Architecture](docs/architecture.md), [Provider protocol](docs/provider-prot
 [Security model](docs/security-model.md), [Protocol support](docs/protocol-support.md),
 [C API and ABI policy](docs/abi-policy.md),
 [Passive outbox](docs/outbox.md), [Subscriptions](docs/subscriptions.md),
+[MCP proxy provider](docs/mcp-proxy.md),
 [Test parity](docs/test-parity.md), and [Provenance](docs/provenance.md).
 Client setup examples are in [Codex and Claude clients](docs/clients.md).
 The scope and limitations of the upstream test suite are in
