@@ -175,9 +175,9 @@ unknown, so the embedder-bound pointer is the only anchor worth
 authenticating against — middleware must never base a decision on
 `client_name`. Two obligations follow, neither checkable by the runtime: the
 box is freed only after `channel_destroy` returns, and one channel maps to one
-principal. One API gap follows too: `serve_stdio` creates its channel
-internally, so there is currently no seam to bind the context when using the
-stock transport.
+principal. `serve_stdio` creates its channel internally, and now takes an
+optional `maelys_mcp_channel_config_t` through `maelys_mcp_stdio_options_t` so
+the stock transport has a seam to bind the context too.
 
 Without it no chain can distinguish two clients sharing one runtime, however
 many hooks it has. It is a prerequisite, not a later refinement.

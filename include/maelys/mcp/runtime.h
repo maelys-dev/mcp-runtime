@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <jansson.h>
 
+#include "maelys/mcp/channel.h"
 #include "maelys/mcp/error.h"
 #include "maelys/mcp/module.h"
 #include "maelys/mcp/provider.h"
@@ -64,6 +65,14 @@ typedef struct maelys_mcp_runtime_config {
 
 typedef struct maelys_mcp_stdio_options {
     unsigned int write_timeout_ms;
+    /*
+     * Configuration for the channel serve_stdio creates internally. NULL
+     * keeps today's defaults (write_timeout_ms mirrored into
+     * admission_timeout_ms and close_timeout_ms, everything else zero and
+     * therefore runtime-defaulted). When non-NULL, this struct is used
+     * as-is; write_timeout_ms above no longer overrides its timeout fields.
+     */
+    const maelys_mcp_channel_config_t *channel_config;
 } maelys_mcp_stdio_options_t;
 
 maelys_mcp_result_t maelys_mcp_runtime_create(

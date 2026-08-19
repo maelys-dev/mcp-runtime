@@ -328,6 +328,10 @@ maelys_mcp_result_t maelys_mcp_channel_handle(
     return maelys_mcp_channel_handle_with_sink(channel, request, &sink);
 }
 
+void *maelys_mcp_channel_context(const maelys_mcp_channel_t *channel) {
+    return channel ? channel->config.context : NULL;
+}
+
 maelys_mcp_result_t maelys_mcp_channel_next(
     maelys_mcp_channel_t *channel,
     unsigned int timeout_ms,

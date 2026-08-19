@@ -18,6 +18,17 @@ typedef struct maelys_mcp_channel_config {
     size_t response_burst;
     unsigned int admission_timeout_ms;
     unsigned int close_timeout_ms;
+    /*
+     * Opaque, embedder-owned. The runtime carries this pointer for the
+     * channel's lifetime, never dereferences it, and never copies what it
+     * designates - it is the same pointer for the whole lifetime, read-only
+     * from the runtime's side. An adapter needing mutability owns its own
+     * locking behind the pointer. The embedder must not free what it
+     * designates until maelys_mcp_channel_destroy has returned, and must map
+     * one channel to one principal; both are the embedder's obligation and
+     * are not checked by the runtime.
+     */
+    void *context;
 } maelys_mcp_channel_config_t;
 
 /*
@@ -34,6 +45,12 @@ maelys_mcp_result_t maelys_mcp_channel_create(
 maelys_mcp_result_t maelys_mcp_channel_handle(
     maelys_mcp_channel_t *channel,
     json_t *request);
+
+/*
+ * Returns the opaque context bound at channel creation (config->context), or
+ * NULL if none was bound. Returns NULL for a NULL channel.
+ */
+void *maelys_mcp_channel_context(const maelys_mcp_channel_t *channel);
 
 /*
  * Returns one owned message, MAELYS_MCP_ERR_TIMEOUT when the monotonic wait
