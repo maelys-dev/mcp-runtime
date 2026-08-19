@@ -95,7 +95,15 @@ static double drive(maelys_mcp_channel_t *channel, const char *tool_name) {
 static double measure_out_of_process(void) {
     maelys_mcp_provider_t *provider = NULL;
     char *error = NULL;
-    if (maelys_mcp_provider_spawn(provider_path, 1024u * 1024u,
+    /* Spawn happens before the timed window, so its describe deadline is a
+     * liveness bound, not a measurement: keep it loose enough to survive a
+     * loaded machine (the default 5s has flaked under parallel builds). */
+    maelys_mcp_provider_process_options_t spawn_options = {
+        .executable_path = provider_path,
+        .max_message_bytes = 1024u * 1024u,
+        .describe_timeout_ms = 30000u
+    };
+    if (maelys_mcp_provider_spawn_with_options(&spawn_options,
             &provider, &error) != MAELYS_MCP_OK) {
         fprintf(stderr, "   spawn failed: %s\n", error ? error : "(no detail)");
         free(error);
