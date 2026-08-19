@@ -162,7 +162,7 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         close(wake_pipe[1]);
         return MAELYS_MCP_ERR_IO;
     }
-    maelys_mcp_channel_config_t channel_config = {
+    maelys_mcp_channel_config_t default_channel_config = {
         .max_messages = 256u,
         .max_bytes = runtime->max_message_bytes > SIZE_MAX / 4u ?
             SIZE_MAX : runtime->max_message_bytes * 4u,
@@ -170,8 +170,10 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         .admission_timeout_ms = write_timeout_ms,
         .close_timeout_ms = write_timeout_ms
     };
+    const maelys_mcp_channel_config_t *channel_config = options && options->channel_config ?
+        options->channel_config : &default_channel_config;
     maelys_mcp_channel_t *channel = NULL;
-    initialized = maelys_mcp_channel_create(runtime, &channel_config, &channel);
+    initialized = maelys_mcp_channel_create(runtime, channel_config, &channel);
     if (initialized != MAELYS_MCP_OK) {
         maelys_mcp_line_reader_clear(&reader);
         close(wake_pipe[0]);
