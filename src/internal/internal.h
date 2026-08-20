@@ -9,10 +9,12 @@
 
 #include "maelys/mcp/content.h"
 #include "maelys/mcp/channel.h"
+#include "maelys/mcp/middleware.h"
 #include "maelys/mcp/outbox.h"
 #include "maelys/mcp/runtime.h"
 
 #define MAELYS_MCP_MAX_MODULES 16u
+#define MAELYS_MCP_MAX_MIDDLEWARE 16u
 #define JSONRPC_INVALID_REQUEST (-32600)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
 #define JSONRPC_INVALID_PARAMS (-32602)
@@ -123,9 +125,18 @@ struct maelys_mcp_runtime {
     size_t provider_count;
     const struct maelys_mcp_module_descriptor *modules[MAELYS_MCP_MAX_MODULES];
     size_t module_count;
-    maelys_mcp_authorize_fn authorize;
-    maelys_mcp_audit_fn audit;
-    void *policy_context;
+    /*
+     * The middleware chain. Appended to under lifecycle_mutex while the
+     * runtime is cold, then read without any lock for the rest of its life -
+     * the immutability the public header promises is what makes that safe.
+     * The two counters let a dispatch path skip building a hook context at
+     * all when no middleware implements that hook, so an empty chain costs
+     * the same branch the removed authorize/audit pointers used to.
+     */
+    maelys_mcp_middleware_t middleware[MAELYS_MCP_MAX_MIDDLEWARE];
+    size_t middleware_count;
+    size_t authorize_hook_count;
+    size_t audit_hook_count;
     pthread_mutex_t lifecycle_mutex;
     pthread_cond_t lifecycle_changed;
     int lifecycle_mutex_initialized;
@@ -357,6 +368,22 @@ int maelys_mcp_add_server_meta(
     maelys_mcp_runtime_t *runtime,
     json_t *result,
     const char *result_type);
+/*
+ * Middleware chain, hooks 2 and 5. The has_* predicates exist so a caller can
+ * skip filling a hook context - list paths ask once per catalog entry - and
+ * they are exactly the branch the pre-chain `if (!runtime->authorize)` was.
+ * Both invocations run with no runtime lock held.
+ */
+int maelys_mcp_chain_has_authorize(const maelys_mcp_runtime_t *runtime);
+int maelys_mcp_chain_has_audit(const maelys_mcp_runtime_t *runtime);
+maelys_mcp_authorize_decision_t maelys_mcp_chain_authorize(
+    const maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_authorize_context_t *request);
+void maelys_mcp_chain_audit(
+    const maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_audit_context_t *record);
+/* Runs every middleware's destroy hook, reverse registration order. */
+void maelys_mcp_chain_destroy(maelys_mcp_runtime_t *runtime);
 void maelys_mcp_subscription_clear(maelys_mcp_subscription_t *subscription);
 void maelys_mcp_cancel_subscription(
     maelys_mcp_channel_t *channel,

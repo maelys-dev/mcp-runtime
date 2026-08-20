@@ -157,13 +157,19 @@ int main(void) {
     maelys_mcp_runtime_config_t runtime_config = {
         .server_name = "test-runtime",
         .server_version = "1.0",
-        .instructions = "test",
-        .authorize = authorize,
-        .audit = audit_call,
-        .policy_context = &state
+        .instructions = "test"
     };
     maelys_mcp_runtime_t *runtime = NULL;
     ASSERT_TRUE(maelys_mcp_runtime_create(&runtime_config, &runtime) == MAELYS_MCP_OK);
+    /*
+     * Deliberately the compatibility middleware rather than a native hook:
+     * every policy assertion below is the one this test made when authorize
+     * and audit were runtime_config fields, so it is the claim that migration
+     * preserves the decision surface that is being checked, not just that a
+     * chain runs.
+     */
+    ASSERT_TRUE(maelys_mcp_runtime_add_compat_policy(runtime, authorize,
+        audit_call, &state) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
     ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) == MAELYS_MCP_OK);
