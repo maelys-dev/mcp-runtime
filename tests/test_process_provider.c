@@ -30,6 +30,26 @@ static long long milliseconds(void) {
     return (long long)now.tv_sec * 1000LL + (long long)now.tv_nsec / 1000000LL;
 }
 
+/*
+ * Spawn a fixture this suite expects to come up. The describe deadline is a
+ * liveness bound the suite does not measure, and the default 5s has missed
+ * under a sanitizer on a loaded machine - the reason tests/test_provider_perf.c
+ * gives, and the same loose bound tests/test_nested_requests.c uses. Every
+ * other timeout stays at its default. The spawns that expect a broken fixture
+ * keep calling maelys_mcp_provider_spawn: a deadline cannot turn their
+ * failure into a pass, and they keep the default-path wrapper covered.
+ */
+static maelys_mcp_result_t spawn_fixture(const char *path, size_t limit,
+    maelys_mcp_provider_t **out_provider, char **out_error) {
+    maelys_mcp_provider_process_options_t options = {
+        .executable_path = path,
+        .max_message_bytes = limit,
+        .describe_timeout_ms = 30000u
+    };
+    return maelys_mcp_provider_spawn_with_options(&options, out_provider,
+        out_error);
+}
+
 int main(int argc, char **argv) {
     ASSERT_TRUE(argc == 10);
     maelys_mcp_provider_t *provider = NULL;
@@ -46,15 +66,15 @@ int main(int argc, char **argv) {
         free(error);
         error = NULL;
     }
-    ASSERT_TRUE(maelys_mcp_provider_spawn(argv[6], 65536u, &provider, &error) == MAELYS_MCP_OK);
+    ASSERT_TRUE(spawn_fixture(argv[6], 65536u, &provider, &error) == MAELYS_MCP_OK);
     ASSERT_TRUE(provider != NULL);
     free(error);
     error = NULL;
     maelys_mcp_provider_destroy(provider);
     provider = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_spawn(argv[1], 65536u, &provider, &error) == MAELYS_MCP_OK);
+    ASSERT_TRUE(spawn_fixture(argv[1], 65536u, &provider, &error) == MAELYS_MCP_OK);
     maelys_mcp_provider_t *fd_check = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_spawn(argv[8], 65536u, &fd_check, &error) == MAELYS_MCP_OK);
+    ASSERT_TRUE(spawn_fixture(argv[8], 65536u, &fd_check, &error) == MAELYS_MCP_OK);
     maelys_mcp_provider_destroy(fd_check);
     maelys_mcp_provider_destroy(provider);
     provider = NULL;
@@ -70,14 +90,17 @@ int main(int argc, char **argv) {
     free(error);
     error = NULL;
     short_timeout.executable_path = argv[9];
-    short_timeout.describe_timeout_ms = 500u;
+    /* This case tests the 50ms shutdown deadline through the destroy timing
+     * below; its describe deadline is only a liveness bound, so it gets the
+     * same loose one spawn_fixture uses. */
+    short_timeout.describe_timeout_ms = 30000u;
     ASSERT_TRUE(maelys_mcp_provider_spawn_with_options(
         &short_timeout, &provider, &error) == MAELYS_MCP_OK);
     started = milliseconds();
     maelys_mcp_provider_destroy(provider);
     ASSERT_TRUE(milliseconds() - started < 1000LL);
     provider = NULL;
-    ASSERT_TRUE(maelys_mcp_provider_spawn(argv[1], 65536u, &provider, &error) == MAELYS_MCP_OK);
+    ASSERT_TRUE(spawn_fixture(argv[1], 65536u, &provider, &error) == MAELYS_MCP_OK);
     free(error);
     maelys_mcp_runtime_config_t config = {
         .server_name = "process-test",
