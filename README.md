@@ -159,14 +159,21 @@ docs/                architecture, security and provider protocol
 
 ## Status
 
-Pre-1.0, native ABI 3. The 0.14 line completes the seven-hook middleware
-chain and replaces the former `authorize`/`audit` config callbacks with it
-(migration is one call — see the [CHANGELOG](CHANGELOG.md)). The
-`maelys-provider` wire protocol is negotiated (`/3` floor, `/4` adds
-progress), so existing providers keep working across host upgrades.
+Pre-1.0, native ABI 3. The 0.15 line adds nested (in-band) multi-round-trip
+requests — a tool can ask the client a question mid-call, on both modern and
+legacy MCP — with concurrent calls on one connection, and ships a mutation
+testing runner ([docs](docs/mutation-testing.md)) whose first sweeps' 128
+surviving mutants are the named test-hardening backlog. The 0.14 line
+completed the seven-hook middleware chain, replacing the former
+`authorize`/`audit` config callbacks (migration is one call — see the
+[CHANGELOG](CHANGELOG.md)). The `maelys-provider` wire protocol is negotiated
+(`/3` floor, `/4` progress, `/5` nested requests; every version in the range
+is accepted), so existing providers keep working across host upgrades. The
+bundled SDKs do not yet expose nesting; that is the next increment.
 
-Not implemented yet: streamable HTTP transport, prompts, Tasks, dynamic
-provider reload, full JSON Schema 2020-12, Windows. The pre-1.0 ABI policy is
-documented and versioned; same-major ABI stability begins with 1.0.
+Not implemented yet: SDK-side nested requests, streamable HTTP transport,
+prompts, Tasks, dynamic provider reload, full JSON Schema 2020-12, Windows.
+The pre-1.0 ABI policy is documented and versioned; same-major ABI stability
+begins with 1.0.
 
 The source is available under the [MIT License](LICENSE).

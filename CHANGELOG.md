@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 - 2026-08-20
 
 - **Tools can now ask the user a question in the middle of a call, and older
   MCP clients understand the question.** A provider handling `tools/call` or
@@ -50,26 +50,19 @@
   `denied` before a byte is sent — the same rule `input_required` already
   enforced, so which surfaces a provider may reach does not depend on which
   multi-round-trip shape it chose.
-- **Fix: threads no longer share JSON nodes.** A provider's reader thread
-  handed the thread inside the call a reference into the message it was about
-  to release (progress frames, and now nested requests); a response took a
-  reference to the request's own `id`; a `notifications/progress` frame took
-  one to the request's `progressToken`. In each case two threads could write
-  one jansson refcount, or one could read a node the other was freeing, with
-  nothing ordering them. The progress cases predate this release and were
-  invisible because no suite ran `serve_stdio` under ThreadSanitizer; some
-  reproduced only on Linux. Everything crossing a thread boundary is copied
-  now.
-- **Fix: an outbound frame no longer shares a node with the request that
-  produced it.** A response took a reference to the request's own `id`, and a
-  `notifications/progress` frame took one to the request's `progressToken`, so
-  the thread draining the outbox and the thread that dispatched the request
-  could release one jansson refcount at the same time. Both are data races
-  present since the stdio transport gained its writer thread, and invisible
-  until this release ran `serve_stdio` under ThreadSanitizer for the first
-  time — one of them only reproduced on Linux. Ids and tokens are copied now,
-  which turns "a frame shares no node with its request" from an incidental
-  property into a checkable one.
+- **Fix: threads no longer share JSON nodes — anywhere.** Running
+  `serve_stdio` under ThreadSanitizer for the first time (this release's
+  concurrency work made that mandatory) surfaced a family of pre-existing
+  data races, some Linux-only: a response took a reference to the request's
+  own `id` and a `notifications/progress` frame to its `progressToken` (both
+  present since the stdio transport gained its writer thread); a provider's
+  reader thread handed the calling thread a reference into a message it was
+  about to release; and `tools/list` referenced the registry's schema nodes
+  straight into responses that other channels' threads release concurrently.
+  Every value crossing a thread boundary is copied now — jansson's refcount
+  is atomic, but nothing else about a shared node is — which turns "a frame
+  shares no node with its producer" from an incidental property into a
+  checkable one.
 - ABI stays 3. The additions are a new opaque type
   (`maelys_mcp_nested_relay_t`), three new entry points
   (`maelys_mcp_provider_request_client`,
