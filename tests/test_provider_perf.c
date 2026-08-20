@@ -123,7 +123,7 @@ static double measure_out_of_process(void) {
     if (maelys_mcp_channel_create(runtime, NULL, &channel) != MAELYS_MCP_OK) FAIL("channel_create (out of process)");
     double per_call = drive(channel, "example.echo");
     (void)maelys_mcp_channel_destroy(channel);
-    (void)maelys_mcp_runtime_destroy(runtime);
+    if (maelys_mcp_runtime_destroy(runtime) != MAELYS_MCP_OK) FAIL("runtime_destroy (out of process)");
     return per_call;
 }
 
@@ -157,7 +157,7 @@ static double measure_in_process(void) {
     if (maelys_mcp_channel_create(runtime, NULL, &channel) != MAELYS_MCP_OK) FAIL("channel_create (in process)");
     double per_call = drive(channel, "perf.noop");
     (void)maelys_mcp_channel_destroy(channel);
-    (void)maelys_mcp_runtime_destroy(runtime);
+    if (maelys_mcp_runtime_destroy(runtime) != MAELYS_MCP_OK) FAIL("runtime_destroy (in process)");
     return per_call;
 }
 
