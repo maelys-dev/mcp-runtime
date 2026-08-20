@@ -1,8 +1,26 @@
 import type { Readable } from "node:stream";
 
-export const PROTOCOL: "maelys-provider/3";
+export const PROTOCOL: "maelys-provider/5";
+export const PROTOCOL_FLOOR: "maelys-provider/3";
 export const TOOL_EFFECTS: readonly ["read", "preview", "apply", "commit", "execute"];
+export const NESTED_REQUEST_METHODS: readonly ["elicitation/create", "sampling/createMessage", "roots/list"];
 export class ProviderNotFoundError extends Error {}
+
+/**
+ * Rejection type for requestElicitation/requestSampling/requestRoots.
+ * `client_error` | `denied` | `timeout` | `cancelled` | `unavailable` |
+ * `failed` come verbatim from the host's own `provider/nestedReply` error
+ * vocabulary (docs/provider-protocol.md); `channel_closed` and `protocol`
+ * are synthesized locally when no such reply will ever arrive, or the one
+ * that arrived did not fit the wire shape.
+ */
+export type NestedRequestErrorCode =
+  | "client_error" | "denied" | "timeout" | "cancelled" | "unavailable" | "failed"
+  | "channel_closed" | "protocol";
+export class NestedRequestError extends Error {
+  code: NestedRequestErrorCode;
+  data?: JsonValue;
+}
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -18,7 +36,29 @@ export type CompleteResult = { resultType: "complete"; content?: ContentBlock[];
 export type InputRequest = { method: "elicitation/create" | "sampling/createMessage" | "roots/list"; params: JsonObject };
 export type InputRequiredResult = { resultType: "input_required"; inputRequests?: Record<string, InputRequest>; requestState?: string };
 export type ProviderResult = CompleteResult | InputRequiredResult;
-export type CallContext = { inputResponses?: JsonObject; requestState?: string; clientCapabilities?: JsonObject };
+
+/* The three methods the host will relay a nested request for
+   (docs/provider-protocol.md "Nested requests (version 5)"); params/result
+   shapes are MCP's own, not this SDK's, so they stay loosely typed JSON
+   except where the wire's own envelope is fixed (elicitation's action,
+   roots' array). */
+export type ElicitationRequestParams = JsonObject & { message: string; requestedSchema: JsonSchema };
+export type ElicitationResult = { action: "accept" | "decline" | "cancel"; content?: JsonObject };
+export type SamplingRequestParams = JsonObject;
+export type SamplingResult = JsonObject;
+export type RootsRequestParams = JsonObject;
+export type RootsResult = { roots: Array<{ uri: string; name?: string }> };
+
+export type CallContext = {
+  inputResponses?: JsonObject;
+  requestState?: string;
+  clientCapabilities?: JsonObject;
+  /** Opens one request back at the client and blocks for the answer; rejects
+   *  with NestedRequestError on denial, timeout or a closed channel. */
+  requestElicitation(params: ElicitationRequestParams): Promise<ElicitationResult>;
+  requestSampling(params: SamplingRequestParams): Promise<SamplingResult>;
+  requestRoots(params?: RootsRequestParams): Promise<RootsResult>;
+};
 export type ResourceDescriptor = { uri: string; name: string; title?: string; description?: string; mimeType?: string; size?: number };
 export type ResourceTemplateDescriptor = { uriTemplate: string; name: string; title?: string; description?: string; mimeType?: string };
 export type ResourceContents = { uri: string; mimeType?: string; _meta?: JsonObject } & ({ text: string } | { blob: string });
@@ -62,7 +102,12 @@ export function describeProvider(provider: Provider): JsonObject;
 export function completeResult(value: Omit<CompleteResult, "resultType">): CompleteResult;
 export function inputRequiredResult(value: Omit<InputRequiredResult, "resultType">): InputRequiredResult;
 export function resourceResult(contents: ResourceContents[]): CompleteResourceResult;
-export function handleProviderMessage(provider: Provider, message: unknown): Promise<JsonObject>;
+export type NestedRequestBindings = {
+  requestElicitation?: (params: ElicitationRequestParams) => Promise<ElicitationResult>;
+  requestSampling?: (params: SamplingRequestParams) => Promise<SamplingResult>;
+  requestRoots?: (params?: RootsRequestParams) => Promise<RootsResult>;
+};
+export function handleProviderMessage(provider: Provider, message: unknown, nested?: NestedRequestBindings): Promise<JsonObject>;
 export function serveProvider(provider: Provider, options?: {
   input?: Readable;
   writeLine?: (line: string) => void | Promise<void>;
