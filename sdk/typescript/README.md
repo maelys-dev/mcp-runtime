@@ -1,6 +1,7 @@
 # `@maelys/mcp-provider-sdk`
 
-Dependency-free Node.js SDK for persistent `maelys-provider/3` providers. It owns the
+Dependency-free Node.js SDK for persistent `maelys-provider` providers, up to `/5`
+(every version back to `maelys-provider/3` is still accepted inbound). It owns the
 protocol loop, envelopes, structured errors, shutdown and descriptor validation while
 domain code supplies tool handlers.
 
@@ -41,3 +42,33 @@ await provider.events.toolsListChanged();
 ```
 
 Calling an event method before activation or after shutdown fails explicitly.
+
+A tool or resource handler may also open one request back at the client mid-call and
+block for the answer - MCP's older multi-round-trip pattern, and the counterpart of
+`inputRequiredResult(...)` above rather than a replacement for it:
+
+```js
+handler: async (arguments_, context) => {
+  const { action, content } = await context.requestElicitation({
+    message: "Apply these changes?",
+    requestedSchema: { type: "object", properties: { accept: { type: "boolean" } }, required: ["accept"] },
+  });
+  if (action !== "accept") return completeResult({ content: [{ type: "text", text: "declined" }] });
+  return completeResult({ structuredContent: { applied: true } });
+},
+```
+
+`context.requestSampling(params)` and `context.requestRoots(params)` follow the same
+shape for `sampling/createMessage` and `roots/list`. Each returns a promise that
+resolves with the client's result or rejects with a `NestedRequestError` carrying a
+`code` - `denied`, `timeout`, `cancelled`, `unavailable`, `client_error` (the client's
+own JSON-RPC error, on `.data`) or `failed` come from the host; `channel_closed` and
+`protocol` are raised locally when no reply can arrive, or the one that did doesn't fit
+the wire shape. The host enforces one nested request at a time per call and gates each
+method on the client capability the caller declared.
+
+Nesting is the only thing that makes this SDK declare `maelys-provider/5`. A provider
+that never opens one keeps declaring `/4` for the whole session - the same version it
+declared before this feature existed - and keeps working against a host that predates
+nested requests. The first nested request raises the declared version for the rest of
+the session; it is never lowered back down.

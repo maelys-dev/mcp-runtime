@@ -1,16 +1,68 @@
 import readline from "node:readline";
 
-export const PROTOCOL = "maelys-provider/4";
+/*
+ * The newest version this SDK ever declares - once it has actually opened a
+ * nested request (see PROTOCOL_DECLARED, just below). Also the ceiling of
+ * what it accepts inbound.
+ */
+export const PROTOCOL = "maelys-provider/5";
 /* The version every provider speaks, and the one the host opens with until
-   this SDK declares the newer one in a response. */
+   this SDK declares a newer one in a frame of its own. */
 export const PROTOCOL_FLOOR = "maelys-provider/3";
+/*
+ * The version stamped on outbound frames until a nested request is opened.
+ * Announcing /5 up front would cost every provider built on this SDK its
+ * compatibility with a host that predates /5 (its version check looked for
+ * exactly the floor or its one newest version, not a range - the same
+ * two-endpoint shape src/provider/process_provider.c's own comment warns
+ * about), in exchange for a feature it may never use. The host learns a
+ * version from any frame rather than only from responses, precisely so /5
+ * can be announced late - on the frame that opens the first nested request -
+ * which is what keeps a provider that never nests emitting exactly the bytes
+ * it emitted before this feature existed. Raised in sendNestedRequest,
+ * never lowered afterward.
+ */
+export const PROTOCOL_DECLARED = "maelys-provider/4";
+/*
+ * Every version between the floor and the current one, oldest first, so the
+ * list - not just its endpoints - is what "supported" means: the host
+ * addresses a provider at whatever it last declared, and this SDK declares
+ * /5 only once it actually nests, so /4 has to be accepted even though it is
+ * neither the floor nor the newest version this SDK speaks. This mirrors the
+ * same array in src/provider/process_provider.c.
+ */
+const SUPPORTED_PROTOCOLS = Object.freeze([PROTOCOL_FLOOR, "maelys-provider/4", PROTOCOL]);
 export const TOOL_EFFECTS = Object.freeze(["read", "preview", "apply", "commit", "execute"]);
+/* The three methods the host will ever relay for a nested request - the same
+   set, and the same client-capability gate, the input_required path uses. */
+export const NESTED_REQUEST_METHODS = Object.freeze(["elicitation/create", "sampling/createMessage", "roots/list"]);
 const EVENT_CONTROL = Symbol("maelys-provider-event-control");
 
 export class ProviderNotFoundError extends Error {
   constructor(message = "resource not found") {
     super(message);
     this.name = "ProviderNotFoundError";
+  }
+}
+
+/*
+ * Raised by requestElicitation/requestSampling/requestRoots. `code` is either
+ * one the host's provider/nestedReply reported verbatim - "client_error"
+ * (the client's own JSON-RPC error, carried on as `.data`), "denied",
+ * "timeout", "cancelled" or "unavailable" (docs/provider-protocol.md's
+ * exact vocabulary) - or one this SDK synthesizes locally because no reply
+ * will ever arrive to report one: "channel_closed" (provider stdin ended
+ * mid-wait) and "protocol" (the reply that did arrive did not fit the wire
+ * shape). Keeping every rejection in one error type, with `code` always
+ * present, means a handler can catch once regardless of which side noticed
+ * the failure.
+ */
+export class NestedRequestError extends Error {
+  constructor(code, message, data) {
+    super(message || "nested request failed");
+    this.name = "NestedRequestError";
+    this.code = code;
+    if (data !== undefined) this.data = data;
   }
 }
 
@@ -47,7 +99,12 @@ function createEventControl() {
     if (!active || typeof writeMessage !== "function") {
       throw new Error("provider events are unavailable before activation or after shutdown");
     }
-    await writeMessage({ protocol: PROTOCOL, method, params });
+    // No `protocol` field here: the bound writer stamps whatever version the
+    // connection currently declares, and that can rise mid-session the
+    // moment a handler opens its first nested request - raised, never
+    // lowered - so an event must always declare what the session declares
+    // right now, not what it declared when this call started.
+    await writeMessage({ method, params });
   };
   return {
     public: Object.freeze({
@@ -240,15 +297,171 @@ function validateProviderResult(result) {
   throw new TypeError("provider resultType must be complete or input_required");
 }
 
-export async function handleProviderMessage(provider, message) {
+/*
+ * The helper a handler calls to open one request back at the client and
+ * block for the answer (docs/provider-protocol.md "Nested requests
+ * (version 5)"). `connection` is the single per-process-connection slot
+ * serveProvider owns; there is exactly one because the wire is strictly
+ * single-outstanding in both directions and this SDK never runs two calls
+ * concurrently (the dispatch loop awaits one handler to completion before
+ * reading the next request), so a second nested request can only mean a
+ * handler that raced its own two helper calls - refused locally, before a
+ * byte reaches the wire, the same way a double nested request coming back
+ * the other way would be fatal to the whole transport.
+ */
+function sendNestedRequest(connection, method, params) {
+  if (connection.nestedWaiter) {
+    return Promise.reject(new NestedRequestError("unavailable",
+      "a nested request is already outstanding on this connection"));
+  }
+  const nestedId = `n${++connection.nestedCounter}`;
+  const reply = new Promise((resolve, reject) => {
+    connection.nestedWaiter = { nestedId, resolve, reject };
+  });
+  const innerParams = params === undefined ? {} : objectValue(params, `${method} params`);
+  /*
+   * Raised before the frame goes out, never lowered afterward: this is the
+   * frame that announces /5, matching docs/provider-protocol.md ("a provider
+   * announces /5 on the nested request itself"). Every frame this connection
+   * writes from now on - including this call's own response, built after its
+   * handler returns - declares the raised version, not the one declared when
+   * the session started.
+   */
+  connection.declaredProtocol = PROTOCOL;
+  Promise.resolve(connection.writeMessage({
+    protocol: connection.declaredProtocol,
+    method: "provider/nestedRequest",
+    params: { nestedId, method, params: innerParams },
+  })).catch((error) => {
+    // The write itself failed (e.g. stdout closed): nothing will ever answer
+    // this nestedId, so settle the waiter here rather than leaving it to the
+    // channel-closed path, which only fires once the *input* side notices.
+    if (connection.nestedWaiter && connection.nestedWaiter.nestedId === nestedId) {
+      connection.nestedWaiter = null;
+      reply.catch(() => undefined);
+    }
+  });
+  return reply;
+}
+
+function unavailableNestedRequest(name) {
+  return () => Promise.reject(new NestedRequestError("unavailable",
+    `${name} requires a live connection - it is unavailable outside serveProvider`));
+}
+
+/*
+ * Resolves (or rejects) whichever requestElicitation/requestSampling/
+ * requestRoots call is currently waiting, from a provider/nestedReply frame
+ * the frame pump in serveProvider just read off stdin. `nestedId` is the
+ * collision-avoidance mechanism the wire uses instead of an id-space
+ * negotiation (docs/provider-protocol.md), so a mismatch here means the
+ * host and this SDK have lost track of which reply answers which request -
+ * treated the same as any other malformed reply, not silently dropped.
+ */
+function resolveNestedReply(connection, message) {
+  const waiter = connection.nestedWaiter;
+  if (!waiter) {
+    diagnostic(["ignoring unexpected provider/nestedReply", message]);
+    return;
+  }
+  const params = message && typeof message.params === "object" && message.params !== null &&
+    !Array.isArray(message.params) ? message.params : null;
+  const nestedId = params ? params.nestedId : undefined;
+  if (typeof nestedId !== "string" || nestedId !== waiter.nestedId) {
+    connection.nestedWaiter = null;
+    waiter.reject(new NestedRequestError("protocol",
+      `provider/nestedReply nestedId did not match the outstanding request (expected ${waiter.nestedId})`));
+    return;
+  }
+  connection.nestedWaiter = null;
+  const hasResult = params && Object.prototype.hasOwnProperty.call(params, "result");
+  const hasError = params && Object.prototype.hasOwnProperty.call(params, "error");
+  if (hasResult === hasError) {
+    waiter.reject(new NestedRequestError("protocol",
+      "provider/nestedReply must contain exactly one of result or error"));
+    return;
+  }
+  if (hasError) {
+    const error = params.error;
+    if (!error || typeof error !== "object" || Array.isArray(error) ||
+        typeof error.code !== "string" || typeof error.message !== "string") {
+      waiter.reject(new NestedRequestError("protocol",
+        "provider/nestedReply error must have a string code and message"));
+      return;
+    }
+    waiter.reject(new NestedRequestError(error.code, error.message, error.data));
+    return;
+  }
+  waiter.resolve(params.result);
+}
+
+/* Settles whatever nested wait is outstanding when the connection can no
+   longer produce a reply - stdin closed or errored mid-wait. */
+function failNestedWaiter(connection, error) {
+  const waiter = connection.nestedWaiter;
+  if (!waiter) return;
+  connection.nestedWaiter = null;
+  waiter.reject(error);
+}
+
+/*
+ * A tiny async FIFO, not a library: push() never blocks, take() resolves in
+ * arrival order (queued items first, otherwise the next push), and close()
+ * makes every future and outstanding take() resolve to `undefined` - the
+ * dispatch loop's "no more frames" signal, mirroring an exhausted async
+ * iterator's `{done: true}`.
+ */
+function createAsyncQueue() {
+  const items = [];
+  const waiters = [];
+  let closed = false;
+  return {
+    push(item) {
+      if (closed) return;
+      if (waiters.length) waiters.shift()(item);
+      else items.push(item);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      while (waiters.length) waiters.shift()(undefined);
+    },
+    take() {
+      if (items.length) return Promise.resolve(items.shift());
+      if (closed) return Promise.resolve(undefined);
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+  };
+}
+
+/*
+ * `nested` binds the three request-back helpers to a live connection; when
+ * omitted (every direct call in this SDK's own unit tests, and any embedder
+ * that only wants request/response dispatch) each helper rejects immediately
+ * rather than silently hanging, so a handler discovers the gap the first
+ * time it calls one rather than only under a real nested-capable host.
+ *
+ * The response this function builds always declares PROTOCOL_DECLARED
+ * (/4): this function has no connection-level state of its own to know
+ * whether *this* call raised it, so serveProvider is the one that restamps
+ * `protocol` after the handler returns, from whatever the connection
+ * declares by then - see the comment there. Called standalone, with no
+ * connection, nesting is unavailable (the stubs above reject immediately),
+ * so /4 is simply correct on its own.
+ */
+export async function handleProviderMessage(provider, message, nested = {}) {
   const request = objectValue(message, "provider request");
   if (typeof request.id !== "number" || !Number.isInteger(request.id)) throw new TypeError("provider request id must be an integer");
-  /* The host opens at the floor and only speaks the current version once we
-   have declared it in a response, so both are valid inbound. */
-  if (request.protocol !== PROTOCOL && request.protocol !== PROTOCOL_FLOOR) {
+  /* The host opens at the floor and only speaks a newer version once we have
+     declared it in a frame, so any version in the supported range is valid
+     inbound - not only the floor and the current one. */
+  if (!SUPPORTED_PROTOCOLS.includes(request.protocol)) {
     throw new TypeError("unsupported provider protocol");
   }
   const params = objectValue(request.params ?? {}, "provider request params");
+  const requestElicitation = nested.requestElicitation ?? unavailableNestedRequest("requestElicitation");
+  const requestSampling = nested.requestSampling ?? unavailableNestedRequest("requestSampling");
+  const requestRoots = nested.requestRoots ?? unavailableNestedRequest("requestRoots");
   let result;
   if (request.method === "provider/describe") {
     result = describeProvider(provider);
@@ -266,6 +479,7 @@ export async function handleProviderMessage(provider, message) {
         stringValue(params.requestState, "provider/call requestState"),
       clientCapabilities: params.clientCapabilities === undefined ? undefined :
         objectValue(params.clientCapabilities, "provider/call clientCapabilities"),
+      requestElicitation, requestSampling, requestRoots,
     };
     result = validateProviderResult(await tool.handler(arguments_, context));
   } else if (request.method === "provider/readResource") {
@@ -278,6 +492,7 @@ export async function handleProviderMessage(provider, message) {
         stringValue(params.requestState, "provider/readResource requestState"),
       clientCapabilities: params.clientCapabilities === undefined ? undefined :
         objectValue(params.clientCapabilities, "provider/readResource clientCapabilities"),
+      requestElicitation, requestSampling, requestRoots,
     };
     const candidate = await provider.readResource(uri, context);
     result = candidate?.resultType === "input_required" ?
@@ -287,7 +502,7 @@ export async function handleProviderMessage(provider, message) {
   } else {
     throw new Error(`unknown provider method: ${String(request.method)}`);
   }
-  return { protocol: PROTOCOL, id: request.id, result };
+  return { protocol: PROTOCOL_DECLARED, id: request.id, result };
 }
 
 function diagnostic(values) {
@@ -306,41 +521,122 @@ export async function serveProvider(provider, options = {}) {
     writeTail = pending.catch(() => undefined);
     return pending;
   };
-  eventControl.bind(writeMessage);
+  /*
+   * Everything this connection needs to share between the dispatch loop and
+   * an in-call nested wait, plus the one piece of state that outlives any
+   * single call: `declaredProtocol`, the version stamped on every outbound
+   * frame from here on. It starts at PROTOCOL_DECLARED (/4) and is raised to
+   * PROTOCOL (/5), once, the moment sendNestedRequest opens the first nested
+   * request - never lowered afterward, and never reset between calls.
+   */
+  const connection = { writeMessage, nestedWaiter: null, nestedCounter: 0, declaredProtocol: PROTOCOL_DECLARED };
+  // The events writer stamps `protocol` itself, ahead of whatever emit()
+  // builds: that is the one place this connection's currently-declared
+  // version reaches an event.
+  eventControl.bind((message) => writeMessage({ protocol: connection.declaredProtocol, ...message }));
   const originalConsole = { log: console.log, info: console.info, warn: console.warn };
   if (options.redirectConsole !== false) {
     console.log = (...values) => diagnostic(values);
     console.info = (...values) => diagnostic(values);
     console.warn = (...values) => diagnostic(values);
   }
+
+  /*
+   * One raw line reader for the whole connection, pulled out of the dispatch
+   * loop so both it and an in-call requestElicitation/requestSampling/
+   * requestRoots can consume frames without either losing or reordering one.
+   * It never stops pumping stdin: every line is classified the moment it
+   * arrives - a provider/nestedReply is resolved right here, in arrival
+   * order, whether the dispatch loop below is idle between requests or a
+   * handler is blocked deeper on the stack waiting on exactly this frame;
+   * everything else is handed to the dispatch queue untouched. That keeps
+   * ordinary requests from ever being reordered around a nested detour, and
+   * is the same three-way split process_reader_main makes on the host's own
+   * provider-facing leg (response / nested request / event) - here there are
+   * only two kinds, because host-to-provider traffic has no third, event-like
+   * frame to distinguish.
+   */
+  const dispatchQueue = createAsyncQueue();
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  const pump = (async () => {
+    try {
+      for await (const line of lines) {
+        let parsed;
+        let parseError;
+        try {
+          parsed = JSON.parse(line);
+        } catch (error) {
+          parseError = error;
+        }
+        if (parseError === undefined && parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+            parsed.id === undefined && parsed.method === "provider/nestedReply") {
+          resolveNestedReply(connection, parsed);
+          continue;
+        }
+        dispatchQueue.push({ parsed, parseError });
+      }
+    } finally {
+      dispatchQueue.close();
+      failNestedWaiter(connection, new NestedRequestError("channel_closed",
+        "provider input closed before a nested reply arrived"));
+    }
+  })();
+
   try {
-    for await (const line of lines) {
-      let message;
+    for (;;) {
+      const next = await dispatchQueue.take();
+      if (next === undefined) break;
+      const { parsed: message, parseError } = next;
       let response;
       try {
-        message = JSON.parse(line);
-        response = await handleProviderMessage(provider, message);
+        if (parseError !== undefined) throw parseError;
+        response = await handleProviderMessage(provider, message, {
+          requestElicitation: (params) => sendNestedRequest(connection, "elicitation/create", params),
+          requestSampling: (params) => sendNestedRequest(connection, "sampling/createMessage", params),
+          requestRoots: (params) => sendNestedRequest(connection, "roots/list", params),
+        });
       } catch (error) {
         const candidate = message && typeof message === "object" && !Array.isArray(message) ? message.id : 0;
         const id = typeof candidate === "number" && Number.isInteger(candidate) ? candidate : 0;
-        response = { protocol: PROTOCOL, id, error: {
-          code: error instanceof ProviderNotFoundError ? "not_found" : "provider_error",
+        response = { protocol: PROTOCOL_DECLARED, id, error: {
+          code: error instanceof ProviderNotFoundError ? "not_found" :
+            error instanceof NestedRequestError ? error.code : "provider_error",
           message: error instanceof Error ? error.message : String(error),
         } };
       }
+      /*
+       * Restamped here, after the handler (success or error) has fully run,
+       * rather than trusted from whatever handleProviderMessage or the catch
+       * block above built: a call that opened a nested request has already
+       * raised connection.declaredProtocol by now, via sendNestedRequest, and
+       * its own response - not just the frames after it - must say so, not
+       * the version declared when the call started. Reassigning an existing
+       * key updates its value without moving it, so `protocol` stays the
+       * first key in the encoded object either way.
+       */
+      response.protocol = connection.declaredProtocol;
       await writeMessage(response);
       if (message && typeof message === "object" && !Array.isArray(message) &&
           message.method === "provider/activate" && response.result) {
         eventControl.activate();
       }
-      if (message && typeof message === "object" && !Array.isArray(message) && message.method === "provider/shutdown") break;
+      if (message && typeof message === "object" && !Array.isArray(message) && message.method === "provider/shutdown") {
+        lines.close();
+        break;
+      }
     }
   } finally {
     lines.close();
     eventControl.deactivate();
     await writeTail;
+    // Cleanup below must run whether or not the pump ever saw a transport
+    // error, so its rejection (a stream `error` event, propagated the same
+    // way an unguarded `for await` would surface one) is captured rather
+    // than awaited directly, and only rethrown once every other finally
+    // step - restoring console among them - has already executed.
+    const pumpFailure = await pump.then(() => undefined, (error) => error);
     if (options.redirectConsole !== false) Object.assign(console, originalConsole);
+    if (pumpFailure) throw pumpFailure;
   }
   return 0;
 }

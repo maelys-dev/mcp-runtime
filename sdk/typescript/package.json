@@ -1,7 +1,7 @@
 {
   "name": "@maelys/mcp-provider-sdk",
-  "version": "0.3.0",
-  "description": "Dependency-free TypeScript/JavaScript SDK for maelys-provider/3 providers.",
+  "version": "0.4.0",
+  "description": "Dependency-free TypeScript/JavaScript SDK for maelys-provider providers, up to /5.",
   "type": "module",
   "files": ["src", "README.md"],
   "exports": { ".": { "types": "./src/index.d.ts", "import": "./src/index.js" } },
