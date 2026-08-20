@@ -137,7 +137,13 @@ static maelys_mcp_result_t call_directly(
  */
 static int test_dogfood(const char *host, const char *example_provider) {
     char *const upstream_argv[] = {
-        (char *)host, (char *)"--provider", (char *)example_provider, NULL
+        (char *)host, (char *)"--provider", (char *)example_provider,
+        /* The upstream host spawns its child provider with the default 5s
+         * describe deadline, inside the connect window but out of reach of
+         * connect_timeout_ms below; under a sanitizer on a loaded machine
+         * that deadline has missed, killing the whole connect. Like the
+         * connect deadline, it is a liveness bound nothing here measures. */
+        (char *)"--provider-describe-timeout-ms", (char *)"30000", NULL
     };
     maelys_mcp_proxy_options_t options = {
         .executable_path = host,
@@ -448,7 +454,9 @@ static int test_schema_policy_skip(const char *upstream) {
 static int test_schema_policy_skip_nothing_skipped(
     const char *host, const char *example_provider) {
     char *const upstream_argv[] = {
-        (char *)host, (char *)"--provider", (char *)example_provider, NULL
+        (char *)host, (char *)"--provider", (char *)example_provider,
+        /* Same loose child-describe bound as test_dogfood, same reason. */
+        (char *)"--provider-describe-timeout-ms", (char *)"30000", NULL
     };
     maelys_mcp_proxy_options_t options = {
         .executable_path = host,
