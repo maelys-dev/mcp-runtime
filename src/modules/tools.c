@@ -69,6 +69,16 @@ static void audit_tool(
     maelys_mcp_chain_audit(runtime, &record);
 }
 
+/*
+ * The schemas are deep-copied, not referenced. The registry co-owns the
+ * originals for the life of the runtime, and this entry leaves for a response
+ * whichever thread drains that channel's outbox will release - while other
+ * channels' dispatches are still taking and dropping references to the same
+ * nodes. Nothing orders those threads, so a shared node is the same
+ * refcount race as the transport's shared id and progressToken were: a frame
+ * handed to the outbox shares no node with anything another thread will
+ * release.
+ */
 static json_t *tool_as_json(maelys_mcp_owned_tool_t *tool) {
     json_t *root = json_object();
     json_t *annotations = json_object();
@@ -79,9 +89,11 @@ static json_t *tool_as_json(maelys_mcp_owned_tool_t *tool) {
         json_object_set_new(root, "name", json_string(tool->name)) != 0 ||
         json_object_set_new(root, "title", json_string(tool->title)) != 0 ||
         json_object_set_new(root, "description", json_string(tool->description)) != 0 ||
-        json_object_set(root, "inputSchema", tool->input_schema) != 0 ||
+        json_object_set_new(root, "inputSchema",
+            json_deep_copy(tool->input_schema)) != 0 ||
         (tool->output_schema &&
-            json_object_set(root, "outputSchema", tool->output_schema) != 0) ||
+            json_object_set_new(root, "outputSchema",
+                json_deep_copy(tool->output_schema)) != 0) ||
         json_object_set_new(annotations, "readOnlyHint", json_boolean(read_only)) != 0 ||
         json_object_set_new(annotations, "destructiveHint", json_boolean(!read_only)) != 0 ||
         json_object_set_new(root, "_meta",
