@@ -335,6 +335,12 @@ static const char *nested_error_code(maelys_mcp_result_t status) {
     }
 }
 
+/*
+ * json_object_set_new consumes its value whether it succeeds or fails, so
+ * every handover below stops owning the value on the same line it is handed
+ * over - not one branch later, which is where a failing sibling condition
+ * would otherwise turn a leak into a double release.
+ */
 static json_t *nested_reply_message(
     const char *protocol,
     const char *nested_id,
@@ -349,32 +355,30 @@ static json_t *nested_reply_message(
     }
     if (status == MAELYS_MCP_OK) {
         json_t *result = payload ? json_incref(payload) : json_object();
-        if (!result || json_object_set_new(params, "result", result) != 0) {
-            goto failed;
-        }
+        if (!result) goto failed;
+        if (json_object_set_new(params, "result", result) != 0) goto failed;
     } else {
         json_t *error = json_object();
-        if (!error ||
-            json_object_set_new(error, "code",
-                json_string(nested_error_code(status))) != 0 ||
+        if (!error) goto failed;
+        int described = json_object_set_new(error, "code",
+                json_string(nested_error_code(status))) == 0 &&
             json_object_set_new(error, "message",
                 json_string(message_text ? message_text :
-                    "nested request failed")) != 0 ||
+                    "nested request failed")) == 0 &&
             /* The client's own error object travels as data, so a provider can
              * tell "the user declined" from "the request never got there". */
-            (payload && json_object_set(error, "data", payload) != 0) ||
-            json_object_set_new(params, "error", error) != 0) {
-            if (error) json_decref(error);
-            goto failed;
-        }
+            (!payload || json_object_set(error, "data", payload) == 0);
+        int attached = json_object_set_new(params, "error", error) == 0;
+        if (!described || !attached) goto failed;
     }
     if (json_object_set_new(reply, "protocol", json_string(protocol)) != 0 ||
         json_object_set_new(reply, "method",
-            json_string("provider/nestedReply")) != 0 ||
-        json_object_set_new(reply, "params", params) != 0) {
-        params = NULL;
+            json_string("provider/nestedReply")) != 0) {
         goto failed;
     }
+    int attached = json_object_set_new(reply, "params", params) == 0;
+    params = NULL;
+    if (!attached) goto failed;
     return reply;
 failed:
     if (params) json_decref(params);
@@ -927,6 +931,10 @@ static void process_destroy(void *context) {
     }
     if (process->pending_response) json_decref(process->pending_response);
     if (process->pending_progress) json_decref(process->pending_progress);
+    /* A nested request the reader took off the wire and no call ever collected
+     * - which is exactly what a provider that died or broke the one-at-a-time
+     * rule leaves behind, so it is the normal case, not the exotic one. */
+    if (process->pending_nested) json_decref(process->pending_nested);
     free(process->failure_message);
     if (process->response_ready_initialized) {
         pthread_cond_destroy(&process->response_ready);

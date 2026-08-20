@@ -204,9 +204,15 @@ static json_t *nested_request_message(
     const char *method,
     json_t *params) {
     json_t *message = json_object();
-    /* A call that carried no params still sends an empty object, so a client
-     * never has to special-case a missing member. */
-    json_t *body = params ? json_incref(params) : json_object();
+    /*
+     * A copy of the params, not a reference to them. This frame goes to the
+     * outbox and is released by whichever thread drains it, while `params`
+     * belongs to the caller and is released on this one; sharing a node
+     * between the two is two threads releasing one jansson refcount. A call
+     * that carried no params still sends an empty object, so a client never
+     * has to special-case a missing member.
+     */
+    json_t *body = params ? json_deep_copy(params) : json_object();
     if (!message || !body ||
         json_object_set_new(message, "jsonrpc", json_string("2.0")) != 0 ||
         json_object_set_new(message, "id", json_string(id)) != 0 ||

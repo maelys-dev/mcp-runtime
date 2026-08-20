@@ -50,13 +50,16 @@
   `denied` before a byte is sent — the same rule `input_required` already
   enforced, so which surfaces a provider may reach does not depend on which
   multi-round-trip shape it chose.
-- **Fix: a response no longer shares its `id` with the request that produced
-  it.** Every response the runtime built took a reference to the request's own
-  `id` node, so the thread draining the outbox and the thread that read the
-  request off the wire could release one jansson refcount at the same time —
-  a data race present since the stdio transport gained its writer thread, and
-  invisible until this release ran `serve_stdio` under ThreadSanitizer for the
-  first time. Ids are copied now.
+- **Fix: an outbound frame no longer shares a node with the request that
+  produced it.** A response took a reference to the request's own `id`, and a
+  `notifications/progress` frame took one to the request's `progressToken`, so
+  the thread draining the outbox and the thread that dispatched the request
+  could release one jansson refcount at the same time. Both are data races
+  present since the stdio transport gained its writer thread, and invisible
+  until this release ran `serve_stdio` under ThreadSanitizer for the first
+  time — one of them only reproduced on Linux. Ids and tokens are copied now,
+  which turns "a frame shares no node with its request" from an incidental
+  property into a checkable one.
 - ABI stays 3. The additions are a new opaque type
   (`maelys_mcp_nested_relay_t`), three new entry points
   (`maelys_mcp_provider_request_client`,

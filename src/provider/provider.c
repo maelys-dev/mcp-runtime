@@ -126,7 +126,11 @@ maelys_mcp_result_t maelys_mcp_provider_report_progress(
     if (!params || !notification) goto failed;
     /* progressToken and progress are the only required params; total and
      * message are omitted rather than sent empty when not supplied. */
-    if (json_object_set(params, "progressToken", reporter->token) != 0 ||
+    /* Copied, not referenced: this notification is released by whichever
+     * thread drains the outbox, and the token is a node of the request, which
+     * is released by the thread that dispatched it. */
+    if (json_object_set_new(params, "progressToken",
+            json_deep_copy(reporter->token)) != 0 ||
         json_object_set_new(params, "progress", json_real(progress)) != 0 ||
         (total >= 0.0 &&
             json_object_set_new(params, "total", json_real(total)) != 0) ||
