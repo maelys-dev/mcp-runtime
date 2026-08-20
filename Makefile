@@ -72,7 +72,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
 -include $(DEPENDENCY_FILES)
 
-.PHONY: all clean test test-build check check-version-header check-all check-sdks test-conformance test-provider-conformance test-sdk-nested test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
+.PHONY: all clean test test-build check check-version-header check-all check-sdks test-conformance test-provider-conformance test-sdk-nested test-mcp-conformance-official asan asan-build tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
 	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
@@ -307,9 +307,20 @@ install: all
 	install -m 644 $(PC) "$(DESTDIR)$(PREFIX)/lib/pkgconfig/maelys-mcp.pc"
 	cp -R include/maelys "$(DESTDIR)$(PREFIX)/include/"
 
+ASAN_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=address,undefined -fno-omit-frame-pointer
+ASAN_LDLIBS = $(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=address,undefined
+
 asan:
 	ASAN_OPTIONS=$(ASAN_OPTIONS_VALUE) UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-	$(MAKE) BUILD_PROFILE=asan check CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=address,undefined -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=address,undefined"
+	$(MAKE) BUILD_PROFILE=asan check CFLAGS="$(ASAN_CFLAGS)" LDLIBS="$(ASAN_LDLIBS)"
+
+# Compile everything `asan` runs, without running any of it. The same split as
+# `test-build`, for the same reason: scripts/mutate.py needs a build step
+# separate from the kill step to tell a mutant that failed to compile
+# (stillborn) from one the suite noticed (killed). Used by mutation-asan.json;
+# see docs/mutation-testing.md.
+asan-build:
+	$(MAKE) BUILD_PROFILE=asan test-build CFLAGS="$(ASAN_CFLAGS)" LDLIBS="$(ASAN_LDLIBS)"
 
 tsan:
 	TSAN_OPTIONS=halt_on_error=1 \

@@ -1,4 +1,7 @@
 #include "maelys/mcp.h"
+/* For MAELYS_MCP_MAX_MIDDLEWARE: the chain's capacity is not public, and the
+ * boundary cases below are about exactly that number. */
+#include "src/internal/internal.h"
 #include "tests/test_support.h"
 
 #include <pthread.h>
@@ -380,6 +383,11 @@ static int test_registration_rules(void) {
         MAELYS_MCP_ERR_ARGUMENT);
     ASSERT_TRUE(error && strcmp(error, "middleware implements no hook") == 0);
     free(error);
+    /* out_error is optional: a caller that does not want the message still
+     * gets the verdict, and the refusal has nowhere to write rather than
+     * writing nowhere. */
+    ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &hookless, NULL) ==
+        MAELYS_MCP_ERR_ARGUMENT);
     ASSERT_TRUE(maelys_mcp_runtime_add_compat_policy(runtime, NULL, NULL, NULL) ==
         MAELYS_MCP_ERR_ARGUMENT);
 
@@ -1660,6 +1668,44 @@ static int test_list_transforms_every_catalog(void) {
 }
 
 /*
+ * "Unchanged" is the zero-copy path, and it has to leave the catalog where the
+ * next hook can see it. A hook that returns no replacement must not be read as
+ * a hook that returned an empty one, or a passive logger in front of a
+ * transformer would silently empty the catalog it was only watching.
+ */
+static int test_a_passive_list_hook_leaves_the_catalog(void) {
+    fixture_state_t state = {0};
+    maelys_mcp_runtime_t *runtime = NULL;
+    ASSERT_TRUE(build_runtime(&state, &runtime) == MAELYS_MCP_OK);
+    /* No rename and no addition: transform_list returns OK having written
+     * nothing, which is the "unchanged" answer. */
+    transform_t passive = {.id = 1};
+    transform_t active = {.id = 2, .list_add = "meta.search"};
+    maelys_mcp_middleware_t watcher = transform_middleware("watcher", &passive);
+    maelys_mcp_middleware_t editor = transform_middleware("editor", &active);
+    ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &watcher, NULL) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &editor, NULL) ==
+        MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
+
+    json_t *response = dispatch(channel, "tools/list", modern_params());
+    json_t *tools = listed(response, "tools");
+    ASSERT_TRUE(json_array_size(tools) == 3u);
+    ASSERT_TRUE(lists_entry(tools, "fx.read") && lists_entry(tools, "fx.mutate"));
+    ASSERT_TRUE(lists_entry(tools, "meta.search"));
+    json_decref(response);
+    /* The second hook saw the whole catalog, not an empty one. */
+    ASSERT_TRUE(passive.lists == 1 && passive.last_list_size == 2u);
+    ASSERT_TRUE(active.lists == 1 && active.last_list_size == 2u);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+/*
  * A catalog that could not be transformed is not a shorter catalog: the
  * listing fails, for the same reason an undecidable hook 2 fails one.
  */
@@ -2016,6 +2062,15 @@ static int test_wrap_sink_defaults_to_pass_through(void) {
     maelys_mcp_runtime_t *runtime = NULL;
     ASSERT_TRUE(build_runtime(&state, &runtime) == MAELYS_MCP_OK);
     sink_probe_t probe = {.id = 1, .passive = 1};
+    /*
+     * Ahead of it, a middleware that implements no hook 6 at all - the common
+     * case, and the one that has to be stepped over rather than called. A
+     * chain in which every middleware wraps never exercises that step.
+     */
+    probe_t unrelated = {.id = 9};
+    maelys_mcp_middleware_t bystander = probe_middleware("bystander", &unrelated);
+    ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &bystander, NULL) ==
+        MAELYS_MCP_OK);
     maelys_mcp_middleware_t middleware = sink_middleware("passive", &probe);
     ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &middleware, NULL) ==
         MAELYS_MCP_OK);
@@ -2233,6 +2288,338 @@ static int test_wrap_sink_runs_concurrently_across_channels(void) {
     return 0;
 }
 
+/* ---- the chain's own boundaries ----
+ *
+ * Every hook above walks `runtime->middleware[]` with the same loop, and every
+ * test above registers two or three middlewares - so the loops are exercised
+ * only in their comfortable middle. Two boundaries are never reached: a chain
+ * filled to MAELYS_MCP_MAX_MIDDLEWARE, where the last slot is the last legal
+ * index, and the slot one past it, which is not a slot at all.
+ *
+ * That matters because a full chain is the only configuration in which reading
+ * one index too far leaves the array: below capacity the next slot is a zeroed
+ * one whose hooks are all NULL, so an off-by-one there is invisible by
+ * construction. Mutation testing found exactly this - seven `index <` to
+ * `index <=` mutants, one per loop, that no test could tell apart from the
+ * original. Filling the chain is what makes the difference observable.
+ */
+
+typedef enum hook_kind {
+    HOOK_RESOLVE = 0,
+    HOOK_AUTHORIZE,
+    HOOK_CALL,
+    HOOK_RESULT,
+    HOOK_AUDIT,
+    HOOK_LIST,
+    HOOK_WRAP,
+    HOOK_KIND_COUNT
+} hook_kind_t;
+
+/* Two spare rows past a full chain, so an extra iteration is recorded rather
+ * than silently dropped by the bound this test is trying to check. */
+#define SLOT_LOG_CAPACITY (MAELYS_MCP_MAX_MIDDLEWARE + 2u)
+
+typedef struct chain_log {
+    size_t order[HOOK_KIND_COUNT][SLOT_LOG_CAPACITY];
+    size_t count[HOOK_KIND_COUNT];
+    size_t releases;
+} chain_log_t;
+
+typedef struct slot {
+    size_t index;
+    chain_log_t *log;
+} slot_t;
+
+static void note(chain_log_t *log, hook_kind_t hook, size_t index) {
+    if (log->count[hook] >= SLOT_LOG_CAPACITY) return;
+    log->order[hook][log->count[hook]++] = index;
+}
+
+/*
+ * Ran once for every registered middleware and for no one else, in
+ * registration order: slot 0 first, the last slot last, and nothing past it.
+ */
+static int ran_every_slot(const chain_log_t *log, hook_kind_t hook) {
+    if (log->count[hook] != (size_t)MAELYS_MCP_MAX_MIDDLEWARE) return 0;
+    for (size_t index = 0; index < (size_t)MAELYS_MCP_MAX_MIDDLEWARE; ++index) {
+        if (log->order[hook][index] != index) return 0;
+    }
+    return 1;
+}
+
+static maelys_mcp_result_t slot_resolve(
+    void *context,
+    const maelys_mcp_resolve_context_t *request,
+    maelys_mcp_resolution_t *out_resolution) {
+    slot_t *slot = context;
+    (void)request;
+    (void)out_resolution;
+    note(slot->log, HOOK_RESOLVE, slot->index);
+    return MAELYS_MCP_OK;
+}
+
+static maelys_mcp_authorize_decision_t slot_authorize(
+    void *context,
+    const maelys_mcp_authorize_context_t *request) {
+    slot_t *slot = context;
+    (void)request;
+    note(slot->log, HOOK_AUTHORIZE, slot->index);
+    return MAELYS_MCP_AUTHORIZE_ALLOW;
+}
+
+static maelys_mcp_call_disposition_t slot_call(
+    void *context,
+    const maelys_mcp_call_context_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    slot_t *slot = context;
+    (void)request;
+    (void)out_result;
+    (void)out_error;
+    note(slot->log, HOOK_CALL, slot->index);
+    /* Never substitutes: a substitution stops the chain, and this test is
+     * about the whole chain running. */
+    return MAELYS_MCP_CALL_INVOKE;
+}
+
+static maelys_mcp_result_disposition_t slot_result(
+    void *context,
+    const maelys_mcp_result_context_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    slot_t *slot = context;
+    (void)request;
+    (void)out_result;
+    (void)out_error;
+    note(slot->log, HOOK_RESULT, slot->index);
+    return MAELYS_MCP_RESULT_UNCHANGED;
+}
+
+static void slot_audit(void *context, const maelys_mcp_audit_context_t *record) {
+    slot_t *slot = context;
+    (void)record;
+    note(slot->log, HOOK_AUDIT, slot->index);
+}
+
+static maelys_mcp_result_t slot_list(
+    void *context,
+    const maelys_mcp_list_context_t *request,
+    json_t **out_entries) {
+    slot_t *slot = context;
+    (void)request;
+    (void)out_entries;
+    note(slot->log, HOOK_LIST, slot->index);
+    return MAELYS_MCP_OK;
+}
+
+static void slot_wrapper_release(void *context) {
+    slot_t *slot = context;
+    slot->log->releases++;
+}
+
+static maelys_mcp_result_t slot_wrap(
+    void *context,
+    const maelys_mcp_wrap_sink_context_t *request,
+    maelys_mcp_sink_wrapper_t *out_wrapper) {
+    slot_t *slot = context;
+    (void)request;
+    note(slot->log, HOOK_WRAP, slot->index);
+    /* Sets no emit or complete: a passive wrapper still occupies a slot in
+     * the chain's parallel arrays, which is what the bound is about. */
+    out_wrapper->context = slot;
+    out_wrapper->release = slot_wrapper_release;
+    return MAELYS_MCP_OK;
+}
+
+static maelys_mcp_middleware_t slot_middleware(const char *name, slot_t *slot) {
+    maelys_mcp_middleware_t middleware = {
+        .name = name,
+        .context = slot,
+        .on_resolve = slot_resolve,
+        .on_authorize = slot_authorize,
+        .on_call = slot_call,
+        .on_result = slot_result,
+        .on_audit = slot_audit,
+        .wrap_sink = slot_wrap,
+        .on_list = slot_list
+    };
+    return middleware;
+}
+
+static int test_a_full_chain_runs_every_slot(void) {
+    fixture_state_t state = {0};
+    maelys_mcp_runtime_t *runtime = NULL;
+    ASSERT_TRUE(build_runtime(&state, &runtime) == MAELYS_MCP_OK);
+    chain_log_t log = {0};
+    slot_t slots[MAELYS_MCP_MAX_MIDDLEWARE] = {{0, NULL}};
+    for (size_t index = 0; index < (size_t)MAELYS_MCP_MAX_MIDDLEWARE; ++index) {
+        slots[index].index = index;
+        slots[index].log = &log;
+        maelys_mcp_middleware_t middleware =
+            slot_middleware("slot", &slots[index]);
+        ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &middleware,
+            NULL) == MAELYS_MCP_OK);
+    }
+    /* The slot after the last one does not exist, and asking for it is a
+     * caller error rather than a silently dropped registration. */
+    slot_t overflow = {.index = MAELYS_MCP_MAX_MIDDLEWARE, .log = &log};
+    maelys_mcp_middleware_t past_the_end = slot_middleware("overflow", &overflow);
+    char *error = NULL;
+    ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &past_the_end,
+        &error) == MAELYS_MCP_ERR_ARGUMENT);
+    ASSERT_TRUE(error && strcmp(error, "middleware capacity reached") == 0);
+    free(error);
+
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
+
+    /* One tools/call: one traversal each of hooks 1, 2, 3, 4, 5 and 6. */
+    json_t *response = dispatch(channel, "tools/call",
+        call_params("fx.read", json_pack("{s:s}", "message", "hello")));
+    ASSERT_TRUE(json_object_get(response, "result"));
+    json_decref(response);
+    ASSERT_TRUE(state.calls == 1);
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_RESOLVE));
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_AUTHORIZE));
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_CALL));
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_RESULT));
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_AUDIT));
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_WRAP));
+    /* Every wrapper the chain built was released, and no more. */
+    ASSERT_TRUE(log.releases == (size_t)MAELYS_MCP_MAX_MIDDLEWARE);
+
+    /* One tools/list, on a fresh log: hook 7 traverses the chain once, while
+     * hooks 2 and 5 traverse it once per catalog entry and so are not the
+     * subject here. */
+    memset(&log, 0, sizeof(log));
+    response = dispatch(channel, "tools/list", modern_params());
+    ASSERT_TRUE(json_array_size(json_object_get(
+        json_object_get(response, "result"), "tools")) == 2u);
+    json_decref(response);
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_LIST));
+    ASSERT_TRUE(ran_every_slot(&log, HOOK_WRAP));
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+/*
+ * The guard in guard_complete: two responses carrying one request id is a
+ * protocol violation whichever of them a client believes, so the second is
+ * refused rather than delivered - and refused with the sink's own failure
+ * convention, which leaves the message with the caller that offered it.
+ */
+typedef struct double_completer {
+    maelys_mcp_result_t first;
+    maelys_mcp_result_t second;
+} double_completer_t;
+
+static maelys_mcp_result_t double_complete(
+    void *context,
+    const maelys_mcp_response_sink_t *inner,
+    json_t *response) {
+    double_completer_t *probe = context;
+    probe->first = maelys_mcp_sink_complete(inner, response);
+    json_t *again = json_pack("{s:s,s:i,s:{s:[{s:s,s:s}]}}",
+        "jsonrpc", "2.0", "id", 1, "result",
+        "content", "type", "text", "text", "second");
+    if (!again) {
+        probe->second = MAELYS_MCP_ERR_MEMORY;
+        return probe->first;
+    }
+    probe->second = maelys_mcp_sink_complete(inner, again);
+    /* Refused, so the reference never transferred and releasing it here is
+     * this caller's job rather than a double free. */
+    json_decref(again);
+    return probe->first;
+}
+
+static maelys_mcp_result_t double_wrap(
+    void *context,
+    const maelys_mcp_wrap_sink_context_t *request,
+    maelys_mcp_sink_wrapper_t *out_wrapper) {
+    (void)request;
+    out_wrapper->context = context;
+    out_wrapper->complete = double_complete;
+    return MAELYS_MCP_OK;
+}
+
+static int test_a_second_completion_is_refused(void) {
+    fixture_state_t state = {0};
+    maelys_mcp_runtime_t *runtime = NULL;
+    ASSERT_TRUE(build_runtime(&state, &runtime) == MAELYS_MCP_OK);
+    double_completer_t probe = {0};
+    maelys_mcp_middleware_t middleware = {
+        .name = "double", .context = &probe, .wrap_sink = double_wrap
+    };
+    ASSERT_TRUE(maelys_mcp_runtime_add_middleware(runtime, &middleware, NULL) ==
+        MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
+
+    json_t *frames = dispatch_frames(channel, "tools/call",
+        call_params("fx.mutate", NULL));
+    ASSERT_TRUE(json_array_size(frames) == 1u);
+    ASSERT_TRUE(json_object_get(json_array_get(frames, 0), "result"));
+    json_decref(frames);
+    ASSERT_TRUE(probe.first == MAELYS_MCP_OK);
+    ASSERT_TRUE(probe.second == MAELYS_MCP_ERR_STATE);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+/*
+ * The compatibility shim takes either callback alone. An embedder migrating
+ * off the removed config fields may have set only one of them, and refusing
+ * that pair would make the one-call migration a rewrite for exactly the
+ * embedders it exists for.
+ */
+static int test_compat_policy_accepts_either_callback_alone(void) {
+    fixture_state_t state = {0};
+    maelys_mcp_runtime_t *runtime = NULL;
+    ASSERT_TRUE(build_runtime(&state, &runtime) == MAELYS_MCP_OK);
+    compat_state_t authorize_only = {0};
+    ASSERT_TRUE(maelys_mcp_runtime_add_compat_policy(runtime, compat_authorize,
+        NULL, &authorize_only) == MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
+    json_t *response = dispatch(channel, "tools/call",
+        call_params("fx.mutate", NULL));
+    ASSERT_TRUE(error_code(response) == -32003);
+    json_decref(response);
+    /* The one callback that was supplied decided; the one that was not is not
+     * a reason to have refused the registration. */
+    ASSERT_TRUE(authorize_only.authorized >= 1 && authorize_only.audited == 0);
+    /* The chain is immutable once a channel exists, and the shim a refused
+     * registration had already built is released rather than stranded. */
+    ASSERT_TRUE(maelys_mcp_runtime_add_compat_policy(runtime, compat_authorize,
+        NULL, &authorize_only) == MAELYS_MCP_ERR_STATE);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+
+    fixture_state_t audit_state = {0};
+    runtime = NULL;
+    ASSERT_TRUE(build_runtime(&audit_state, &runtime) == MAELYS_MCP_OK);
+    compat_state_t audit_only = {0};
+    ASSERT_TRUE(maelys_mcp_runtime_add_compat_policy(runtime, NULL,
+        compat_audit, &audit_only) == MAELYS_MCP_OK);
+    channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, NULL, &channel) == MAELYS_MCP_OK);
+    response = dispatch(channel, "tools/call", call_params("fx.mutate", NULL));
+    /* Nothing authorizes, so the apply-effect tool that the allowlist above
+     * refused now runs, and is journalled. */
+    ASSERT_TRUE(json_object_get(response, "result"));
+    json_decref(response);
+    ASSERT_TRUE(audit_only.audited == 1 && audit_only.authorized == 0);
+    ASSERT_TRUE(strcmp(audit_only.last_audited_identity, "fx.mutate") == 0);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t cases[] = {
         {"empty chain is transparent", test_empty_chain_is_transparent},
@@ -2262,6 +2649,8 @@ int main(void) {
         {"result redaction versus output schema",
             test_result_redaction_versus_output_schema},
         {"list transforms every catalog", test_list_transforms_every_catalog},
+        {"a passive list hook leaves the catalog",
+            test_a_passive_list_hook_leaves_the_catalog},
         {"a list failure fails the listing",
             test_list_failure_fails_the_listing},
         {"wrap_sink keeps progress ahead of the response",
@@ -2274,7 +2663,11 @@ int main(void) {
         {"wrap_sink defaults to pass through",
             test_wrap_sink_defaults_to_pass_through},
         {"wrap_sink runs concurrently across channels",
-            test_wrap_sink_runs_concurrently_across_channels}
+            test_wrap_sink_runs_concurrently_across_channels},
+        {"a full chain runs every slot", test_a_full_chain_runs_every_slot},
+        {"a second completion is refused", test_a_second_completion_is_refused},
+        {"the compat policy accepts either callback alone",
+            test_compat_policy_accepts_either_callback_alone}
     };
     int failures = maelys_run_tests(cases, sizeof(cases) / sizeof(cases[0]));
     if (failures == 0) puts("test_middleware: OK");

@@ -289,6 +289,41 @@ starts producing kills you distrust, override the kill command in
 `mutation.json` — for example to a single suite, or to `make check` under a
 stricter environment — rather than reading the numbers more optimistically.
 
+## What to do with a survivor
+
+A survivor is a finding. It is not automatically a test to write: some of them
+are mutants no test could ever kill, and chasing those inflates a number
+without improving anything. The one thing that must not happen to a survivor
+is nothing at all, silently — a survivor nobody killed and nobody wrote down
+is reported again by every future sweep and read as already-handled by every
+future reader.
+
+`docs/mutation-triage.md` is where that is written down. It carries every
+survivor of a completed sweep that was *not* killed, one line each, with the
+bucket it fell into and the reason. Killing a survivor and recording why it
+was left are the two acceptable outcomes; a third sweep reporting the same
+unexamined line is not.
+
+### The sanitizer variant
+
+`mutation-asan.json` is the same configuration with the sanitizer profile as
+its build and kill commands (`make asan-build` and `make asan`, the same split
+as `test-build` and `test`, for the same stillborn-detection reason):
+
+```sh
+python3 scripts/mutate.py --config mutation-asan.json \
+    --files 'src/core/nested.c' --operators relational_swap \
+    --confirm-survivors --report mutation-asan-report.json
+```
+
+It is deliberately not the default. `make asan` costs several times what
+`make check` costs per mutant, and it earns that only on files whose survivors
+are of a shape a sanitizer can see — an off-by-one on a heap array, a skipped
+`json_decref`. It is blind to an over-read that stays inside one allocation,
+and on Darwin it is blind to leaks as well, because that profile runs with
+`detect_leaks=0`. `docs/mutation-triage.md` records which survivors it
+actually killed and which it did not.
+
 ## Configuration contract
 
 Everything repository-specific lives in `mutation.json` at the repository
