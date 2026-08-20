@@ -66,6 +66,8 @@
   diffing scripted sessions against the previous SDKs, in all three
   languages.
 
+## 0.15.0 - 2026-08-20
+
 - **Tools can now ask the user a question in the middle of a call, and older
   MCP clients understand the question.** A provider handling `tools/call` or
   `resources/read` can open a real `elicitation/create`,
