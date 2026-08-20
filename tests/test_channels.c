@@ -1214,6 +1214,170 @@ static int test_channel_context_accessor(void) {
     return 0;
 }
 
+/* ---- tools/list schemas across channels, concurrently ---- */
+
+static json_t *listing_input_schema(void) {
+    return json_pack("{s:s,s:{s:{s:s}},s:[s],s:b}",
+        "type", "object",
+        "properties", "path", "type", "string",
+        "required", "path",
+        "additionalProperties", 0);
+}
+
+static json_t *listing_output_schema(void) {
+    return json_pack("{s:s,s:{s:{s:s}}}",
+        "type", "object",
+        "properties", "text", "type", "string");
+}
+
+/* Never reached: this suite only lists the tool. */
+static maelys_mcp_result_t listing_call(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    (void)context;
+    (void)request;
+    (void)out_result;
+    (void)out_error;
+    return MAELYS_MCP_ERR_STATE;
+}
+
+static maelys_mcp_runtime_t *new_listing_runtime(void) {
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "listing-test",
+        .server_version = "1",
+        .max_providers = 1u
+    };
+    maelys_mcp_runtime_t *runtime = NULL;
+    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) return NULL;
+    json_t *input_schema = listing_input_schema();
+    json_t *output_schema = listing_output_schema();
+    maelys_mcp_tool_t tool = {
+        .name = "ls.read",
+        .title = "Read",
+        .description = "Lists with both schemas declared.",
+        .input_schema = input_schema,
+        .output_schema = output_schema,
+        .effect = MAELYS_MCP_EFFECT_READ
+    };
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "listing-provider",
+        .version = "1",
+        .tools = &tool,
+        .tool_count = 1u,
+        .call = listing_call
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    maelys_mcp_result_t status = input_schema && output_schema &&
+        maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) ==
+            MAELYS_MCP_OK ?
+        maelys_mcp_provider_create(&provider_config, &provider) :
+        MAELYS_MCP_ERR_STATE;
+    if (input_schema) json_decref(input_schema);
+    if (output_schema) json_decref(output_schema);
+    if (status == MAELYS_MCP_OK &&
+        maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) {
+        maelys_mcp_provider_destroy(provider);
+        status = MAELYS_MCP_ERR_STATE;
+    }
+    if (status != MAELYS_MCP_OK) {
+        maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+        (void)destroy_status;
+        return NULL;
+    }
+    return runtime;
+}
+
+static json_t *list_request(json_int_t id) {
+    return json_pack("{s:s,s:I,s:s,s:{s:o}}",
+        "jsonrpc", "2.0", "id", id, "method", "tools/list",
+        "params", "_meta", modern_meta());
+}
+
+#define LISTING_ROUNDS 32
+
+typedef struct lister {
+    maelys_mcp_channel_t *channel;
+    int failures;
+} lister_t;
+
+/*
+ * One channel's worth of the stdio writer's life: take the response off the
+ * outbox, serialize it, release it. The serialize step matters - it is where
+ * a frame still sharing nodes with the registry would be read while another
+ * thread manipulates those nodes' refcounts.
+ */
+static void *list_repeatedly(void *argument) {
+    lister_t *lister = argument;
+    for (int round = 0; round < LISTING_ROUNDS; ++round) {
+        if (handle(lister->channel, list_request(round + 1)) != MAELYS_MCP_OK) {
+            lister->failures++;
+            continue;
+        }
+        json_t *response = next_message(lister->channel, 5000u);
+        json_t *tools = json_object_get(
+            json_object_get(response, "result"), "tools");
+        char *wire = response ?
+            json_dumps(response, JSON_COMPACT | JSON_SORT_KEYS) : NULL;
+        if (!response || json_array_size(tools) != 1u || !wire) {
+            lister->failures++;
+        }
+        free(wire);
+        if (response) json_decref(response);
+    }
+    return NULL;
+}
+
+/*
+ * A tools/list response must share no node with the registry's tool entries:
+ * the registry co-owns its schema objects for the life of the runtime, and a
+ * response referencing them is released by whichever thread drains that
+ * channel's outbox while other channels' dispatches take references to the
+ * same nodes. Nothing orders those threads, and jansson's refcount is an
+ * atomic read-modify-write behind an ordinary read of the same word, so the
+ * share is a data race - the same letter-of-the-memory-model race the stdio
+ * transport's shared id and progressToken nodes were. Two channels listing
+ * concurrently is the smallest shape that exercises it.
+ */
+static int test_tools_list_shares_no_schema_across_channels(void) {
+    maelys_mcp_runtime_t *runtime = new_listing_runtime();
+    ASSERT_TRUE(runtime != NULL);
+    lister_t first = {0};
+    lister_t second = {0};
+    first.channel = new_channel(runtime, 16u, 5000u);
+    second.channel = new_channel(runtime, 16u, 5000u);
+    ASSERT_TRUE(first.channel && second.channel);
+
+    pthread_t thread;
+    ASSERT_TRUE(pthread_create(&thread, NULL, list_repeatedly, &second) == 0);
+    list_repeatedly(&first);
+    ASSERT_TRUE(pthread_join(thread, NULL) == 0);
+    ASSERT_TRUE(first.failures == 0 && second.failures == 0);
+
+    /* Not sharing must not mean not equal: the wire still carries exactly
+     * the schemas the provider declared. */
+    ASSERT_TRUE(handle(first.channel, list_request(LISTING_ROUNDS + 1)) ==
+        MAELYS_MCP_OK);
+    json_t *response = next_message(first.channel, 5000u);
+    ASSERT_TRUE(response != NULL);
+    json_t *entry = json_array_get(
+        json_object_get(json_object_get(response, "result"), "tools"), 0u);
+    json_t *expected_input = listing_input_schema();
+    json_t *expected_output = listing_output_schema();
+    int matches = expected_input && expected_output &&
+        json_equal(json_object_get(entry, "inputSchema"), expected_input) &&
+        json_equal(json_object_get(entry, "outputSchema"), expected_output);
+    if (expected_input) json_decref(expected_input);
+    if (expected_output) json_decref(expected_output);
+    json_decref(response);
+    ASSERT_TRUE(matches);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(second.channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(destroy_channel_and_runtime(first.channel, runtime));
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
         {"same JSON-RPC id is isolated with exact fanout",
@@ -1246,7 +1410,9 @@ int main(void) {
         {"concurrent channels dispatch under fanout",
             test_concurrent_channels_dispatch_under_fanout},
         {"channel context accessor is bound, read-back and NULL-safe",
-            test_channel_context_accessor}
+            test_channel_context_accessor},
+        {"tools/list shares no schema node across channels",
+            test_tools_list_shares_no_schema_across_channels}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));
 }
