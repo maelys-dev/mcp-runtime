@@ -1,9 +1,9 @@
 # `@maelys/mcp-provider-sdk`
 
-Dependency-free Node.js SDK for persistent `maelys-provider/5` providers (every version
-back to `maelys-provider/3` is still accepted inbound). It owns the protocol loop,
-envelopes, structured errors, shutdown and descriptor validation while domain code
-supplies tool handlers.
+Dependency-free Node.js SDK for persistent `maelys-provider` providers, up to `/5`
+(every version back to `maelys-provider/3` is still accepted inbound). It owns the
+protocol loop, envelopes, structured errors, shutdown and descriptor validation while
+domain code supplies tool handlers.
 
 ```js
 import { completeResult, createProvider, serveProvider } from "@maelys/mcp-provider-sdk";
@@ -65,5 +65,10 @@ resolves with the client's result or rejects with a `NestedRequestError` carryin
 own JSON-RPC error, on `.data`) or `failed` come from the host; `channel_closed` and
 `protocol` are raised locally when no reply can arrive, or the one that did doesn't fit
 the wire shape. The host enforces one nested request at a time per call and gates each
-method on the client capability the caller declared - a provider that never calls these
-helpers behaves exactly as before.
+method on the client capability the caller declared.
+
+Nesting is the only thing that makes this SDK declare `maelys-provider/5`. A provider
+that never opens one keeps declaring `/4` for the whole session - the same version it
+declared before this feature existed - and keeps working against a host that predates
+nested requests. The first nested request raises the declared version for the rest of
+the session; it is never lowered back down.

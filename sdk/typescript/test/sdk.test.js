@@ -72,7 +72,10 @@ test("persistent messages preserve protocol and integer ids", async () => {
     method: "provider/call",
     params: { name: "fixture.echo", arguments: { message: "hello" } },
   });
-  assert.deepEqual(response, { protocol: "maelys-provider/5", id: 7, result: {
+  // Spelled out rather than compared against PROTOCOL_DECLARED: the property
+  // under test is that a call which never nests declares the older version -
+  // a constant reference would move with the code under its own mutation.
+  assert.deepEqual(response, { protocol: "maelys-provider/4", id: 7, result: {
     resultType: "complete", structuredContent: { message: "hello" },
   } });
   await assert.rejects(() => handleProviderMessage(provider, {
@@ -203,11 +206,94 @@ test("handleProviderMessage accepts every protocol from the floor to the current
     const response = await handleProviderMessage(provider, {
       protocol, id: 1, method: "provider/describe", params: {},
     });
-    assert.equal(response.protocol, PROTOCOL);
+    // The host addresses a provider at whatever it last declared - not
+    // necessarily the newest version this SDK speaks - so /4 has to be
+    // accepted even though it is neither the floor nor PROTOCOL.
+    assert.equal(response.protocol, "maelys-provider/4");
   }
   await assert.rejects(() => handleProviderMessage(provider, {
     protocol: "maelys-provider/2", id: 1, method: "provider/describe", params: {},
   }), /unsupported provider protocol/);
+});
+
+test("a provider that never nests declares maelys-provider/4 on every frame it writes", async () => {
+  let provider;
+  provider = createProvider({
+    name: "never-nests", version: "1", tools: [{
+      name: "echo", description: "Echo without ever calling a nested helper.",
+      inputSchema: { type: "object" }, effect: "read",
+      handler: async () => {
+        await provider.events.resourcesListChanged();
+        return completeResult({ structuredContent: { ok: true } });
+      },
+    }],
+  });
+  const requests = [
+    { protocol: "maelys-provider/3", id: 1, method: "provider/describe", params: {} },
+    { protocol: "maelys-provider/3", id: 2, method: "provider/activate", params: {} },
+    { protocol: "maelys-provider/3", id: 3, method: "provider/call", params: { name: "echo", arguments: {} } },
+    { protocol: "maelys-provider/3", id: 4, method: "provider/shutdown", params: {} },
+  ];
+  const output = [];
+  await serveProvider(provider, {
+    input: Readable.from(requests.map((request) => `${JSON.stringify(request)}\n`)),
+    writeLine: (line) => { output.push(JSON.parse(line)); },
+    redirectConsole: false,
+  });
+  // Every response and every event: describe, activate, the call's own
+  // response, the event the handler emitted mid-call, and shutdown.
+  assert.equal(output.length, 5);
+  // Spelled out, not compared against PROTOCOL_DECLARED: the property under
+  // test is that these bytes are unchanged from before this SDK could nest,
+  // and a constant reference would move with the code under its own
+  // mutation rather than pin the literal.
+  for (const message of output) assert.equal(message.protocol, "maelys-provider/4");
+});
+
+test("the first nested request raises the declared protocol to /5 for the rest of the session, never lowered", async () => {
+  const provider = createProvider({
+    name: "raises-once", version: "1",
+    tools: [
+      {
+        name: "confirm", description: "The one tool that nests.",
+        inputSchema: { type: "object" }, effect: "apply",
+        handler: async (_arguments, context) => completeResult({
+          structuredContent: await context.requestElicitation({ message: "Apply?", requestedSchema: { type: "object" } }),
+        }),
+      },
+      {
+        name: "echo", description: "An ordinary tool called after the nest resolves.",
+        inputSchema: { type: "object" }, effect: "read",
+        handler: async () => completeResult({ structuredContent: { ok: true } }),
+      },
+    ],
+  });
+  const harness = createHarness({
+    onNestedRequest: (params, { send, end }) => {
+      send({ protocol: PROTOCOL, method: "provider/nestedReply",
+        params: { nestedId: params.nestedId, result: { action: "accept" } } });
+      // A second, ordinary call after the nest resolves - proves the raise
+      // holds for the rest of the session, not just for the one frame that
+      // announced it.
+      send({ protocol: PROTOCOL, id: 2, method: "provider/call", params: { name: "echo", arguments: {} } });
+      send({ protocol: PROTOCOL, id: 3, method: "provider/shutdown", params: {} });
+      end();
+    },
+  });
+  // Answered before the nesting call is even dispatched (the dispatch loop
+  // is strictly one frame at a time), so this pins the "before" state too.
+  harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/describe", params: {} });
+  harness.send({ protocol: "maelys-provider/3", id: 100, method: "provider/call", params: { name: "confirm", arguments: {} } });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+
+  assert.equal(harness.output.find((message) => message.id === 1).protocol, "maelys-provider/4");
+  const nestedRequestFrame = harness.output.find((message) => message.method === "provider/nestedRequest");
+  assert.equal(nestedRequestFrame.protocol, "maelys-provider/5");
+  // The nesting call's own response - not just what comes after it.
+  assert.equal(harness.output.find((message) => message.id === 100).protocol, "maelys-provider/5");
+  // An unrelated call dispatched afterward: still /5, not reverted to /4.
+  assert.equal(harness.output.find((message) => message.id === 2).protocol, "maelys-provider/5");
+  assert.equal(harness.output.find((message) => message.id === 3).protocol, "maelys-provider/5");
 });
 
 test("requestElicitation/requestSampling/requestRoots reject outside serveProvider", async () => {

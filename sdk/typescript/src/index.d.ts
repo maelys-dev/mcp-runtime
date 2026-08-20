@@ -1,7 +1,13 @@
 import type { Readable } from "node:stream";
 
+/** The newest version this SDK ever declares - once it has actually opened a
+ *  nested request. Also the ceiling of what it accepts inbound. */
 export const PROTOCOL: "maelys-provider/5";
 export const PROTOCOL_FLOOR: "maelys-provider/3";
+/** Declared on every outbound frame until a handler opens its first nested
+ *  request; raised to PROTOCOL then, never lowered. A provider that never
+ *  nests keeps declaring this version for the whole session. */
+export const PROTOCOL_DECLARED: "maelys-provider/4";
 export const TOOL_EFFECTS: readonly ["read", "preview", "apply", "commit", "execute"];
 export const NESTED_REQUEST_METHODS: readonly ["elicitation/create", "sampling/createMessage", "roots/list"];
 export class ProviderNotFoundError extends Error {}

@@ -1,16 +1,36 @@
 import readline from "node:readline";
 
 /*
- * Every version between the floor and the current one, oldest first, so the
- * list - not just its endpoints - is what "supported" means: a host that
- * only accepted the floor and the newest would reject a provider still
- * declaring an in-between version the moment a newer one existed. This
- * mirrors the same array in src/provider/process_provider.c.
+ * The newest version this SDK ever declares - once it has actually opened a
+ * nested request (see PROTOCOL_DECLARED, just below). Also the ceiling of
+ * what it accepts inbound.
  */
 export const PROTOCOL = "maelys-provider/5";
 /* The version every provider speaks, and the one the host opens with until
-   this SDK declares the newer one in a response. */
+   this SDK declares a newer one in a frame of its own. */
 export const PROTOCOL_FLOOR = "maelys-provider/3";
+/*
+ * The version stamped on outbound frames until a nested request is opened.
+ * Announcing /5 up front would cost every provider built on this SDK its
+ * compatibility with a host that predates /5 (its version check looked for
+ * exactly the floor or its one newest version, not a range - the same
+ * two-endpoint shape src/provider/process_provider.c's own comment warns
+ * about), in exchange for a feature it may never use. The host learns a
+ * version from any frame rather than only from responses, precisely so /5
+ * can be announced late - on the frame that opens the first nested request -
+ * which is what keeps a provider that never nests emitting exactly the bytes
+ * it emitted before this feature existed. Raised in sendNestedRequest,
+ * never lowered afterward.
+ */
+export const PROTOCOL_DECLARED = "maelys-provider/4";
+/*
+ * Every version between the floor and the current one, oldest first, so the
+ * list - not just its endpoints - is what "supported" means: the host
+ * addresses a provider at whatever it last declared, and this SDK declares
+ * /5 only once it actually nests, so /4 has to be accepted even though it is
+ * neither the floor nor the newest version this SDK speaks. This mirrors the
+ * same array in src/provider/process_provider.c.
+ */
 const SUPPORTED_PROTOCOLS = Object.freeze([PROTOCOL_FLOOR, "maelys-provider/4", PROTOCOL]);
 export const TOOL_EFFECTS = Object.freeze(["read", "preview", "apply", "commit", "execute"]);
 /* The three methods the host will ever relay for a nested request - the same
@@ -79,7 +99,12 @@ function createEventControl() {
     if (!active || typeof writeMessage !== "function") {
       throw new Error("provider events are unavailable before activation or after shutdown");
     }
-    await writeMessage({ protocol: PROTOCOL, method, params });
+    // No `protocol` field here: the bound writer stamps whatever version the
+    // connection currently declares, and that can rise mid-session the
+    // moment a handler opens its first nested request - raised, never
+    // lowered - so an event must always declare what the session declares
+    // right now, not what it declared when this call started.
+    await writeMessage({ method, params });
   };
   return {
     public: Object.freeze({
@@ -294,8 +319,17 @@ function sendNestedRequest(connection, method, params) {
     connection.nestedWaiter = { nestedId, resolve, reject };
   });
   const innerParams = params === undefined ? {} : objectValue(params, `${method} params`);
+  /*
+   * Raised before the frame goes out, never lowered afterward: this is the
+   * frame that announces /5, matching docs/provider-protocol.md ("a provider
+   * announces /5 on the nested request itself"). Every frame this connection
+   * writes from now on - including this call's own response, built after its
+   * handler returns - declares the raised version, not the one declared when
+   * the session started.
+   */
+  connection.declaredProtocol = PROTOCOL;
   Promise.resolve(connection.writeMessage({
-    protocol: PROTOCOL,
+    protocol: connection.declaredProtocol,
     method: "provider/nestedRequest",
     params: { nestedId, method, params: innerParams },
   })).catch((error) => {
@@ -406,6 +440,14 @@ function createAsyncQueue() {
  * that only wants request/response dispatch) each helper rejects immediately
  * rather than silently hanging, so a handler discovers the gap the first
  * time it calls one rather than only under a real nested-capable host.
+ *
+ * The response this function builds always declares PROTOCOL_DECLARED
+ * (/4): this function has no connection-level state of its own to know
+ * whether *this* call raised it, so serveProvider is the one that restamps
+ * `protocol` after the handler returns, from whatever the connection
+ * declares by then - see the comment there. Called standalone, with no
+ * connection, nesting is unavailable (the stubs above reject immediately),
+ * so /4 is simply correct on its own.
  */
 export async function handleProviderMessage(provider, message, nested = {}) {
   const request = objectValue(message, "provider request");
@@ -460,7 +502,7 @@ export async function handleProviderMessage(provider, message, nested = {}) {
   } else {
     throw new Error(`unknown provider method: ${String(request.method)}`);
   }
-  return { protocol: PROTOCOL, id: request.id, result };
+  return { protocol: PROTOCOL_DECLARED, id: request.id, result };
 }
 
 function diagnostic(values) {
@@ -479,7 +521,19 @@ export async function serveProvider(provider, options = {}) {
     writeTail = pending.catch(() => undefined);
     return pending;
   };
-  eventControl.bind(writeMessage);
+  /*
+   * Everything this connection needs to share between the dispatch loop and
+   * an in-call nested wait, plus the one piece of state that outlives any
+   * single call: `declaredProtocol`, the version stamped on every outbound
+   * frame from here on. It starts at PROTOCOL_DECLARED (/4) and is raised to
+   * PROTOCOL (/5), once, the moment sendNestedRequest opens the first nested
+   * request - never lowered afterward, and never reset between calls.
+   */
+  const connection = { writeMessage, nestedWaiter: null, nestedCounter: 0, declaredProtocol: PROTOCOL_DECLARED };
+  // The events writer stamps `protocol` itself, ahead of whatever emit()
+  // builds: that is the one place this connection's currently-declared
+  // version reaches an event.
+  eventControl.bind((message) => writeMessage({ protocol: connection.declaredProtocol, ...message }));
   const originalConsole = { log: console.log, info: console.info, warn: console.warn };
   if (options.redirectConsole !== false) {
     console.log = (...values) => diagnostic(values);
@@ -502,7 +556,6 @@ export async function serveProvider(provider, options = {}) {
    * only two kinds, because host-to-provider traffic has no third, event-like
    * frame to distinguish.
    */
-  const connection = { writeMessage, nestedWaiter: null, nestedCounter: 0 };
   const dispatchQueue = createAsyncQueue();
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
   const pump = (async () => {
@@ -545,12 +598,23 @@ export async function serveProvider(provider, options = {}) {
       } catch (error) {
         const candidate = message && typeof message === "object" && !Array.isArray(message) ? message.id : 0;
         const id = typeof candidate === "number" && Number.isInteger(candidate) ? candidate : 0;
-        response = { protocol: PROTOCOL, id, error: {
+        response = { protocol: PROTOCOL_DECLARED, id, error: {
           code: error instanceof ProviderNotFoundError ? "not_found" :
             error instanceof NestedRequestError ? error.code : "provider_error",
           message: error instanceof Error ? error.message : String(error),
         } };
       }
+      /*
+       * Restamped here, after the handler (success or error) has fully run,
+       * rather than trusted from whatever handleProviderMessage or the catch
+       * block above built: a call that opened a nested request has already
+       * raised connection.declaredProtocol by now, via sendNestedRequest, and
+       * its own response - not just the frames after it - must say so, not
+       * the version declared when the call started. Reassigning an existing
+       * key updates its value without moving it, so `protocol` stays the
+       * first key in the encoded object either way.
+       */
+      response.protocol = connection.declaredProtocol;
       await writeMessage(response);
       if (message && typeof message === "object" && !Array.isArray(message) &&
           message.method === "provider/activate" && response.result) {
