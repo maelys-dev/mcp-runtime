@@ -137,10 +137,15 @@ the boundary.
 The baseline is #38's shipped reports. `git log 17076cf..HEAD --
 src/core/nested.c src/core/middleware.c` is empty and the two files are
 byte-identical to that sweep's base commit, so the mutation *sites* are
-unchanged and the published survivor list still identifies real lines. The
-suite has moved on since, so the *verdicts* needed corroboration: of the 25
-mutants that ran on this base before the local sweep was stopped, all 25
-matched #38's published verdicts.
+unchanged and the published survivor list still identifies real lines.
+
+The suite has moved on since, so the *verdicts* needed corroboration rather
+than assumption. Two independent checks supply it. A local sweep on `e0f603b`
+— an ancestor of this branch, with the same two files — was stopped part way
+through, but the 25 mutants that had run all matched #38's published verdicts.
+And every mutant in the kill table below was re-verified individually after
+this branch was rebased onto `main`, reproducing the same verdict and the same
+killing test each time.
 
 | file | baseline (#38) | killed here | projected |
 |---|---|---|---|
