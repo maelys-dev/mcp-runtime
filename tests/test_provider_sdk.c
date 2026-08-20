@@ -279,9 +279,10 @@ static json_t *read_json_line(FILE *stream) {
     return value;
 }
 
-static int send_request(int fd, unsigned long id, const char *method, json_t *params) {
+static int send_request_with_protocol(
+    int fd, const char *protocol, unsigned long id, const char *method, json_t *params) {
     json_t *request = json_pack("{s:s,s:i,s:s,s:o}",
-        "protocol", MAELYS_MCP_PROVIDER_PROTOCOL,
+        "protocol", protocol,
         "id", (json_int_t)id,
         "method", method,
         "params", params ? params : json_object());
@@ -289,6 +290,10 @@ static int send_request(int fd, unsigned long id, const char *method, json_t *pa
     int ok = write_json_line(fd, request);
     json_decref(request);
     return ok;
+}
+
+static int send_request(int fd, unsigned long id, const char *method, json_t *params) {
+    return send_request_with_protocol(fd, MAELYS_MCP_PROVIDER_PROTOCOL, id, method, params);
 }
 
 static maelys_mcp_result_t activate_with_stdout(
@@ -434,6 +439,12 @@ static int nested_round_trip(int fd, FILE *reader, unsigned long id,
 
     json_t *response = read_json_line(reader);
     ASSERT_TRUE(json_is_object(response));
+    /* Read after the call, not before: this response is for the very call
+     * whose handler just opened the nested request that raised the session's
+     * declared version, so it must already carry /5 rather than the /4 it
+     * would have declared before this call started. */
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(response, "protocol")),
+        MAELYS_MCP_PROVIDER_PROTOCOL) == 0);
     json_t *structured = json_object_get(json_object_get(response, "result"), "structuredContent");
     ASSERT_TRUE(json_integer_value(json_object_get(structured, "status")) == (json_int_t)MAELYS_MCP_OK);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(
@@ -493,9 +504,170 @@ static int nested_malformed_reply(int fd, FILE *reader, unsigned long id) {
     return 0;
 }
 
+/* ------------------------------------------------------- version declaration
+ * Late, and latched: a session declares maelys-provider/4 until the provider
+ * opens its first nested request, then maelys-provider/5 forever after -
+ * never lowered, and never declared early just because this SDK is capable of
+ * nesting. Mirrors sdk/python/tests/test_sdk.py's NestedRequestTest version
+ * cases, the reference implementation for this policy.
+ *
+ * Each case below opens its own fresh session (its own socketpair, fixture
+ * and serve() thread) rather than sharing the one the scenarios above run
+ * on, because the property under test is what a session declares *before*
+ * anything has nested it - which the shared session no longer is, once
+ * nested_round_trip has run once on it.
+ */
+
+static int start_sdk_session(sdk_fixture_t *fixture, int *out_fd, FILE **out_reader) {
+    int sockets[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return -1;
+    fixture->fd = sockets[1];
+    fixture->input_schema = json_pack("{s:s,s:{s:{s:s}},s:[s],s:b}",
+        "type", "object", "properties", "message", "type", "string",
+        "required", "message", "additionalProperties", 0);
+    fixture->output_schema = json_pack("{s:s,s:{s:{s:s}},s:[s],s:b}",
+        "type", "object", "properties", "message", "type", "string",
+        "required", "message", "additionalProperties", 0);
+    fixture->resource_schema = json_pack("{s:s}", "type", "object");
+    if (!fixture->input_schema || !fixture->output_schema || !fixture->resource_schema) return -1;
+    if (pthread_mutex_init(&fixture->producer_mutex, NULL) != 0) return -1;
+    if (pthread_cond_init(&fixture->producer_release, NULL) != 0) return -1;
+    if (pthread_create(&fixture->thread, NULL, serve_main, fixture) != 0) return -1;
+    *out_fd = sockets[0];
+    *out_reader = fdopen(sockets[0], "r+");
+    return *out_reader ? 0 : -1;
+}
+
+static int stop_sdk_session(sdk_fixture_t *fixture, int fd, FILE *reader) {
+    void *thread_result = NULL;
+    int joined = pthread_join(fixture->thread, &thread_result) == 0;
+    int ok = joined && (maelys_mcp_result_t)(intptr_t)thread_result == MAELYS_MCP_OK;
+    pthread_cond_destroy(&fixture->producer_release);
+    pthread_mutex_destroy(&fixture->producer_mutex);
+    if (reader) fclose(reader);
+    else if (fd >= 0) close(fd);
+    return ok ? 0 : -1;
+}
+
+static const char *response_protocol(json_t *response) {
+    return json_string_value(json_object_get(response, "protocol"));
+}
+
+static int test_never_nests_declares_the_older_version(void) {
+    sdk_fixture_t fixture = {0};
+    int fd = -1;
+    FILE *reader = NULL;
+    ASSERT_TRUE(start_sdk_session(&fixture, &fd, &reader) == 0);
+
+    ASSERT_TRUE(send_request(fd, 1u, "provider/describe", NULL));
+    json_t *response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), "maelys-provider/4") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(send_request(fd, 2u, "provider/activate", NULL));
+    response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), "maelys-provider/4") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(send_request(fd, 3u, "provider/call",
+        json_pack("{s:s,s:{s:s}}", "name", "sdk.echo", "arguments", "message", "hi")));
+    response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), "maelys-provider/4") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(send_request(fd, 4u, "provider/shutdown", NULL));
+    response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), "maelys-provider/4") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(stop_sdk_session(&fixture, fd, reader) == 0);
+    return 0;
+}
+
+static int test_first_nested_request_raises_and_latches_the_version(void) {
+    sdk_fixture_t fixture = {0};
+    int fd = -1;
+    FILE *reader = NULL;
+    ASSERT_TRUE(start_sdk_session(&fixture, &fd, &reader) == 0);
+
+    ASSERT_TRUE(send_request(fd, 1u, "provider/describe", NULL));
+    json_t *response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), "maelys-provider/4") == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(send_request(fd, 2u, "provider/activate", NULL));
+    response = read_json_line(reader);
+    json_decref(response);
+
+    /* The first nested request this session ever opens: nested_round_trip
+     * already asserts the nestedRequest frame and this call's own response
+     * both declare /5. */
+    ASSERT_TRUE(nested_round_trip(fd, reader, 3u, "elicitation/create", "Proceed?") == 0);
+
+    /* Never lowered: an ordinary call with nothing to do with nesting, after
+     * the first nested request, still declares /5 rather than reverting to
+     * what this session opened at. */
+    ASSERT_TRUE(send_request(fd, 4u, "provider/call",
+        json_pack("{s:s,s:{s:s}}", "name", "sdk.echo", "arguments", "message", "hi")));
+    response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), MAELYS_MCP_PROVIDER_PROTOCOL) == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(send_request(fd, 5u, "provider/shutdown", NULL));
+    response = read_json_line(reader);
+    ASSERT_TRUE(strcmp(response_protocol(response), MAELYS_MCP_PROVIDER_PROTOCOL) == 0);
+    json_decref(response);
+
+    ASSERT_TRUE(stop_sdk_session(&fixture, fd, reader) == 0);
+    return 0;
+}
+
+/*
+ * The host addresses a provider at whatever it last declared, which after
+ * late declaration is not necessarily the newest version this SDK speaks -
+ * so every version between the floor and /5 has to be valid inbound, not
+ * just the two endpoints (src/provider/provider_sdk.c's
+ * supported_host_protocol). A version outside that range must still be
+ * refused.
+ */
+static int test_inbound_protocol_range_is_accepted(void) {
+    sdk_fixture_t fixture = {0};
+    int fd = -1;
+    FILE *reader = NULL;
+    ASSERT_TRUE(start_sdk_session(&fixture, &fd, &reader) == 0);
+
+    const char *const versions[] = {
+        MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR, "maelys-provider/4", MAELYS_MCP_PROVIDER_PROTOCOL
+    };
+    for (unsigned long index = 0; index < sizeof(versions) / sizeof(versions[0]); ++index) {
+        ASSERT_TRUE(send_request_with_protocol(
+            fd, versions[index], index + 1u, "provider/describe", NULL));
+        json_t *response = read_json_line(reader);
+        ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+        json_decref(response);
+    }
+
+    ASSERT_TRUE(send_request_with_protocol(fd, "maelys-provider/2", 100u,
+        "provider/describe", NULL));
+    json_t *response = read_json_line(reader);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "error")));
+    json_decref(response);
+
+    ASSERT_TRUE(send_request(fd, 101u, "provider/shutdown", NULL));
+    response = read_json_line(reader);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+
+    ASSERT_TRUE(stop_sdk_session(&fixture, fd, reader) == 0);
+    return 0;
+}
+
 int main(void) {
     ASSERT_TRUE(test_options_default_stdout_isolation() == 0);
     ASSERT_TRUE(test_invalid_catalog_descriptors() == 0);
+    ASSERT_TRUE(test_never_nests_declares_the_older_version() == 0);
+    ASSERT_TRUE(test_first_nested_request_raises_and_latches_the_version() == 0);
+    ASSERT_TRUE(test_inbound_protocol_range_is_accepted() == 0);
     int sockets[2] = {-1, -1};
     ASSERT_TRUE(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     sdk_fixture_t fixture = {
@@ -518,12 +690,12 @@ int main(void) {
     ASSERT_TRUE(send_request(sockets[0], 1u, "provider/describe", NULL));
     json_t *response = read_json_line(reader);
     ASSERT_TRUE(json_is_object(response));
-    /* Declared unconditionally, even before this provider has ever nested a
-     * request: a /5 declaration that never nests must behave exactly as /4
-     * did, so nothing here is gated on the provider having called
-     * maelys_mcp_provider_sdk_request_client yet. */
+    /* /5 is announced late, on the frame that opens the first nested request
+     * - not here: this session has not nested anything yet, so this response
+     * still declares the older version, exactly as a provider that never
+     * calls maelys_mcp_provider_sdk_request_client always would. */
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(response, "protocol")),
-        MAELYS_MCP_PROVIDER_PROTOCOL) == 0);
+        "maelys-provider/4") == 0);
     json_t *result = json_object_get(response, "result");
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "name")), "sdk-test") == 0);
     ASSERT_TRUE(json_array_size(json_object_get(result, "tools")) == 5u);

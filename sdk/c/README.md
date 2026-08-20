@@ -38,10 +38,17 @@ calls `destroy`.
 `call`/`read_resource` callback, on the thread `serve()` is running on: the
 serve loop is single threaded, so this is a plain blocking call rather than a
 handoff to a second thread, and the host guarantees the correlated
-`provider/nestedReply` is the next thing on the wire. Declaring `/5` is
-unconditional in every SDK response regardless of whether a provider ever
-calls it - a provider that never nests behaves exactly as it did on `/4`, so
-there is no opt-in flag to set.
+`provider/nestedReply` is the next thing on the wire.
+
+Every session declares `maelys-provider/4` until the provider actually opens
+its first nested request; from that request onward it declares `/5`, raised
+and never lowered. This is deliberate, not an oversight: announcing `/5`
+unconditionally would cost a provider that never nests its compatibility with
+a host that predates the version-range fix nested requests shipped with, in
+exchange for a capability it never uses. A provider that never calls
+`maelys_mcp_provider_sdk_request_client` is therefore byte-for-byte what it
+was before this helper existed - there is no opt-in flag to set, and nothing
+to configure.
 
 See `providers/example/main.c` for a complete provider using the SDK, and
 `tests/helpers/sdk_nested_provider.c` for a minimal one that nests a request.

@@ -128,10 +128,13 @@ maelys_mcp_result_t maelys_mcp_provider_sdk_emit_event(
  * own single-outstanding rule; calling this again before the first returns
  * fails with MAELYS_MCP_ERR_STATE rather than corrupting the connection.
  *
- * Declaring `maelys-provider/5` is unconditional in every SDK response
- * regardless of whether a provider ever calls this - a /5 provider that never
- * nests behaves exactly as a /4 one did, so no opt-in flag is needed to keep
- * that behavior unchanged.
+ * A session declares `maelys-provider/4` until this is called for the first
+ * time; from the nestedRequest frame that call writes onward, it declares
+ * `/5` - raised, never lowered. A provider that never calls this is
+ * therefore byte-for-byte unchanged from before this function existed: no
+ * opt-in flag is needed, and declaring /5 unconditionally would have cost
+ * every non-nesting provider its compatibility with a host that predates the
+ * nested-requests version-range fix, for a capability it never uses.
  */
 maelys_mcp_result_t maelys_mcp_provider_sdk_request_client(
     maelys_mcp_provider_sdk_t *sdk,
