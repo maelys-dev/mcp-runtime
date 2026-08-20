@@ -32,30 +32,44 @@ BINARY = Path(REQUIRED_BINARY) if REQUIRED_BINARY else DEFAULT_BINARY
 class Client:
     """A hand-rolled MCP client on the host's stdio, deliberately not the
     runtime's own machinery: the point is to be the other end, not to share
-    an implementation with it."""
+    an implementation with it.
+
+    Unbuffered, with the line splitting done here. A buffered reader would let
+    a chunk carrying two frames leave the second one sitting in the buffer
+    while select() reports nothing to read - a deadline failure with no cause
+    visible anywhere, and exactly the kind of flake a timing test must not
+    have.
+    """
 
     def __init__(self) -> None:
         self._process = subprocess.Popen(
             [str(BINARY), "--provider", str(FIXTURE)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        self._output = self._process.stdout.fileno()
+        self._buffer = b""
         self._selector = selectors.DefaultSelector()
-        self._selector.register(self._process.stdout, selectors.EVENT_READ)
+        self._selector.register(self._output, selectors.EVENT_READ)
 
     def send(self, message: dict) -> None:
-        self._process.stdin.write(json.dumps(message) + "\n")
-        self._process.stdin.flush()
+        self._process.stdin.write(json.dumps(message).encode() + b"\n")
 
     def next_frame(self, timeout: float = 10.0) -> dict:
         deadline = time.monotonic() + timeout
         while True:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                line = self._buffer[:newline]
+                self._buffer = self._buffer[newline + 1:]
+                if line.strip():
+                    return json.loads(line)
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not self._selector.select(remaining):
                 raise AssertionError("the host sent nothing before the deadline")
-            line = self._process.stdout.readline()
-            if not line:
+            chunk = os.read(self._output, 65536)
+            if not chunk:
                 raise AssertionError("the host closed stdout")
-            if line.strip():
-                return json.loads(line)
+            self._buffer += chunk
 
     def frame_with_id(self, wanted, timeout: float = 10.0) -> dict:
         """The frame carrying this id, skipping whatever came first - a nested
