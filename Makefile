@@ -72,7 +72,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
 -include $(DEPENDENCY_FILES)
 
-.PHONY: all clean test test-build check check-version-header check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
+.PHONY: all clean test test-build check check-version-header check-all check-sdks test-conformance test-provider-conformance test-sdk-nested test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
 	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
@@ -251,6 +251,16 @@ check-sdks:
 	python3 -m unittest tests/test_provider_conformance.py -v
 	python3 -m unittest tests/test_mutate.py -v
 
+# The Python SDK's nested round trip against the real host binary, over real
+# stdio. Deliberately not folded into check-sdks: that target needs no C
+# toolchain, and this is the one SDK check that cannot run without a built
+# runtime. Naming the binary also turns the suite's skip into a hard failure,
+# so a gate that ran nothing cannot report success.
+test-sdk-nested: all
+	MAELYS_MCP_BINARY=$(abspath $(BIN)/maelys-mcp) PYTHONPATH=sdk/python/src \
+		python3 -m unittest discover -s sdk/python/tests \
+		-p test_nested_end_to_end.py -v
+
 test-provider-conformance: all
 	python3 conformance/provider_conformance.py $(abspath $(BIN)/example-provider) \
 		--cases conformance/example-cases.json
@@ -267,7 +277,7 @@ test-mcp-conformance-official: all
 		--provider $(abspath conformance/official_tools_provider.py) \
 		--package '$(MCP_CONFORMANCE_PACKAGE)'
 
-check-all: check check-sdks test-provider-conformance
+check-all: check check-sdks test-provider-conformance test-sdk-nested
 
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/lib/pkgconfig" \
