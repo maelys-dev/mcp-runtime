@@ -9,3 +9,6 @@ __pycache__/
 /.deps-static/
 /srcdeps/
 /stage/
+/mutation-report.json
+/mutation-summary.md
+/tests/fixtures/mutation/build/
