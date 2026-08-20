@@ -1,0 +1,24 @@
+{
+  "calls": [
+    {
+      "tool": "nested.confirm",
+      "arguments": {},
+      "expect": "success",
+      "nested": [
+        { "method": "elicitation/create", "result": { "action": "accept", "content": { "ok": true } } }
+      ],
+      "assertStructuredContent": { "action": "accept", "content": { "ok": true } }
+    },
+    {
+      "tool": "nested.sample",
+      "arguments": {},
+      "expect": "success",
+      "nested": [
+        { "method": "sampling/createMessage", "result": {
+          "role": "assistant", "content": { "type": "text", "text": "pong" }
+        } }
+      ],
+      "assertStructuredContent": { "role": "assistant", "content": { "type": "text", "text": "pong" } }
+    }
+  ]
+}

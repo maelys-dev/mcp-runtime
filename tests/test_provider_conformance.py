@@ -90,6 +90,132 @@ class ProviderConformanceTest(unittest.TestCase):
             self.assertEqual(case["tool"], "example.echo")
             self.assertEqual(case["arguments"]["root"], directory)
 
+    def test_case_file_rejects_malformed_nested_spec(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_file = Path(directory) / "cases.json"
+            case_file.write_text(json.dumps({
+                "calls": [{"tool": "nested.echo", "nested": [
+                    {"method": "elicitation/create", "result": {}, "error": {"code": "denied", "message": "no"}},
+                ]}],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(provider_conformance.ConformanceError, "exactly one of result or error"):
+                provider_conformance.read_cases(case_file)
+
+    def test_validate_nested_request_checks_shape_and_declared_method(self):
+        message = {
+            "protocol": "maelys-provider/5", "method": "provider/nestedRequest",
+            "params": {"nestedId": "n1", "method": "elicitation/create", "params": {}},
+        }
+        self.assertEqual(
+            provider_conformance.validate_nested_request(message, {"method": "elicitation/create"}), "n1")
+        # No declared method in the spec: any method is accepted.
+        self.assertEqual(provider_conformance.validate_nested_request(message, {}), "n1")
+        with self.assertRaisesRegex(provider_conformance.ConformanceError, "method mismatch"):
+            provider_conformance.validate_nested_request(message, {"method": "sampling/createMessage"})
+        with self.assertRaisesRegex(provider_conformance.ConformanceError, "non-empty nestedId"):
+            provider_conformance.validate_nested_request({
+                "protocol": "maelys-provider/5", "method": "provider/nestedRequest",
+                "params": {"method": "elicitation/create", "params": {}},
+            }, {})
+
+    def test_build_nested_reply_shapes_result_and_error(self):
+        result_reply = provider_conformance.build_nested_reply("n1", {"result": {"answer": "yes"}})
+        self.assertEqual(result_reply["method"], "provider/nestedReply")
+        self.assertEqual(result_reply["params"], {"nestedId": "n1", "result": {"answer": "yes"}})
+        error_reply = provider_conformance.build_nested_reply(
+            "n1", {"error": {"code": "denied", "message": "no"}})
+        self.assertEqual(error_reply["params"], {"nestedId": "n1", "error": {"code": "denied", "message": "no"}})
+
+    def test_apply_call_assertions_content_and_structured(self):
+        provider_conformance.apply_call_assertions(
+            {"content": [{"type": "text", "text": "yes"}]}, {"assertContentText": "yes"})
+        with self.assertRaisesRegex(provider_conformance.ConformanceError, "content\\[0\\]\\.text"):
+            provider_conformance.apply_call_assertions(
+                {"content": [{"type": "text", "text": "no"}]}, {"assertContentText": "yes"})
+        provider_conformance.apply_call_assertions(
+            {"structuredContent": {"ok": True}}, {"assertStructuredContent": {"ok": True}})
+        with self.assertRaisesRegex(provider_conformance.ConformanceError, "structuredContent"):
+            provider_conformance.apply_call_assertions(
+                {"structuredContent": {"ok": False}}, {"assertStructuredContent": {"ok": True}})
+
+    def _write_nested_fixture(self, directory: str) -> Path:
+        """A dependency-free provider/5 fixture that opens exactly one nested
+        elicitation/create request on `nested.echo`, then echoes back
+        whatever `answer` the reply carried - used to unit-test exchange()'s
+        own nested handling without needing a built SDK provider."""
+        provider = Path(directory) / "nested-fixture"
+        provider.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "def send(message):\n"
+            "    sys.stdout.write(json.dumps(message) + chr(10))\n"
+            "    sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    method, mid = message.get('method'), message.get('id')\n"
+            "    if method == 'provider/describe':\n"
+            "        send({'protocol': 'maelys-provider/3', 'id': mid, 'result': {\n"
+            "            'name': 'nested-fixture', 'version': '1.0.0', 'tools': [{\n"
+            "                'name': 'nested.echo', 'description': 'echoes a nested reply',\n"
+            "                'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False},\n"
+            "                'effect': 'read'}, {\n"
+            "                'name': 'plain.echo', 'description': 'never nests',\n"
+            "                'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False},\n"
+            "                'effect': 'read'}]}})\n"
+            "    elif method == 'provider/activate':\n"
+            "        send({'protocol': 'maelys-provider/3', 'id': mid, 'result': {}})\n"
+            "    elif method == 'provider/call' and message['params']['name'] == 'nested.echo':\n"
+            "        send({'protocol': 'maelys-provider/5', 'method': 'provider/nestedRequest',\n"
+            "            'params': {'nestedId': 'n1', 'method': 'elicitation/create', 'params': {}}})\n"
+            "        reply = json.loads(sys.stdin.readline())['params']\n"
+            "        answer = reply.get('result', {}).get('answer', '') if 'result' in reply else 'denied'\n"
+            "        send({'protocol': 'maelys-provider/5', 'id': mid, 'result': {\n"
+            "            'resultType': 'complete', 'content': [{'type': 'text', 'text': answer}]}})\n"
+            "    elif method == 'provider/call' and message['params']['name'] == 'plain.echo':\n"
+            "        send({'protocol': 'maelys-provider/3', 'id': mid, 'result': {\n"
+            "            'resultType': 'complete', 'content': [{'type': 'text', 'text': 'plain'}]}})\n"
+            "    elif method == 'provider/call':\n"
+            "        send({'protocol': 'maelys-provider/3', 'id': mid,\n"
+            "            'error': {'code': 'not_found', 'message': 'unknown tool'}})\n"
+            "    elif method == 'provider/shutdown':\n"
+            "        send({'protocol': 'maelys-provider/3', 'id': mid, 'result': {}})\n"
+            "        break\n",
+            encoding="utf-8",
+        )
+        provider.chmod(provider.stat().st_mode | stat.S_IXUSR)
+        return provider.resolve()
+
+    def test_nested_round_trip_happy_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = self._write_nested_fixture(directory)
+            report = provider_conformance.run_conformance(provider, [{
+                "tool": "nested.echo", "arguments": {}, "expect": "success",
+                "nested": [{"method": "elicitation/create", "result": {"answer": "yes"}}],
+                "assertContentText": "yes",
+            }], 10)
+            self.assertTrue(report["valid"])
+
+    def test_nested_round_trip_fails_red_when_declared_method_is_wrong(self):
+        """The red half of the round-trip test above: a case that declares
+        the wrong nested method must fail loudly, not silently pass because
+        some nested request happened to arrive."""
+        with tempfile.TemporaryDirectory() as directory:
+            provider = self._write_nested_fixture(directory)
+            with self.assertRaisesRegex(provider_conformance.ConformanceError, "method mismatch"):
+                provider_conformance.run_conformance(provider, [{
+                    "tool": "nested.echo", "arguments": {}, "expect": "success",
+                    "nested": [{"method": "sampling/createMessage", "result": {"answer": "yes"}}],
+                }], 10)
+
+    def test_nested_round_trip_fails_when_provider_never_opens_declared_nested_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            provider = self._write_nested_fixture(directory)
+            with self.assertRaisesRegex(provider_conformance.ConformanceError, "never opened"):
+                provider_conformance.run_conformance(provider, [{
+                    "tool": "plain.echo", "arguments": {}, "expect": "success",
+                    "nested": [{"method": "elicitation/create", "result": {}}],
+                }], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

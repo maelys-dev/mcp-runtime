@@ -269,13 +269,25 @@ test-sdk-nested: all
 		python3 -m unittest discover -s sdk/python/tests \
 		-p test_nested_end_to_end.py -v
 
-test-provider-conformance: all
+test-provider-conformance: all $(BIN)/sdk-nested-provider
 	python3 conformance/provider_conformance.py $(abspath $(BIN)/example-provider) \
 		--cases conformance/example-cases.json
 	python3 conformance/provider_conformance.py \
 		$(abspath sdk/typescript/test/fixture-provider.js) --cases conformance/sdk-cases.json
 	PYTHONPATH=sdk/python/src python3 conformance/provider_conformance.py \
 		$(abspath sdk/python/tests/fixture_provider.py) --cases conformance/sdk-cases.json
+	# Nested (in-band) round trip, one pass per SDK, against the same
+	# already-existing nested fixtures the real-host end-to-end suites use
+	# (tests/helpers/sdk_nested_provider.c, sdk/typescript/test/nested-fixture-provider.js,
+	# sdk/python/tests/nested_fixture_provider.py) - this runner plays the
+	# host's side of provider/nestedRequest -> provider/nestedReply itself,
+	# so no real maelys-mcp process or client is involved.
+	python3 conformance/provider_conformance.py \
+		$(abspath $(BIN)/sdk-nested-provider) --cases conformance/nested-ask-cases.json
+	python3 conformance/provider_conformance.py \
+		$(abspath sdk/typescript/test/nested-fixture-provider.js) --cases conformance/nested-typescript-cases.json
+	PYTHONPATH=sdk/python/src python3 conformance/provider_conformance.py \
+		$(abspath sdk/python/tests/nested_fixture_provider.py) --cases conformance/nested-ask-cases.json
 
 test-conformance: test-provider-conformance
 
