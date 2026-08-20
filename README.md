@@ -152,6 +152,7 @@ docs/                architecture, security and provider protocol
 [Passive outbox](docs/outbox.md) ·
 [Subscriptions](docs/subscriptions.md) ·
 [Test parity](docs/test-parity.md) ·
+[Mutation testing](docs/mutation-testing.md) ·
 [Provenance](docs/provenance.md) ·
 [Official MCP conformance](docs/official-conformance.md) ·
 [Codex and Claude clients](docs/clients.md)

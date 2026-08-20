@@ -72,7 +72,7 @@ DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
 -include $(DEPENDENCY_FILES)
 
-.PHONY: all clean test check check-version-header check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
+.PHONY: all clean test test-build check check-version-header check-all check-sdks test-conformance test-provider-conformance test-mcp-conformance-official asan tsan tsan-run analyze audit install fuzz-build fuzz-smoke \
 	asan-linux-image test-asan-linux test-asan-linux-fresh test-channel-no-thread-nosanitize
 
 all: $(LIB)/libmaelys_mcp.a $(BIN)/maelys-mcp $(BIN)/example-provider $(PC)
@@ -194,7 +194,16 @@ NESTED_FIXTURE_ARGS = $(abspath $(BIN)/nested-provider) \
 	$(abspath $(BIN)/nested-dying-provider) \
 	$(abspath $(BIN)/legacy4-provider)
 
-test: all $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
+TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
+
+# Compile everything `test` runs, without running any of it. The split exists
+# for scripts/mutate.py: a mutant that fails to compile is *stillborn*, not
+# killed, and folding the two together would report a broken mutation as
+# covered test behaviour. A separate build step is the only way to tell them
+# apart without pattern-matching compiler output.
+test-build: all $(TEST_ARTIFACTS)
+
+test: test-build
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -240,6 +249,7 @@ check-sdks:
 	node --test sdk/typescript/test/*.test.js
 	PYTHONPATH=sdk/python/src python3 -m unittest discover -s sdk/python/tests -v
 	python3 -m unittest tests/test_provider_conformance.py -v
+	python3 -m unittest tests/test_mutate.py -v
 
 test-provider-conformance: all
 	python3 conformance/provider_conformance.py $(abspath $(BIN)/example-provider) \

@@ -81,6 +81,29 @@
   anything is dispatched, and decides what runs on a worker. `stdio.c` is a
   thin adapter over it, and a future HTTP transport reuses it verbatim.
   `maelys_mcp_runtime_dispatch` is unchanged.
+- **Mutation testing: "this test can actually fail" is now a finding on disk
+  instead of something the author remembers doing.** Run
+  `python3 scripts/mutate.py --diff origin/main` before opening a pull request
+  and you get a report naming every line your branch changed that the test
+  suite does *not* in fact constrain. Until now the only proof a new test
+  could fail was manual — break the line by hand, watch the named assertion go
+  red, put it back — which left nothing behind for anyone to re-check and, once
+  this cycle, silently passed on a test that was miscounting. The runner
+  injects the same breaks automatically (condition kills, relational and
+  logical swaps, `0`/`1` flips), one at a time, inside a scratch copy of the
+  tree rather than the real one, and classifies each result: killed, survived,
+  stillborn (never compiled), timed out, or flaky. Only killed and survived
+  enter the mutation score — folding the rest in would invent confidence
+  nobody earned. Everything repository-specific lives in `mutation.json`, the
+  JSON report carries a `schema_version`, `--confirm-survivors` re-runs a
+  survivor before believing it, and the run refuses to score anything at all
+  unless the unmutated baseline builds and passes first. A weekly,
+  non-blocking CI sweep publishes survivors to the job summary. See
+  `docs/mutation-testing.md`, including the false-kill caveat no amount of
+  tooling removes.
+- Internal: `make test-build` compiles everything `make test` runs without
+  running any of it, which is how a mutant that fails to compile is told apart
+  from one the tests caught.
 
 ## 0.14.0 - 2026-08-20
 

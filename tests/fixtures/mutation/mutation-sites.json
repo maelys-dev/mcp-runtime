@@ -1,0 +1,11 @@
+{
+  "config_version": 1,
+  "language": "c",
+  "include": ["src/*.c"],
+  "exclude": ["src/guard.c"],
+  "operators": ["condition_kill", "relational_swap", "logical_swap", "constant_flip"],
+  "build_command": "true",
+  "kill_command": "false",
+  "timeout_seconds": 120,
+  "scratch": {"strategy": "copy", "exclude": [".git", "build", "__pycache__"]}
+}

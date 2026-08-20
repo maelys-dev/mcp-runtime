@@ -1,0 +1,93 @@
+name: Mutation testing
+
+# Deliberately not a required check. A survivor is a finding to triage, not a
+# reason to block a merge, and a budgeted random sweep gives a different sample
+# every week - gating on it would gate on the seed. It runs on a schedule and
+# on demand; the actionable output is the survivor list in the job summary and
+# the full JSON report in the artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      max_mutants:
+        description: "Mutant budget for this sweep"
+        required: false
+        default: "150"
+      seed:
+        description: "Shuffle seed (default: the run id, i.e. a fresh sample)"
+        required: false
+        default: ""
+      files:
+        description: "Optional glob to sweep instead of the whole include list"
+        required: false
+        default: ""
+  schedule:
+    # Sunday 04:17 UTC. Off the hour because scheduled runs cluster there.
+    - cron: "17 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-runtime-mutation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  sweep:
+    name: Budgeted mutation sweep
+    runs-on: ubuntu-24.04
+    # Roughly 150 mutants at a `make check` apiece, with headroom for the
+    # baseline build and a slow runner.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang make pkg-config libjansson-dev liburiparser-dev python3
+      - name: Verify the runner's own self-tests first
+        # A sweep from a broken runner is worse than no sweep: it would report
+        # confident verdicts nobody checked.
+        run: python3 -m unittest tests/test_mutate.py
+      - name: Sweep
+        env:
+          CC: clang
+          MUTATION_MAX: ${{ inputs.max_mutants || '150' }}
+          MUTATION_SEED: ${{ inputs.seed || github.run_id }}
+          MUTATION_FILES: ${{ inputs.files }}
+        run: |
+          set -o pipefail
+          # The glob belongs to the tool, not to this shell: an unquoted
+          # expansion here would have bash resolve `src/core/*.c` into a list
+          # and hand --files only its first element.
+          extra=()
+          if [ -n "$MUTATION_FILES" ]; then
+            extra+=(--files "$MUTATION_FILES")
+          fi
+          python3 scripts/mutate.py \
+            --max-mutants "$MUTATION_MAX" \
+            --shuffle --seed "$MUTATION_SEED" \
+            --confirm-survivors \
+            --report mutation-report.json \
+            --markdown-summary mutation-summary.md \
+            "${extra[@]}"
+      - name: Publish the summary
+        if: always()
+        run: |
+          if [ -f mutation-summary.md ]; then
+            cat mutation-summary.md >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "The sweep produced no summary; see the job log." >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutation-report-${{ github.run_id }}
+          path: |
+            mutation-report.json
+            mutation-summary.md
+          if-no-files-found: warn
+          retention-days: 90
