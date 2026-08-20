@@ -1,0 +1,24 @@
+{
+  "config_version": 1,
+  "language": "c",
+  "include": [
+    "src/**/*.c"
+  ],
+  "exclude": [
+    "src/**/*.h"
+  ],
+  "operators": [
+    "condition_kill",
+    "relational_swap",
+    "logical_swap",
+    "constant_flip"
+  ],
+  "build_command": "make -j4 asan-build",
+  "kill_command": "make asan",
+  "build_timeout_seconds": 1800,
+  "timeout_seconds": 2700,
+  "scratch": {
+    "strategy": "copy",
+    "exclude": [".git", "build", "__pycache__", ".DS_Store", "dist", "stage"]
+  }
+}
