@@ -15,7 +15,11 @@ from typing import Any
 # version back: a provider declares its own in responses rather than echoing
 # ours, which is how the host learns whether it may send progress.
 PROTOCOL = "maelys-provider/3"
-SUPPORTED_PROTOCOLS = ("maelys-provider/3", "maelys-provider/4")
+SUPPORTED_PROTOCOLS = (
+    "maelys-provider/3",
+    "maelys-provider/4",
+    "maelys-provider/5",
+)
 EFFECTS = {"read", "preview", "apply", "commit", "execute"}
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",

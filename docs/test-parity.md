@@ -19,6 +19,7 @@ stdio, CLI, and Maelys L0/L1 suites.
 | MCP modules | empty core, explicit/idempotent activation, capability derivation, method isolation, Tools-before-provider invariant |
 | Rich results | text, image, audio, embedded resources, mixed content, base64/MIME validation and structured output |
 | MRTR | input-required/complete rounds, retry context, opaque state validation, capability enforcement and official elicitation scenario |
+| Nested MRTR | end-to-end round trip against a real provider process and a hand-rolled fake client, id correlation across two calls, nested deadline, outer-call cancellation reaching the wait, channel abort mid-wait, provider death mid-wait, a second nested request failing the transport, capability refusal before anything is sent, a `maelys-provider/4` provider still working, and two `tools/call` dispatches genuinely overlapping on one channel (under `make check`, `make tsan` and `make asan`) |
 | MCP resources | static catalog, templates, canonical reads, process-provider bridge, optional size, text/blob/base64 validation and URI policy |
 | MCP subscriptions | accepted-filter negotiation, mandatory first acknowledgement, URI canonicalization and descendants, list/update events, metadata tagging, cancellation, completion and capability gating |
 | Async output | single writer, bounded count/bytes, ownership transfer, response priority, 8:1 anti-starvation, causal coalescence, writer failure, multi-producer pressure and TSan |

@@ -33,7 +33,18 @@ static void *stdio_writer_main(void *opaque) {
         maelys_mcp_result_t status = maelys_mcp_channel_next(
             context->channel, 1000u, &message);
         if (status == MAELYS_MCP_ERR_TIMEOUT) continue;
-        if (status == MAELYS_MCP_ERR_CLOSED) return NULL;
+        if (status == MAELYS_MCP_ERR_CLOSED) {
+            /*
+             * The outbox closed under us. On the graceful path the reader has
+             * already left its loop and nobody is listening; on the path that
+             * matters - an offloaded call faulted the channel from its own
+             * thread - the reader is blocked in poll() and would otherwise sit
+             * there with no writer. Waking it costs nothing in the first case
+             * and is the only signal in the second.
+             */
+            signal_writer_failure(context, MAELYS_MCP_OK);
+            return NULL;
+        }
         if (status != MAELYS_MCP_OK) {
             signal_writer_failure(context, status);
             return NULL;
@@ -214,6 +225,12 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
             if (writer_failed) {
                 free(error);
                 status = (maelys_mcp_result_t)atomic_load(&writer_context.status);
+                /* An offloaded dispatch that failed reports through the
+                 * channel, not through the writer: it had no way to reach this
+                 * frame's caller, because there wasn't one. */
+                if (status == MAELYS_MCP_OK) {
+                    status = maelys_mcp_channel_dispatch_status(channel);
+                }
                 if (status == MAELYS_MCP_OK) status = MAELYS_MCP_ERR_IO;
                 return finish_stdio(&reader, channel, &writer_context, writer,
                     writer_started, wake_pipe, write_fd, write_flags, status, 0);
@@ -249,8 +266,19 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
             continue;
         }
         free(error);
-        status = maelys_mcp_channel_handle(channel, request);
+        /*
+         * The demux, not the dispatcher. This is the whole of what stdio knows
+         * about nested requests and concurrent calls: hand the frame to the
+         * channel and go back to reading. Whether it was a reply this
+         * connection was waiting on, a call that belongs on its own thread, or
+         * an ordinary inline request is the channel's business - which is what
+         * makes this loop reusable by a transport that is not stdio.
+         */
+        status = maelys_mcp_channel_accept(channel, request);
         json_decref(request);
+        if (status == MAELYS_MCP_OK) {
+            status = maelys_mcp_channel_dispatch_status(channel);
+        }
         if (status != MAELYS_MCP_OK) {
             return finish_stdio(&reader, channel, &writer_context, writer,
                 writer_started, wake_pipe, write_fd, write_flags, status, 0);

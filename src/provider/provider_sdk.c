@@ -429,14 +429,25 @@ static json_t *handle_read_resource(maelys_mcp_provider_sdk_t *sdk, json_t *id, 
     return success_response(id, wire);
 }
 
+/*
+ * Every version between the floor and the one this SDK speaks, for the same
+ * reason the host accepts a range: the host opens at the floor and raises as
+ * it learns, so a provider that only recognised the two endpoints would refuse
+ * whatever sits between them.
+ */
+static int supported_host_protocol(const json_t *protocol) {
+    return maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL) ||
+        maelys_mcp_json_string_equals(protocol, "maelys-provider/4") ||
+        maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR);
+}
+
 static json_t *handle_message(maelys_mcp_provider_sdk_t *sdk, json_t *message) {
     json_t *id = json_is_object(message) ? json_object_get(message, "id") : NULL;
     json_t *protocol = json_is_object(message) ? json_object_get(message, "protocol") : NULL;
     json_t *method = json_is_object(message) ? json_object_get(message, "method") : NULL;
     json_t *params = json_is_object(message) ? json_object_get(message, "params") : NULL;
     if (!json_is_integer(id) ||
-        !(maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL) ||
-          maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR)) ||
+        !supported_host_protocol(protocol) ||
         !json_is_string(method) || maelys_mcp_json_string_has_nul(method) ||
         (params && !json_is_object(params))) {
         return error_response(json_is_integer(id) ? id : NULL,

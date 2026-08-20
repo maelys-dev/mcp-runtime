@@ -241,6 +241,22 @@ static int provider_has_templates(const maelys_mcp_provider_t *provider) {
     return provider && provider->resource_template_count && provider->read_resource;
 }
 
+/* Prefers the nesting-capable callback when the provider registered one; the
+ * plain one behaves exactly as it always did. */
+static maelys_mcp_result_t read_with_provider(
+    maelys_mcp_provider_t *provider,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error) {
+    if (provider->read_resource_nested) {
+        return provider->read_resource_nested(provider->context, request,
+            relay, out_result, out_error);
+    }
+    return provider->read_resource(provider->context, request, out_result,
+        out_error);
+}
+
 /*
  * Unlike tools.c's call_tool, resources/read has never validated which
  * specific capability (roots/elicitation/sampling) a client declared before
@@ -357,18 +373,28 @@ static json_t *read_resource(
         .request_state = request_state,
         .client_capabilities = client_capabilities
     };
+    /* See call_tool: offered only while another thread is still reading the
+     * connection, and NULL means this read cannot nest. */
+    maelys_mcp_nested_relay_t relay = {
+        .channel = request->channel,
+        .sink = request->sink,
+        .outer_id = request->id,
+        .client_capabilities = client_capabilities
+    };
+    maelys_mcp_nested_relay_t *nested = request->nestable && request->sink &&
+        request->sink->emit ? &relay : NULL;
     maelys_mcp_provider_t *provider = exact_provider(runtime, canonical);
     maelys_mcp_resource_result_t provider_result;
     maelys_mcp_resource_result_init(&provider_result);
     maelys_mcp_result_t status = MAELYS_MCP_ERR_NOT_FOUND;
     if (provider && provider->read_resource) {
-        status = provider->read_resource(provider->context, &provider_request,
+        status = read_with_provider(provider, &provider_request, nested,
             &provider_result, &error);
     } else {
         for (size_t index = 0; index < runtime->provider_count; ++index) {
             provider = runtime->providers[index];
             if (!provider_has_templates(provider)) continue;
-            status = provider->read_resource(provider->context, &provider_request,
+            status = read_with_provider(provider, &provider_request, nested,
                 &provider_result, &error);
             if (status != MAELYS_MCP_ERR_NOT_FOUND) break;
             free(error);
@@ -404,6 +430,12 @@ static int handles(const char *method) {
         strcmp(method, "resources/read") == 0;
 }
 
+/* Only a read reaches a provider; the two catalogs are answered from the
+ * registry and never wait on anything. */
+static int nestable(const char *method) {
+    return strcmp(method, "resources/read") == 0;
+}
+
 static json_t *handle(
     maelys_mcp_runtime_t *runtime,
     const char *method,
@@ -419,5 +451,6 @@ const maelys_mcp_module_descriptor_t maelys_mcp_resources_module = {
     .capability_name = "resources",
     .capability = capability,
     .handles = handles,
+    .nestable = nestable,
     .handle = handle
 };

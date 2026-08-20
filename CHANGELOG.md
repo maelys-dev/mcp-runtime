@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+- **Tools can now ask the user a question in the middle of a call, and older
+  MCP clients understand the question.** A provider handling `tools/call` or
+  `resources/read` can open a real `elicitation/create`,
+  `sampling/createMessage` or `roots/list` request back at the client on the
+  same connection and block for the answer, instead of ending the call and
+  waiting to be retried. This is MCP's original multi-round-trip pattern; the
+  resumable `input_required` result the runtime already spoke is a
+  `2026-07-28` draft type that a schema-validating `2025-11-25` client
+  rejects, so a legacy client had no working way to be asked anything.
+  Mechanically: each channel keeps a table of outstanding host-to-client
+  requests keyed by a host-generated `maelys/nested/<n>` id, and the two
+  methods that can block on an answer dispatch on their own thread so the
+  connection keeps being read.
+- **Concurrent calls on one connection.** `tools/call` and `resources/read`
+  no longer occupy the transport reader for their whole duration, so a client
+  can have several in flight at once and its cancellations and replies are
+  acted on while they run. Every other method still dispatches inline,
+  in order, exactly as before; `maelys_mcp_channel_handle` is unchanged and
+  still synchronous. The per-channel limit is 8 by default
+  (`maelys_mcp_runtime_configure_nested`); beyond it a call waits for the
+  channel's admission timeout and is then refused with `-32603` rather than
+  queued behind the reader.
+- **A nested question can outlive the call deadline it interrupts.** The
+  300-second provider call deadline is *suspended* while a nested request is
+  outstanding, and the nested request gets its own deadline — ten minutes by
+  default — because the thing answering an elicitation may be a person reading
+  a diff. Configure both with `maelys_mcp_runtime_configure_nested`.
+- **Nothing is left waiting.** A nested request is settled by the client's
+  reply, by a `notifications/cancelled` naming the outer call (which now
+  reaches through to the call underneath it, whether or not the subscriptions
+  module is enabled), by the channel faulting or closing, by the provider
+  process dying, or by its deadline — each one covered by a test.
+- **Provider protocol `maelys-provider/4` → `/5`**, negotiated as always: the
+  host opens at the floor and speaks what the provider declares. Unchanged /3
+  and /4 providers keep working — the host now accepts **every** version from
+  the floor to the current one rather than only those two endpoints, which is
+  a fix as much as a bump: a "floor or newest" check would have started
+  rejecting the /4 providers released against 0.13.0. New frames are
+  `provider/nestedRequest` and `provider/nestedReply`, correlated by a
+  call-scoped `nestedId` and carrying no top-level `id`. See
+  `docs/provider-protocol.md`. The bundled SDKs do not yet expose nesting;
+  that is the next increment.
+- **A provider cannot reach a client surface that was never offered.** A
+  nested request naming a method outside the three MCP defines, or one whose
+  capability the client did not declare at `initialize`, is refused with
+  `denied` before a byte is sent — the same rule `input_required` already
+  enforced, so which surfaces a provider may reach does not depend on which
+  multi-round-trip shape it chose.
+- ABI stays 3. The additions are a new opaque type
+  (`maelys_mcp_nested_relay_t`), three new entry points
+  (`maelys_mcp_provider_request_client`,
+  `maelys_mcp_provider_set_nested_handlers`,
+  `maelys_mcp_runtime_configure_nested`) and one new configuration structure;
+  no released public layout changed.
+- Internal: `maelys_mcp_channel_accept` is the new transport seam — it
+  demultiplexes a reply to a nested request from a new request before
+  anything is dispatched, and decides what runs on a worker. `stdio.c` is a
+  thin adapter over it, and a future HTTP transport reuses it verbatim.
+  `maelys_mcp_runtime_dispatch` is unchanged.
+
 ## 0.14.0 - 2026-08-20
 
 - **The middleware chain is complete: seven hooks that make the runtime

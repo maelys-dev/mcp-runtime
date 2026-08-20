@@ -44,6 +44,101 @@ static int describe_and_shutdown(const char *name, int stubborn) {
 }
 
 /*
+ * The nested-MRTR fixtures (docs/provider-protocol.md, `maelys-provider/5`).
+ * They declare /5 and open a real request back at the client in the middle of
+ * a call, which is the one thing the C SDK cannot be made to do until Phase B
+ * of the nested rollout adds a blocking helper to it.
+ */
+typedef enum nested_mode {
+    /* Opens one nested request, echoes what the client answered. */
+    NESTED_HAPPY,
+    /* Opens two without waiting for the first reply: fatal for the wire. */
+    NESTED_DOUBLE,
+    /* Opens one, then dies before the reply can arrive. */
+    NESTED_DYING,
+    /* Declares /4 and never nests: the version between the floor and the
+     * current one, which a two-value "supported" check would reject. */
+    NESTED_LEGACY4
+} nested_mode_t;
+
+/* The provider wire writes id, method, params in that order and never nests an
+ * "id" inside params, so the first occurrence is the request id - the same
+ * whitebox shortcut request_id() below takes for MCP. */
+static long provider_request_id(const char *request) {
+    const char *marker = strstr(request, "\"id\":");
+    return marker ? strtol(marker + 5, NULL, 10) : 0;
+}
+
+/* The client's reply travels back as provider/nestedReply. Everything this
+ * fixture needs from it is whether it carried a result or an error, and the
+ * `answer` field a happy-path client sends. */
+static void nested_echo(const char *reply, char *out, size_t size) {
+    const char *marker = strstr(reply, "\"answer\":\"");
+    if (!marker) {
+        const char *code = strstr(reply, "\"code\":\"");
+        (void)snprintf(out, size, "error:%.*s", code ?
+            (int)strcspn(code + 8, "\"") : 4, code ? code + 8 : "none");
+        return;
+    }
+    marker += 10;
+    (void)snprintf(out, size, "%.*s", (int)strcspn(marker, "\""), marker);
+}
+
+static int nested_provider(nested_mode_t mode) {
+    const char *protocol = mode == NESTED_LEGACY4 ?
+        "maelys-provider/4" : "maelys-provider/5";
+    char request[8192];
+    while (fgets(request, sizeof(request), stdin)) {
+        long id = provider_request_id(request);
+        if (strstr(request, "provider/describe")) {
+            printf("{\"protocol\":\"%s\",\"id\":%ld,\"result\":{\"name\":\"nested\","
+                "\"version\":\"1\",\"tools\":[{\"name\":\"nested.ask\","
+                "\"title\":\"Ask the client\",\"description\":\"Opens a nested "
+                "client request and returns what it answered.\","
+                "\"inputSchema\":{\"type\":\"object\"},\"effect\":\"read\"}]}}\n",
+                protocol, id);
+        } else if (strstr(request, "provider/activate")) {
+            printf("{\"protocol\":\"%s\",\"id\":%ld,\"result\":{}}\n", protocol, id);
+        } else if (strstr(request, "provider/call")) {
+            if (mode == NESTED_LEGACY4) {
+                printf("{\"protocol\":\"%s\",\"id\":%ld,\"result\":{\"resultType\":"
+                    "\"complete\",\"content\":[{\"type\":\"text\",\"text\":"
+                    "\"legacy4-ok\"}]}}\n", protocol, id);
+                if (fflush(stdout) != 0) return 3;
+                continue;
+            }
+            printf("{\"protocol\":\"%s\",\"method\":\"provider/nestedRequest\","
+                "\"params\":{\"nestedId\":\"n1\",\"method\":\"elicitation/create\","
+                "\"params\":{\"message\":\"Proceed?\"}}}\n", protocol);
+            if (mode == NESTED_DOUBLE) {
+                /* No reply awaited: two outstanding at once is what this
+                 * fixture exists to have the host refuse. */
+                printf("{\"protocol\":\"%s\",\"method\":\"provider/nestedRequest\","
+                    "\"params\":{\"nestedId\":\"n2\",\"method\":"
+                    "\"elicitation/create\",\"params\":{}}}\n", protocol);
+            }
+            if (fflush(stdout) != 0) return 3;
+            if (mode == NESTED_DYING) _exit(0);
+            char reply[8192];
+            if (!fgets(reply, sizeof(reply), stdin)) return 0;
+            if (!strstr(reply, "provider/nestedReply")) return 7;
+            char answer[256];
+            nested_echo(reply, answer, sizeof(answer));
+            printf("{\"protocol\":\"%s\",\"id\":%ld,\"result\":{\"resultType\":"
+                "\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}\n",
+                protocol, id, answer);
+        } else if (strstr(request, "provider/shutdown")) {
+            printf("{\"protocol\":\"%s\",\"id\":%ld,\"result\":{}}\n", protocol, id);
+            return fflush(stdout) == 0 ? 0 : 3;
+        } else {
+            return 5;
+        }
+        if (fflush(stdout) != 0) return 3;
+    }
+    return 0;
+}
+
+/*
  * The modes below speak real MCP rather than the maelys-provider wire: they
  * are upstreams for the stdio MCP proxy provider (docs/mcp-proxy.md). The
  * dogfood rig for that provider is mcp-runtime proxying mcp-runtime, so these
@@ -167,6 +262,10 @@ int main(int argc, char **argv) {
     if (strstr(argv[0], "chatty-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_CHATTY);
     if (strstr(argv[0], "dying-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_DYING);
     if (strstr(argv[0], "exotic-schema-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_EXOTIC_SCHEMA);
+    if (strstr(argv[0], "nested-double-provider")) return nested_provider(NESTED_DOUBLE);
+    if (strstr(argv[0], "nested-dying-provider")) return nested_provider(NESTED_DYING);
+    if (strstr(argv[0], "legacy4-provider")) return nested_provider(NESTED_LEGACY4);
+    if (strstr(argv[0], "nested-provider")) return nested_provider(NESTED_HAPPY);
     if (strstr(argv[0], "fd-check")) {
 #if !defined(MAELYS_TEST_ADDRESS_SANITIZER) && \
     !defined(MAELYS_TEST_THREAD_SANITIZER)

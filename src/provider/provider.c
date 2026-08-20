@@ -87,6 +87,16 @@ void maelys_mcp_provider_result_clear(maelys_mcp_provider_result_t *result) {
     maelys_mcp_provider_result_init(result);
 }
 
+maelys_mcp_result_t maelys_mcp_provider_set_nested_handlers(
+    maelys_mcp_provider_t *provider,
+    const maelys_mcp_provider_nested_handlers_t *handlers) {
+    if (!provider || !handlers) return MAELYS_MCP_ERR_ARGUMENT;
+    if (!handlers->call && !handlers->read_resource) return MAELYS_MCP_ERR_ARGUMENT;
+    provider->call_nested = handlers->call;
+    provider->read_resource_nested = handlers->read_resource;
+    return MAELYS_MCP_OK;
+}
+
 void maelys_mcp_provider_bind_event_sink(
     maelys_mcp_provider_t *provider,
     maelys_mcp_result_t (*sink)(

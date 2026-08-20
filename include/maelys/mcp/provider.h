@@ -18,10 +18,11 @@ typedef struct maelys_mcp_provider maelys_mcp_provider_t;
  * the protocol string exactly, so a host that simply started sending a newer
  * one would break every existing provider on every request. The host opens at
  * the floor, reads the version the provider declares in its own responses,
- * and speaks that from then on. A /3 provider therefore keeps working
- * untouched; only a /4 one may send progress.
+ * and speaks that from then on. A /3 or /4 provider therefore keeps working
+ * untouched; only a /4 one may send progress, and only a /5 one may open a
+ * nested request back at the client.
  */
-#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/4"
+#define MAELYS_MCP_PROVIDER_PROTOCOL "maelys-provider/5"
 #define MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR "maelys-provider/3"
 #define MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS 5000u
 #define MAELYS_MCP_DEFAULT_PROVIDER_CALL_TIMEOUT_MS 300000u
@@ -130,6 +131,86 @@ typedef maelys_mcp_result_t (*maelys_mcp_provider_read_resource_fn)(
     char **out_error);
 
 typedef void (*maelys_mcp_provider_destroy_fn)(void *context);
+
+/*
+ * Opaque handle for opening a request back at the client in the middle of a
+ * call - MCP's older, nested multi-round-trip pattern, the one a
+ * schema-validating `2025-11-25` client understands. Owned by the runtime and
+ * valid only for the duration of the callback it arrives in.
+ *
+ * This is the counterpart of the resumable `input_required` result, not a
+ * replacement for it: `input_required` ends the call and lets the client
+ * retry, while this keeps the call open and blocks it until the client
+ * answers.
+ */
+typedef struct maelys_mcp_nested_relay maelys_mcp_nested_relay_t;
+
+/*
+ * Sends one server-to-client request on the connection this call arrived on
+ * and blocks until the client answers, the outer call is cancelled, the
+ * channel goes away, or the nested deadline expires
+ * (maelys_mcp_nested_config_t.request_timeout_ms, deliberately separate from
+ * the provider call deadline because a human answering an elicitation
+ * legitimately outlives it).
+ *
+ * `method` must be one of `elicitation/create`, `sampling/createMessage` or
+ * `roots/list`, and the client must have declared the matching capability;
+ * anything else fails with MAELYS_MCP_ERR_DENIED before a byte is sent, so a
+ * provider cannot use this to reach a client surface that was never offered.
+ *
+ * `params` is borrowed. On MAELYS_MCP_OK `*out_result` holds the client's
+ * result, owned by the caller. A client that answered with a JSON-RPC error
+ * returns MAELYS_MCP_ERR_PROVIDER with that error object in `*out_result`.
+ * `*out_error` is set on failure and owned by the caller.
+ *
+ * A NULL relay returns MAELYS_MCP_ERR_STATE: it is how "this call cannot nest"
+ * is expressed, so a provider must fall back rather than assume.
+ */
+maelys_mcp_result_t maelys_mcp_provider_request_client(
+    maelys_mcp_nested_relay_t *relay,
+    const char *method,
+    json_t *params,
+    json_t **out_result,
+    char **out_error);
+
+/*
+ * The nesting-capable forms of the two callbacks that can need a client round
+ * trip. They are separate entry points rather than extra fields on
+ * maelys_mcp_provider_config_t because widening a released public structure is
+ * an ABI break (docs/abi-policy.md); a provider that does not register them
+ * keeps using the plain callbacks unchanged.
+ *
+ * `relay` is NULL when the dispatch this call arrived on cannot carry a nested
+ * request.
+ */
+typedef maelys_mcp_result_t (*maelys_mcp_provider_call_nested_fn)(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error);
+
+typedef maelys_mcp_result_t (*maelys_mcp_provider_read_resource_nested_fn)(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error);
+
+typedef struct maelys_mcp_provider_nested_handlers {
+    maelys_mcp_provider_call_nested_fn call;
+    maelys_mcp_provider_read_resource_nested_fn read_resource;
+} maelys_mcp_provider_nested_handlers_t;
+
+/*
+ * Registers the nesting-capable callbacks on a provider created by
+ * maelys_mcp_provider_create. Either member may be NULL, in which case that
+ * surface keeps using the plain callback. Must be called before the provider
+ * is handed to maelys_mcp_runtime_add_provider.
+ */
+maelys_mcp_result_t maelys_mcp_provider_set_nested_handlers(
+    maelys_mcp_provider_t *provider,
+    const maelys_mcp_provider_nested_handlers_t *handlers);
 
 typedef struct maelys_mcp_provider_config {
     const char *name;

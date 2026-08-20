@@ -39,6 +39,43 @@ static void set_process_failure_locked(
     process->failure_message = maelys_mcp_strdup(
         message ? message : "provider transport failed");
     pthread_cond_broadcast(&process->response_ready);
+    /*
+     * A thread blocked on a nested client request is not waiting on this
+     * condition - it is waiting on the channel, for a reply from the client -
+     * so broadcasting alone would leave it there until the nested deadline,
+     * holding an operation reference on a channel whose provider is already
+     * dead. Reaching across to settle it is the one place the lock hierarchy
+     * runs state_mutex -> channel->mutex; see src/internal/internal.h for why
+     * that cannot close into a cycle.
+     */
+    if (process->nested_channel) {
+        maelys_mcp_channel_nested_fail_id(process->nested_channel,
+            process->nested_wait_id, MAELYS_MCP_ERR_PROVIDER);
+    }
+}
+
+/*
+ * Published by the thread inside the call for exactly the window it is blocked
+ * on the client, so the failure path above knows what to cancel. Binding while
+ * the provider is already dead settles the wait immediately rather than
+ * letting it start.
+ */
+static void process_bind_nested_wait(
+    void *context,
+    maelys_mcp_channel_t *channel,
+    const char *nested_id) {
+    maelys_mcp_process_context_t *process = context;
+    if (!process) return;
+    pthread_mutex_lock(&process->state_mutex);
+    process->nested_channel = channel;
+    (void)snprintf(process->nested_wait_id, sizeof(process->nested_wait_id),
+        "%s", nested_id ? nested_id : "");
+    int already_failed = channel != NULL && (process->failed || process->closing);
+    pthread_mutex_unlock(&process->state_mutex);
+    if (already_failed) {
+        maelys_mcp_channel_nested_fail_id(channel, nested_id,
+            MAELYS_MCP_ERR_PROVIDER);
+    }
 }
 
 static int provider_event_from_message(
@@ -71,11 +108,55 @@ static int provider_event_from_message(
     return 0;
 }
 
-/* Accepts either version: the floor every provider speaks, or the current
- * one. Anything else is still a protocol failure. */
+/*
+ * Every version between the floor and the current one, oldest first, so the
+ * index is the version's rank. The list matters as much as the endpoints: when
+ * /4 shipped there were only two entries and "supported" could be spelled as
+ * two comparisons, but a host that only accepted the floor and the newest
+ * would start rejecting the /4 providers released against 0.13.0 the moment
+ * /5 existed.
+ */
+static const char *const provider_protocols[] = {
+    MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR,
+    "maelys-provider/4",
+    MAELYS_MCP_PROVIDER_PROTOCOL
+};
+
+#define PROVIDER_PROTOCOL_COUNT \
+    (sizeof(provider_protocols) / sizeof(provider_protocols[0]))
+
+static int protocol_rank(const json_t *protocol) {
+    for (size_t index = 0; index < PROVIDER_PROTOCOL_COUNT; ++index) {
+        if (maelys_mcp_json_string_equals(protocol, provider_protocols[index])) {
+            return (int)index;
+        }
+    }
+    return -1;
+}
+
+static int protocol_rank_of(const char *protocol) {
+    for (size_t index = 0; index < PROVIDER_PROTOCOL_COUNT; ++index) {
+        if (strcmp(protocol, provider_protocols[index]) == 0) return (int)index;
+    }
+    return -1;
+}
+
 static int supported_provider_protocol(const json_t *protocol) {
-    return maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL) ||
-        maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR);
+    return protocol_rank(protocol) >= 0;
+}
+
+/*
+ * The SDKs declare their own version rather than echoing ours, so any frame a
+ * provider sends is enough to learn what it speaks and to stop addressing it
+ * at the floor. Raise only: a provider that answered once at /5 does not get
+ * to talk the host back down.
+ */
+static void raise_protocol_locked(
+    maelys_mcp_process_context_t *process,
+    int rank) {
+    if (rank < 0 || rank <= protocol_rank_of(process->negotiated_protocol)) return;
+    (void)snprintf(process->negotiated_protocol,
+        sizeof(process->negotiated_protocol), "%s", provider_protocols[rank]);
 }
 
 /* Beyond this many undelivered frames the oldest are dropped. Progress is
@@ -124,7 +205,8 @@ static void *process_reader_main(void *opaque) {
         json_t *protocol = json_is_object(message) ?
             json_object_get(message, "protocol") : NULL;
         json_t *id = json_is_object(message) ? json_object_get(message, "id") : NULL;
-        if (!supported_provider_protocol(protocol)) {
+        int rank = protocol_rank(protocol);
+        if (rank < 0) {
             json_decref(message);
             pthread_mutex_lock(&process->state_mutex);
             set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
@@ -132,6 +214,9 @@ static void *process_reader_main(void *opaque) {
             pthread_mutex_unlock(&process->state_mutex);
             break;
         }
+        pthread_mutex_lock(&process->state_mutex);
+        raise_protocol_locked(process, rank);
+        pthread_mutex_unlock(&process->state_mutex);
         if (json_is_integer(id)) {
             unsigned long long response_id =
                 (unsigned long long)json_integer_value(id);
@@ -173,6 +258,39 @@ static void *process_reader_main(void *opaque) {
             json_decref(message);
             continue;
         }
+        /*
+         * The third demux branch, and the one nesting needed: "has a method,
+         * has no id" is a provider-initiated request, distinct both from a
+         * response (id present) and from the three whitelisted id-less events
+         * below. It is handed to the thread inside the call - the reader must
+         * never do the client round trip itself, or the connection would stop
+         * being read for the duration of it.
+         *
+         * Two nested requests outstanding at once is fatal here rather than
+         * queued: the provider wire is strictly single-outstanding in both
+         * directions, and a provider that broke that has already lost track of
+         * which reply answers which request.
+         */
+        if (!id && maelys_mcp_json_string_equals(
+                json_object_get(message, "method"),
+                "provider/nestedRequest")) {
+            json_t *params = json_object_get(message, "params");
+            pthread_mutex_lock(&process->state_mutex);
+            int refused = !process->waiting || process->pending_nested ||
+                process->nested_inflight || !json_is_object(params);
+            if (refused) {
+                set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
+                    "provider issued an unexpected or overlapping nested request");
+                pthread_mutex_unlock(&process->state_mutex);
+                json_decref(message);
+                break;
+            }
+            process->pending_nested = json_incref(params);
+            pthread_cond_broadcast(&process->response_ready);
+            pthread_mutex_unlock(&process->state_mutex);
+            json_decref(message);
+            continue;
+        }
         maelys_mcp_provider_event_t event;
         if (id || !provider_event_from_message(message, &event)) {
             json_decref(message);
@@ -204,6 +322,147 @@ static void *process_reader_main(void *opaque) {
     return NULL;
 }
 
+/* The error a nested request comes back with, in the provider wire's own
+ * string-code convention (the same one `not_found` already uses). */
+static const char *nested_error_code(maelys_mcp_result_t status) {
+    switch (status) {
+        case MAELYS_MCP_ERR_PROVIDER: return "client_error";
+        case MAELYS_MCP_ERR_DENIED: return "denied";
+        case MAELYS_MCP_ERR_TIMEOUT: return "timeout";
+        case MAELYS_MCP_ERR_CLOSED: return "cancelled";
+        case MAELYS_MCP_ERR_STATE: return "unavailable";
+        default: return "failed";
+    }
+}
+
+static json_t *nested_reply_message(
+    const char *protocol,
+    const char *nested_id,
+    maelys_mcp_result_t status,
+    json_t *payload,
+    const char *message_text) {
+    json_t *params = json_object();
+    json_t *reply = json_object();
+    if (!params || !reply) goto failed;
+    if (json_object_set_new(params, "nestedId", json_string(nested_id)) != 0) {
+        goto failed;
+    }
+    if (status == MAELYS_MCP_OK) {
+        json_t *result = payload ? json_incref(payload) : json_object();
+        if (!result || json_object_set_new(params, "result", result) != 0) {
+            goto failed;
+        }
+    } else {
+        json_t *error = json_object();
+        if (!error ||
+            json_object_set_new(error, "code",
+                json_string(nested_error_code(status))) != 0 ||
+            json_object_set_new(error, "message",
+                json_string(message_text ? message_text :
+                    "nested request failed")) != 0 ||
+            /* The client's own error object travels as data, so a provider can
+             * tell "the user declined" from "the request never got there". */
+            (payload && json_object_set(error, "data", payload) != 0) ||
+            json_object_set_new(params, "error", error) != 0) {
+            if (error) json_decref(error);
+            goto failed;
+        }
+    }
+    if (json_object_set_new(reply, "protocol", json_string(protocol)) != 0 ||
+        json_object_set_new(reply, "method",
+            json_string("provider/nestedReply")) != 0 ||
+        json_object_set_new(reply, "params", params) != 0) {
+        params = NULL;
+        goto failed;
+    }
+    return reply;
+failed:
+    if (params) json_decref(params);
+    if (reply) json_decref(reply);
+    return NULL;
+}
+
+static void shift_deadline(struct timespec *deadline, long long elapsed_ms) {
+    if (elapsed_ms <= 0) return;
+    deadline->tv_sec += (time_t)(elapsed_ms / 1000LL);
+    long nanoseconds = deadline->tv_nsec + (long)(elapsed_ms % 1000LL) * 1000000L;
+    deadline->tv_sec += nanoseconds / 1000000000L;
+    deadline->tv_nsec = nanoseconds % 1000000000L;
+}
+
+static long long realtime_milliseconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+    return (long long)now.tv_sec * 1000LL + (long long)now.tv_nsec / 1000000LL;
+}
+
+/*
+ * Runs one nested round trip on the thread that owns the call, then writes the
+ * correlated reply back through the exchange mutex that thread already holds -
+ * so no second write path exists, and the reply cannot interleave with another
+ * request's bytes.
+ *
+ * The call deadline is shifted by however long the client took. A tool call
+ * has 300 seconds; a person answering an elicitation may take longer than
+ * that, and charging their thinking time against the provider's deadline would
+ * make the timeout fire on the one party that did nothing wrong.
+ */
+static void relay_nested_request(
+    maelys_mcp_process_context_t *process,
+    maelys_mcp_nested_relay_t *relay,
+    json_t *params,
+    struct timespec *deadline) {
+    json_t *nested_id = json_object_get(params, "nestedId");
+    json_t *method = json_object_get(params, "method");
+    json_t *inner = json_object_get(params, "params");
+    if (!json_is_string(nested_id) || maelys_mcp_json_string_has_nul(nested_id) ||
+        !json_is_string(method) || maelys_mcp_json_string_has_nul(method) ||
+        (inner && !json_is_object(inner))) {
+        pthread_mutex_lock(&process->state_mutex);
+        set_process_failure_locked(process, MAELYS_MCP_ERR_PROTOCOL,
+            "provider sent a malformed nested request");
+        pthread_mutex_unlock(&process->state_mutex);
+        return;
+    }
+    long long started_ms = realtime_milliseconds();
+    json_t *result = NULL;
+    char *error = NULL;
+    maelys_mcp_result_t status = relay ?
+        maelys_mcp_provider_request_client(relay, json_string_value(method),
+            inner, &result, &error) :
+        MAELYS_MCP_ERR_STATE;
+    if (!relay) {
+        error = maelys_mcp_strdup("this call cannot open a nested client request");
+    }
+    long long finished_ms = realtime_milliseconds();
+    if (started_ms >= 0 && finished_ms >= started_ms) {
+        shift_deadline(deadline, finished_ms - started_ms);
+    }
+    pthread_mutex_lock(&process->state_mutex);
+    char protocol[sizeof(process->negotiated_protocol)];
+    (void)snprintf(protocol, sizeof(protocol), "%s", process->negotiated_protocol);
+    pthread_mutex_unlock(&process->state_mutex);
+    json_t *reply = nested_reply_message(protocol,
+        json_string_value(nested_id), status, result, error);
+    free(error);
+    if (result) json_decref(result);
+    if (!reply) {
+        pthread_mutex_lock(&process->state_mutex);
+        set_process_failure_locked(process, MAELYS_MCP_ERR_MEMORY,
+            "cannot build the nested reply");
+        pthread_mutex_unlock(&process->state_mutex);
+        return;
+    }
+    maelys_mcp_result_t written = maelys_mcp_write_json_line(process->fd, reply);
+    json_decref(reply);
+    if (written != MAELYS_MCP_OK) {
+        pthread_mutex_lock(&process->state_mutex);
+        set_process_failure_locked(process, written,
+            "cannot write the nested reply to provider");
+        pthread_mutex_unlock(&process->state_mutex);
+    }
+}
+
 static int response_deadline(unsigned int timeout_ms, struct timespec *out) {
     if (clock_gettime(CLOCK_REALTIME, out) != 0) return 0;
     out->tv_sec += (time_t)(timeout_ms / 1000u);
@@ -220,6 +479,7 @@ static maelys_mcp_result_t process_exchange(
     unsigned int timeout_ms,
     json_t *params,
     maelys_mcp_progress_reporter_t *reporter,
+    maelys_mcp_nested_relay_t *relay,
     json_t **out_result,
     char **out_error) {
     if (!process || process->fd < 0 || !method || !out_result) return MAELYS_MCP_ERR_ARGUMENT;
@@ -304,6 +564,24 @@ static maelys_mcp_result_t process_exchange(
             pthread_mutex_lock(&process->state_mutex);
             continue;
         }
+        /*
+         * Same discipline as progress, for the same reason: the reader took
+         * the frame off the wire, but only this thread may act on it - it owns
+         * the sink, and it is the one that must block. `nested_inflight` is
+         * what makes a second nested request while this one is outstanding
+         * visible to the reader as the protocol violation it is.
+         */
+        if (process->pending_nested) {
+            json_t *nested = process->pending_nested;
+            process->pending_nested = NULL;
+            process->nested_inflight = 1;
+            pthread_mutex_unlock(&process->state_mutex);
+            relay_nested_request(process, relay, nested, &deadline);
+            json_decref(nested);
+            pthread_mutex_lock(&process->state_mutex);
+            process->nested_inflight = 0;
+            continue;
+        }
         int waited = pthread_cond_timedwait(
             &process->response_ready, &process->state_mutex, &deadline);
         if (waited == ETIMEDOUT) {
@@ -359,15 +637,9 @@ static maelys_mcp_result_t process_exchange(
         pthread_mutex_unlock(&process->exchange_mutex);
         return MAELYS_MCP_ERR_PROTOCOL;
     }
-    /* The SDKs declare their own version in responses rather than echoing
-     * ours, so the first response is enough to learn what this provider
-     * speaks and to stop addressing it at the floor. */
-    if (maelys_mcp_json_string_equals(protocol, MAELYS_MCP_PROVIDER_PROTOCOL)) {
-        pthread_mutex_lock(&process->state_mutex);
-        (void)snprintf(process->negotiated_protocol,
-            sizeof(process->negotiated_protocol), "%s", MAELYS_MCP_PROVIDER_PROTOCOL);
-        pthread_mutex_unlock(&process->state_mutex);
-    }
+    /* The version this provider declared was already learned by the reader,
+     * which raises it from every frame rather than only from responses -
+     * a /5 provider announces itself on its nested requests too. */
     json_t *error = json_object_get(response, "error");
     json_t *result = json_object_get(response, "result");
     if (!!error == !!result || (error && !json_is_object(error))) {
@@ -393,12 +665,12 @@ static maelys_mcp_result_t process_exchange(
     return *out_result ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
-static maelys_mcp_result_t process_call(
-    void *context,
+static maelys_mcp_result_t process_call_relayed(
+    maelys_mcp_process_context_t *process,
     const maelys_mcp_provider_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
     maelys_mcp_provider_result_t *out_result,
     char **out_error) {
-    maelys_mcp_process_context_t *process = context;
     json_t *params = json_object();
     if (!params) return MAELYS_MCP_ERR_MEMORY;
     if (json_object_set_new(params, "name", json_string(request->tool_name)) != 0 ||
@@ -407,15 +679,22 @@ static maelys_mcp_result_t process_call(
             json_object_set(params, "inputResponses", request->input_responses) != 0) ||
         (request->request_state &&
             json_object_set(params, "requestState", request->request_state) != 0) ||
+        /*
+         * Deep-copied rather than referenced: on a legacy channel this object
+         * belongs to the channel and is shared by every call on it, and two
+         * concurrent calls taking a reference to it would be two threads
+         * writing one refcount. Copying reads it and touches nothing.
+         */
         (request->client_capabilities &&
-            json_object_set(params, "clientCapabilities", request->client_capabilities) != 0)) {
+            json_object_set_new(params, "clientCapabilities",
+                json_deep_copy(request->client_capabilities)) != 0)) {
         json_decref(params);
         return MAELYS_MCP_ERR_MEMORY;
     }
     json_t *wire_result = NULL;
     maelys_mcp_result_t result = process_exchange(
         process, "provider/call", process->call_timeout_ms, params,
-        request->progress, &wire_result, out_error);
+        request->progress, relay, &wire_result, out_error);
     json_decref(params);
     if (result != MAELYS_MCP_OK) return result;
     json_t *type = json_is_object(wire_result) ?
@@ -464,12 +743,38 @@ static maelys_mcp_result_t process_call(
     return result;
 }
 
-static maelys_mcp_result_t process_read_resource(
+/*
+ * The two entry points differ only in whether a relay reaches process_exchange
+ * - and in binding this process to the wait, which is how a provider that dies
+ * mid-relay cancels the thread blocked on the client.
+ */
+static maelys_mcp_result_t process_call(
     void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    return process_call_relayed(context, request, NULL, out_result, out_error);
+}
+
+static maelys_mcp_result_t process_call_nested(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    if (relay) {
+        relay->waiter_context = context;
+        relay->waiter_bind = process_bind_nested_wait;
+    }
+    return process_call_relayed(context, request, relay, out_result, out_error);
+}
+
+static maelys_mcp_result_t process_read_resource_relayed(
+    maelys_mcp_process_context_t *process,
     const maelys_mcp_resource_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
     maelys_mcp_resource_result_t *out_result,
     char **out_error) {
-    maelys_mcp_process_context_t *process = context;
     json_t *params = json_object();
     if (!params) return MAELYS_MCP_ERR_MEMORY;
     if (json_object_set_new(params, "uri", json_string(request->uri)) != 0 ||
@@ -477,14 +782,16 @@ static maelys_mcp_result_t process_read_resource(
             "inputResponses", request->input_responses) != 0) ||
         (request->request_state && json_object_set(params,
             "requestState", request->request_state) != 0) ||
-        (request->client_capabilities && json_object_set(params,
-            "clientCapabilities", request->client_capabilities) != 0)) {
+        /* Deep-copied for the same reason as in process_call_relayed. */
+        (request->client_capabilities && json_object_set_new(params,
+            "clientCapabilities",
+            json_deep_copy(request->client_capabilities)) != 0)) {
         json_decref(params);
         return MAELYS_MCP_ERR_MEMORY;
     }
     json_t *wire = NULL;
     maelys_mcp_result_t status = process_exchange(process, "provider/readResource",
-        process->call_timeout_ms, params, NULL, &wire, out_error);
+        process->call_timeout_ms, params, NULL, relay, &wire, out_error);
     json_decref(params);
     if (status != MAELYS_MCP_OK) return status;
     json_t *type = json_is_object(wire) ? json_object_get(wire, "resultType") : NULL;
@@ -521,6 +828,29 @@ static maelys_mcp_result_t process_read_resource(
     return status;
 }
 
+static maelys_mcp_result_t process_read_resource(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error) {
+    return process_read_resource_relayed(context, request, NULL, out_result,
+        out_error);
+}
+
+static maelys_mcp_result_t process_read_resource_nested(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_nested_relay_t *relay,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error) {
+    if (relay) {
+        relay->waiter_context = context;
+        relay->waiter_bind = process_bind_nested_wait;
+    }
+    return process_read_resource_relayed(context, request, relay, out_result,
+        out_error);
+}
+
 static long long monotonic_milliseconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
@@ -549,7 +879,7 @@ static maelys_mcp_result_t process_activate(void *context, char **out_error) {
     pthread_mutex_unlock(&process->state_mutex);
     json_t *result = NULL;
     maelys_mcp_result_t status = process_exchange(process, "provider/activate",
-        process->describe_timeout_ms, NULL, NULL, &result, out_error);
+        process->describe_timeout_ms, NULL, NULL, NULL, &result, out_error);
     if (status == MAELYS_MCP_OK && !json_is_object(result)) {
         replace_error(out_error, "provider activation result must be an object");
         status = MAELYS_MCP_ERR_PROTOCOL;
@@ -570,7 +900,7 @@ static void process_destroy(void *context) {
         json_t *ignored = NULL;
         char *error = NULL;
         (void)process_exchange(process, "provider/shutdown",
-            process->shutdown_timeout_ms, NULL, NULL, &ignored, &error);
+            process->shutdown_timeout_ms, NULL, NULL, NULL, &ignored, &error);
         if (ignored) json_decref(ignored);
         free(error);
         pthread_mutex_lock(&process->state_mutex);
@@ -871,8 +1201,8 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     if (status != MAELYS_MCP_OK) return status;
 
     json_t *description = NULL;
-    status = process_exchange(process, "provider/describe", 
-        process->describe_timeout_ms, NULL, NULL, &description, out_error);
+    status = process_exchange(process, "provider/describe",
+        process->describe_timeout_ms, NULL, NULL, NULL, &description, out_error);
     if (status != MAELYS_MCP_OK) {
         process_destroy(process);
         return status;
@@ -979,6 +1309,20 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     if (status != MAELYS_MCP_OK) {
         process_destroy(process);
     } else {
+        /*
+         * Registered unconditionally, not gated on the version this provider
+         * declared: the nesting-capable callback is a superset of the plain
+         * one, and a provider that never sends a nested request never notices
+         * the difference. Gating here would only mean a provider that
+         * announces /5 late - on the frame that opens its first nested request
+         * - could never be relayed.
+         */
+        maelys_mcp_provider_nested_handlers_t handlers = {
+            .call = process_call_nested,
+            .read_resource = (resource_count || template_count) ?
+                process_read_resource_nested : NULL
+        };
+        (void)maelys_mcp_provider_set_nested_handlers(*out_provider, &handlers);
         (*out_provider)->activate = process_activate;
         (*out_provider)->activated = 0;
         pthread_mutex_lock(&process->state_mutex);

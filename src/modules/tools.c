@@ -560,9 +560,27 @@ static json_t *call_tool(
         }
         substituted = disposition == MAELYS_MCP_CALL_SUBSTITUTE;
     }
+    /*
+     * The nested-MRTR leg. It is offered only when something other than this
+     * thread is still reading the connection (request->nestable) - otherwise
+     * a provider that opened a client request would be waiting for a reply
+     * that only this thread could have read. A provider handed a NULL relay
+     * falls back to the resumable input_required result.
+     */
+    maelys_mcp_nested_relay_t relay = {
+        .channel = request->channel,
+        .sink = request->sink,
+        .outer_id = request->id,
+        .client_capabilities = client_capabilities
+    };
+    maelys_mcp_nested_relay_t *nested = request->nestable && request->sink &&
+        request->sink->emit ? &relay : NULL;
     status = substituted ? MAELYS_MCP_OK :
-        tool->provider->call(tool->provider->context, &provider_request,
-            &provider_result, &error);
+        (tool->provider->call_nested ?
+            tool->provider->call_nested(tool->provider->context,
+                &provider_request, nested, &provider_result, &error) :
+            tool->provider->call(tool->provider->context, &provider_request,
+                &provider_result, &error));
     json_t *required_capabilities = NULL;
     if (status == MAELYS_MCP_OK) {
         status = validate_provider_result(runtime, tool, &provider_result,
@@ -623,6 +641,12 @@ static int handles(const char *method) {
     return strcmp(method, "tools/list") == 0 || strcmp(method, "tools/call") == 0;
 }
 
+/* A call is the only tools method that reaches a provider, and therefore the
+ * only one that can end up waiting on the client. */
+static int nestable(const char *method) {
+    return strcmp(method, "tools/call") == 0;
+}
+
 static json_t *handle(
     maelys_mcp_runtime_t *runtime,
     const char *method,
@@ -643,5 +667,6 @@ const maelys_mcp_module_descriptor_t maelys_mcp_tools_module = {
     .capability_name = "tools",
     .capability = capability,
     .handles = handles,
+    .nestable = nestable,
     .handle = handle
 };

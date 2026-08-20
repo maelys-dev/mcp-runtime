@@ -16,6 +16,16 @@ extern "C" {
 #define MAELYS_MCP_PROTOCOL_LEGACY "2025-11-25"
 #define MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES (1024u * 1024u)
 #define MAELYS_MCP_DEFAULT_STDIO_WRITE_TIMEOUT_MS 5000u
+/*
+ * Ten minutes, deliberately longer than the 300-second provider call deadline:
+ * the thing on the other end of a nested `elicitation/create` is a person, and
+ * a deadline sized for a machine would turn "the user went to read the diff"
+ * into a protocol failure. The call deadline is suspended while a nested
+ * request is outstanding rather than racing it.
+ */
+#define MAELYS_MCP_DEFAULT_NESTED_REQUEST_TIMEOUT_MS 600000u
+#define MAELYS_MCP_DEFAULT_MAX_CONCURRENT_REQUESTS 8u
+#define MAELYS_MCP_DEFAULT_MAX_NESTED_REQUESTS 16u
 
 typedef struct maelys_mcp_runtime maelys_mcp_runtime_t;
 
@@ -50,6 +60,28 @@ typedef struct maelys_mcp_runtime_config {
     size_t max_subscriptions;
 } maelys_mcp_runtime_config_t;
 
+/*
+ * How a channel handles the two methods that can block on a client round trip.
+ * Bound once on the runtime, while it is cold, and inherited by every channel
+ * - a new structure and a new entry point rather than new fields on
+ * maelys_mcp_channel_config_t, which is released public layout
+ * (docs/abi-policy.md). Every zero field selects its documented default, so
+ * `{0}` is the current behaviour.
+ */
+typedef struct maelys_mcp_nested_config {
+    /* How long a nested request may wait for the client's reply.
+     * 0 selects MAELYS_MCP_DEFAULT_NESTED_REQUEST_TIMEOUT_MS. */
+    unsigned int request_timeout_ms;
+    /* How many `tools/call`/`resources/read` requests one channel may have in
+     * flight at once. Beyond it, a new one waits for the channel's admission
+     * timeout and is then refused with -32603 rather than queued behind the
+     * transport reader. 0 selects MAELYS_MCP_DEFAULT_MAX_CONCURRENT_REQUESTS. */
+    size_t max_concurrent_requests;
+    /* How many nested requests one channel may have outstanding at once.
+     * 0 selects MAELYS_MCP_DEFAULT_MAX_NESTED_REQUESTS. */
+    size_t max_nested_requests;
+} maelys_mcp_nested_config_t;
+
 typedef struct maelys_mcp_stdio_options {
     unsigned int write_timeout_ms;
     /*
@@ -76,6 +108,16 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
  */
 MAELYS_MCP_WARN_UNUSED_RESULT
 maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime);
+
+/*
+ * Binds nested-request settings. Like middleware registration, this is only
+ * accepted while the runtime is cold: every channel reads these values with no
+ * lock, so they must stop changing before the first channel can dispatch.
+ * Returns MAELYS_MCP_ERR_STATE once a channel exists.
+ */
+maelys_mcp_result_t maelys_mcp_runtime_configure_nested(
+    maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_nested_config_t *config);
 
 maelys_mcp_result_t maelys_mcp_runtime_add_provider(
     maelys_mcp_runtime_t *runtime,
