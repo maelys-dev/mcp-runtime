@@ -67,7 +67,7 @@ LIB_SOURCES := \
 	src/transport/stdio_isolation.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJ)/%.o)
 DEPENDENCY_SOURCES := $(LIB_SOURCES) host/main.c host/manifest.c providers/example/main.c \
-	$(wildcard tests/*.c) tests/helpers/adversarial_provider.c
+	$(wildcard tests/*.c) tests/helpers/adversarial_provider.c tests/helpers/sdk_nested_provider.c
 DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
 -include $(DEPENDENCY_FILES)
@@ -99,6 +99,13 @@ $(BIN)/adversarial-provider: $(OBJ)/tests/helpers/adversarial_provider.o
 
 $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream $(BIN)/nested-provider $(BIN)/nested-double-provider $(BIN)/nested-dying-provider $(BIN)/legacy4-provider: $(BIN)/adversarial-provider
 	ln -sf $(notdir $<) $@
+
+# Unlike the fixture above, this one is a real C SDK provider - it links
+# libmaelys_mcp.a (provider_sdk.c, jansson) rather than hand-rolling JSON, so
+# it needs the library's own flags, not adversarial-provider's bare compile.
+$(BIN)/sdk-nested-provider: $(OBJ)/tests/helpers/sdk_nested_provider.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 $(BIN)/test-runtime: $(OBJ)/tests/test_runtime.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
@@ -188,11 +195,12 @@ test-channel-no-thread-nosanitize: $(NO_THREAD_BIN)
 	$(NO_THREAD_BIN)
 
 NESTED_FIXTURES := $(BIN)/nested-provider $(BIN)/nested-double-provider \
-	$(BIN)/nested-dying-provider $(BIN)/legacy4-provider
+	$(BIN)/nested-dying-provider $(BIN)/legacy4-provider $(BIN)/sdk-nested-provider
 NESTED_FIXTURE_ARGS = $(abspath $(BIN)/nested-provider) \
 	$(abspath $(BIN)/nested-double-provider) \
 	$(abspath $(BIN)/nested-dying-provider) \
-	$(abspath $(BIN)/legacy4-provider)
+	$(abspath $(BIN)/legacy4-provider) \
+	$(abspath $(BIN)/sdk-nested-provider)
 
 TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
 
