@@ -1,44 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.14.0 - 2026-08-20
 
-- **Middleware chain**, the runtime's single policy and observation seam. The
-  design in `docs/middleware-design.md` specifies seven hooks; this lands the chain
-  core — registration, ordering, invocation — and its two decision points,
-  `on_authorize` and `on_audit`. All five of the runtime's policy decision points go
-  through it: `tools/list` (per tool), `tools/call`, `resources/list` (per resource),
-  `resources/templates/list` (per template) and `resources/read`. Decisions are taken
-  on the resolved identity and on the channel's embedder-bound opaque pointer, and a
-  hook that cannot reach a verdict is distinct from one that denies. See
-  `docs/middleware.md`.
-- **API break (ABI 2 → 3): `maelys_mcp_runtime_config_t` loses `authorize`, `audit`
-  and `policy_context`.** The chain replaces those callbacks rather than coexisting
-  with them; two similar-looking mechanisms on the security-critical path double the
-  surface that has to be audited. **Migration is one call**:
-  `maelys_mcp_runtime_add_compat_policy(runtime, authorize, audit, policy_context)`
-  registers a built-in middleware that calls the same callbacks with the same
-  metadata, before the first channel. Registering just an authorizer is one struct
-  field. `maelys_mcp_request_context_t`, `maelys_mcp_authorize_fn` and
-  `maelys_mcp_audit_fn` moved from `maelys/mcp/runtime.h` to
-  `maelys/mcp/middleware.h`, which `maelys/mcp.h` includes.
-- **Named behaviour change: policy now runs before schema validation on
-  `tools/call`.** A denied caller returns `-32003` with no data whether or not its
-  arguments would have validated, so it cannot map a tool's argument schema through
-  validation error details. The consequence for middleware authors is in the public
-  contract: `on_authorize` sees params this runtime has not validated yet.
-- **Named behaviour change: a denied `resources/read` is journalled**, as a denied
-  `tools/call` always was. The asymmetry was an omission.
-- **Named behaviour change: an undecidable verdict is not a denial.**
-  `MAELYS_MCP_AUTHORIZE_ERROR` maps to `-32603`, never `-32003`, and fails a whole
-  listing rather than dropping the entry it could not evaluate — a hidden catalog
-  entry and an unevaluated one are indistinguishable to a client.
-- `on_authorize` receives the request's whole params, `inputResponses` and
-  `requestState` included, so MRTR continuation traffic — elicitation answers and
-  sampling completions — is no longer invisible to policy. This is visibility, not
-  binding: a continuation can still arrive on a different channel than the one that
-  issued it.
-- `on_audit` carries both the requested and the resolved identity, so a journal
-  records what the client asked for rather than what a future transform injected.
+- **The middleware chain is complete: seven hooks that make the runtime
+  programmable.** You can now register middleware that decides, observes and
+  transforms everything crossing the runtime — who may call what
+  (`on_authorize`), what gets journalled (`on_audit`), what a tool is really
+  named and called with (`on_resolve`), whether the provider is invoked at all
+  (`on_call`), what the client gets back (`on_result`), how a request's output
+  stream is delivered (`wrap_sink`), and what the catalogs advertise
+  (`on_list`). Every hook is optional; hooks compose in registration order and
+  see the channel's embedder-bound context. See `docs/middleware.md`.
+- **Authorization on every decision point** (`on_authorize`, hook ②). Your
+  policy now sees all five of the runtime's decision points — `tools/list`
+  (per tool), `tools/call`, `resources/list` (per resource),
+  `resources/templates/list` (per template) and `resources/read` — with the
+  resolved tool identity, the request's whole params (MRTR continuation
+  traffic included — visibility, not channel binding), and the per-channel
+  context. An undecidable verdict is distinct from a denial: it maps to
+  `-32603`, never `-32003`, and fails a whole listing rather than silently
+  hiding the entry it could not evaluate.
+- **Audit with both views** (`on_audit`, hook ⑤). A journal entry now carries
+  both the identity the client asked for and the identity that actually ran,
+  so a rename or transform cannot launder what was requested. A denied
+  `resources/read` is journalled, as a denied `tools/call` always was.
 - **Tool renaming and argument injection** (`on_resolve`, hook ①). You can now
   publish a tool under a different name, hide an argument from clients and supply
   it yourself, or map a whole family of published names onto one real tool — the
@@ -77,100 +62,104 @@
   wrapper could break a request: a swallowed response is detected and answered past
   the chain with `-32603` rather than left to wedge the connection, and a second
   completion for one id is refused.
-- `maelys_mcp_middleware_t` gains `on_resolve`, `on_call`, `on_result`, `wrap_sink`
-  and `on_list`, and its fields are now in hook order. This extends the ABI-3
-  descriptor introduced above before ABI 3 has been released, so there is no
-  further bump; every field is optional and existing designated initializers keep
-  compiling unchanged.
-- `maelys_mcp_response_sink_t` becomes a public **opaque** type, with
-  `maelys_mcp_sink_emit`, `maelys_mcp_sink_complete` and
-  `maelys_mcp_sink_cancelled` to forward through it. The layout stays private, so
-  decorating the delivery path is not a commitment to its shape.
-- The middleware suite now runs under `make tsan` as well as `make check`, because
-  `wrap_sink` sits on the path every request's output takes.
+- **API break (ABI 2 → 3), migration is one call.**
+  `maelys_mcp_runtime_config_t` loses `authorize`, `audit` and
+  `policy_context`: the chain replaces those callbacks rather than coexisting
+  with them, because two similar-looking mechanisms on the security-critical
+  path double the surface that has to be audited. To migrate, call
+  `maelys_mcp_runtime_add_compat_policy(runtime, authorize, audit,
+  policy_context)` before the first channel — it registers a built-in
+  middleware invoking the same callbacks with the same metadata.
+  `maelys_mcp_request_context_t`, `maelys_mcp_authorize_fn` and
+  `maelys_mcp_audit_fn` moved to `maelys/mcp/middleware.h`, which
+  `maelys/mcp.h` includes.
+- **Behaviour change: policy runs before schema validation on `tools/call`.**
+  A denied caller gets `-32003` with no detail whether or not its arguments
+  would have validated, so it can no longer map a tool's argument schema
+  through validation error messages. Consequence for middleware authors:
+  `on_authorize` sees params the runtime has not validated yet.
+- Plumbing for the above, all additive within the unreleased ABI 3:
+  `maelys_mcp_middleware_t` gains the five new hook fields (in hook order;
+  designated initializers keep compiling); `maelys_mcp_response_sink_t`
+  becomes a public opaque type with `maelys_mcp_sink_emit`/`_complete`/
+  `_cancelled` to forward through; and the middleware suite runs under
+  `make tsan` as well as `make check`, because `wrap_sink` sits on the path
+  every request's output takes.
 
 ## 0.13.1 - 2026-08-20
 
-- **Fix**: the release build's Linux (GCC) runners failed on
-  `-Werror=format-truncation=` in `host/manifest.c` — GCC sizes `%zu` at its
-  theoretical worst case (up to 20 digits for a 64-bit `size_t`), which
-  exceeded the buffer used to format `allowEffects[N]` error locations. clang
-  (the regular CI checks, local macOS builds) never flagged it, so it shipped
-  undetected in 0.13.0. No behavioural change; v0.13.0's tag was never
-  followed by a GitHub Release (its Linux builds failed, so publishing was
-  skipped) — this is the first release actually carrying 0.13.0's features.
+- **Fix: Linux release builds compile again.** GCC (used only by the release
+  workflow's Ubuntu runners) rejected a too-small error-message buffer in
+  `host/manifest.c` under `-Werror=format-truncation=`; clang, used by the
+  regular CI checks and macOS builds, never flagged it. No behavioural
+  change. Note: v0.13.0's tag was never followed by a GitHub Release (its
+  Linux builds failed), so this is the first release actually carrying
+  0.13.0's features.
 
 ## 0.13.0 - 2026-08-20
 
-- **MCP proxy provider**: federate any third-party MCP server over stdio. mcp-runtime
-  spawns it, negotiates its era (modern `2026-07-28` or a legacy dated revision),
-  snapshots its tool catalog once at connect, and re-exposes those tools through the
-  normal provider pipeline — effect gating, schema validation, policy and audit all
-  apply to traffic this runtime did not originate. The catalog snapshot is pinned:
-  calls resolve only against it, never against a fresh list, so a renamed or
-  disappeared upstream tool cannot be silently substituted. Progress notifications
-  relay end to end, correlated on the caller's own client token, never the upstream's.
-- **Schema policy for the proxy**: an upstream tool whose `inputSchema` this runtime's
-  strict validator cannot handle no longer has to fail the whole connection. Three
-  policies — `strict` (default: fails connect, unchanged from initial release),
-  `skip` (the tool is dropped from the catalog and reported by name; the rest of the
-  upstream stays usable), `passthrough` (the tool is exposed with a permissive schema
-  and the upstream validates its own arguments; effect gating, policy and audit still
-  apply).
-- **Provider manifest**: `--manifest /absolute/path.json` declares a whole provider
-  set — native and proxy providers alike, plus `allowEffects` — instead of one
-  `--provider` flag per process. Strict two-phase validation rejects any unknown key
-  by name and location; nothing is constructed from a partially validated document.
-  Composes with `--provider`/`--allow-effect` rather than replacing them. See
-  `docs/manifest.md`.
-- **`notifications/progress` support**, end to end. In-process and out-of-process
-  providers can report progress on a long-running call; the bare `_meta.progressToken`
-  key (identical across both protocol eras) opts a call in, and progress frames are
-  delivered in strict order ahead of the call's final response — including over the
-  provider wire, which required negotiating `maelys-provider/3` → `/4` (a provider
-  declares its own version in responses; the host never requires an upgrade, so an
-  unmodified `/3` provider keeps working exactly as before). Closes the official
-  conformance suite's `tools-call-with-progress` scenario in both the modern and
-  legacy requirement sets.
-- **Response sink**: dispatch now delivers through a transport-neutral sink
-  (`emit`/`complete`/`cancelled`) instead of assuming a single buffered reply. Pure
-  internal refactor with no behavioural change on its own — the foundation the
-  progress and (future) HTTP streaming work build on.
-- Official conformance coverage extended to the legacy `2025-11-25` requirement set,
-  fetched live from the official tool rather than hand-copied, plus a permanent
-  concurrent-dispatch test and channel/provider performance baselines that now run on
-  every `make check`/`make tsan`.
+- **MCP proxy provider — plug any third-party MCP server into the runtime as
+  if it were a native provider.** Point the host at an MCP server executable
+  and its tools appear alongside your own, with effect gating, schema
+  validation, policy and audit applied to traffic this runtime did not
+  originate. The runtime spawns it over stdio, negotiates its protocol era
+  (modern `2026-07-28` or a legacy dated revision), and pins its tool catalog
+  at connect time — calls resolve only against that snapshot, so a renamed or
+  vanished upstream tool cannot be silently substituted. Progress relays end
+  to end on the caller's own token. See `docs/mcp-proxy.md`.
+- **Choose what happens to upstream tools with unsupported schemas** (proxy
+  `schemaPolicy`). One exotic tool no longer has to fail the whole
+  connection: `strict` (default) still fails the connect naming the tool,
+  `skip` drops just that tool and reports it, `passthrough` exposes it with a
+  permissive schema and lets the upstream validate its own arguments —
+  effect gating, policy and audit still apply.
+- **Declare your whole provider fleet in one JSON file** (`--manifest
+  /absolute/path.json`). Native and proxy providers plus `allowEffects`, in
+  one declarative document instead of one flag per process. Validation is
+  strict and two-phase — any unknown key is rejected by name and location,
+  and nothing is constructed from a partially valid document. Composes with
+  `--provider`/`--allow-effect`. See `docs/manifest.md`.
+- **Progress notifications, end to end.** A long-running tool call can now
+  stream `notifications/progress` to the client that opted in via
+  `_meta.progressToken`, in strict order ahead of the final response — from
+  in-process providers and across the provider wire (negotiated
+  `maelys-provider/3` → `/4`; an unmodified `/3` provider keeps working
+  untouched). Closes the official `tools-call-with-progress` conformance
+  scenario in both the modern and legacy requirement sets.
+- **Internal: transport-neutral response sink.** Dispatch delivers through an
+  `emit`/`complete`/`cancelled` seam instead of assuming one buffered reply —
+  no behavioural change on its own; the foundation progress (and future HTTP
+  streaming) builds on.
+- **Wider conformance and performance coverage**: the legacy `2025-11-25`
+  official requirement set now runs in CI (fetched live, not hand-copied),
+  plus a permanent concurrent-dispatch test and channel/provider performance
+  baselines on every `make check`/`make tsan`.
 
 ## 0.12.2 - 2026-08-17
 
-- Legacy clients (`2024-11-05` through `2025-11-25`) can now use `input_required`/MRTR
-  (elicitation, sampling, roots) exactly like modern clients, provided they declared
-  the relevant capability once at `initialize` — the same top-level keys
-  (`elicitation`, `sampling`, `roots`) that modern clients declare per-request in
-  `_meta`. Previously every legacy channel was unconditionally denied with
-  `input_required requires the modern MCP protocol and MRTR module`, regardless of
-  what it had declared. Applies to both `tools/call` and `resources/read`. A legacy
-  channel that declared nothing keeps getting `-32021`/`requiredCapabilities`, same
-  as before.
+- **Legacy clients can now use elicitation, sampling and roots.** A client on
+  `2024-11-05` through `2025-11-25` that declared the capability once at
+  `initialize` gets the same `input_required`/MRTR flow as modern clients, on
+  both `tools/call` and `resources/read`. Previously every legacy channel was
+  unconditionally denied regardless of what it declared. A legacy channel
+  that declared nothing still gets `-32021`/`requiredCapabilities`.
 
 ## 0.12.1 - 2026-08-17
 
-- Fix a regression where any request carrying an opaque `_meta` object (for example
-  a progress token) on an already legacy-initialized channel was incorrectly forced
-  through modern `protocolVersion`/`clientCapabilities` validation and rejected with
-  `-32602`. Only `_meta` that actually carries the
-  `io.modelcontextprotocol/protocolVersion` key is now treated as a negotiation
-  attempt — including on a legacy-initialized channel, where it is correctly
-  rejected as an unsupported mid-session renegotiation. Fixes a startup failure
-  observed with legacy MCP clients (e.g. Hermes) sending per-request metadata.
+- **Fix: legacy clients sending per-request metadata could not start.** A
+  request carrying an opaque `_meta` object (a progress token, for example)
+  on a legacy-initialized channel was wrongly forced through modern
+  negotiation and rejected with `-32602` — observed as a startup failure
+  with real legacy clients (e.g. Hermes). Only `_meta` actually carrying
+  `io.modelcontextprotocol/protocolVersion` is treated as negotiation now.
 
 ## 0.12.0 - 2026-08-17
 
-- Negotiate the legacy `initialize` handshake instead of requiring an exact match on
-  `2025-11-25`. The runtime now accepts `2024-11-05`, `2025-03-26`, `2025-06-18` and
-  `2025-11-25`, and echoes the client's requested version back in the result, so
-  clients (such as Codex) that announce an older dated revision are no longer rejected
-  with `-32602`. `2026-07-28` support (stateless, via per-request `_meta`) is unchanged.
+- **Older MCP protocol versions are accepted at `initialize`.** The runtime
+  now negotiates `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25`
+  and echoes the client's requested version back, so clients announcing an
+  older dated revision (such as Codex) are no longer rejected with `-32602`.
+  Modern `2026-07-28` support is unchanged.
 
 ## 0.11.0 - 2026-08-17
 
