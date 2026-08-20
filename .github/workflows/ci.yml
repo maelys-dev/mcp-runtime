@@ -33,6 +33,23 @@ jobs:
       - run: make check-all CC=clang ANALYZER=clang
       - run: make analyze CC=clang ANALYZER=clang
 
+  check-gcc:
+    # A second compiler, deliberately. Every other job above pins CC=clang;
+    # the Makefile's own default (CC ?= cc) resolves to GCC on these Ubuntu
+    # runners, and GCC's -Wformat-truncation= is stricter than clang's about
+    # sizing a snprintf destination for %zu's theoretical worst case (a
+    # 64-bit size_t can print up to 20 digits). Without this job, a GCC-only
+    # -Werror failure is invisible until the tag-triggered release build's
+    # Linux runners hit it - after the tag is already pushed. See v0.13.0.
+    name: Native checks (GCC)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes gcc make pkg-config libjansson-dev liburiparser-dev
+      - run: make check CC=gcc
+
   sanitizers:
     name: ASan, UBSan and TSan
     runs-on: ubuntu-24.04
