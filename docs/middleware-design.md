@@ -1,12 +1,14 @@
 # Middleware chain — design
 
-> **Status: partly implemented.** The chain core — registration, ordering,
-> invocation — and its two decision hooks, ② `on_authorize` and ⑤ `on_audit`,
-> are shipped, and all five policy decision points go through them.
-> `docs/middleware.md` documents that surface. Hooks ①③④⑥⑦ and the fanout
-> direction remain design only, as does everything the sections below describe
-> in the future tense. The sections marked *today* now describe the **pre-chain**
-> runtime and are kept as the record of what was replaced.
+> **Status: implemented, except the fanout direction.** All seven hooks are
+> shipped — the chain core and its two decision hooks ② `on_authorize` and ⑤
+> `on_audit` first, then the five transformation hooks ① `on_resolve`, ③
+> `on_call`, ④ `on_result`, ⑥ `wrap_sink` and ⑦ `on_list`.
+> `docs/middleware.md` documents that surface. What remains design only is the
+> **fanout** hook — the genuinely reverse path, with its own threading
+> contract — along with everything else the sections below describe in the
+> future tense. The sections marked *today* describe the **pre-chain** runtime
+> and are kept as the record of what was replaced.
 >
 > This document is recorded so the decisions and their reasons survive, and so
 > the implementation can be reviewed against them rather than against memory.
@@ -107,6 +109,28 @@ tools/list: list_tools() → policy(LIST) → ⑦ on_list → serialisation
 A middleware implements only the hooks it needs: a transform takes ①④⑦, a
 proxy ③, a redactor ④⑥.
 
+> **Shipped**, with the diagram's placements taken literally except in two
+> spots worth naming.
+>
+> ⑦ operates on the **serialized catalog** — the JSON array of entries as they
+> would go on the wire — rather than on the registry structures the diagram's
+> "→ serialisation" could be read as implying. That reading is what makes a
+> synthetic entry expressible at all: a tool ⑦ invents has no
+> `maelys_mcp_owned_tool_t` to be. It also extends ⑦ to `resources/list` and
+> `resources/templates/list`, which the diagram mentions only for tools;
+> `catalog` discriminates.
+>
+> ④ runs **after** `validate_provider_result`, not between ③ and it. The
+> diagram is silent on where validation sits; putting ④ after keeps the
+> promise made under "Known holes" below — the runtime validates the real
+> result against the real schema — and a ④ replacement is then re-checked
+> structurally but not against `outputSchema`.
+>
+> ① is `tools/call` only. `resources/read` has no request-side transformation
+> hook; its identity resolution is URI normalization, which ② and ⑤ already
+> see both sides of. Naming it here rather than leaving it implied: a resource
+> rename is not expressible in this release.
+
 **This reorders policy ahead of schema validation, which is a behaviour
 change**, not the status quo. It is wanted — a denied caller should not be
 able to probe argument schemas through validation error details — but it must
@@ -152,6 +176,22 @@ Two precisions the examples force, neither of which was stated above:
   That is the price of ③'s const arguments, and it is a real ergonomic cost,
   not a wash.
 
+> **Shipped, and both precisions are load-bearing rather than decorative.**
+> The first is enforced by ordering: validation runs on ①'s output against the
+> real tool's input schema, and a test calls a tool with an argument of the
+> wrong type twice — once with only a ⑦ relabel, which fails `-32602`, and
+> once with ① converting, which succeeds. The second is enforced by ③'s
+> signature: its arguments are `json_t *` on a `const` context and rewriting
+> them is documented as undefined, so the split is the only way to express
+> `forward()`.
+>
+> The per-user tool this section calls unimplementable without the per-channel
+> context is now implementable, and both halves are tested: ⑦ filters the
+> catalog on `maelys_mcp_channel_context()` and ① injects from the same
+> pointer. The audit amendment it confirms is tested as a negative — the
+> injected value reaches the provider and does **not** appear in the params ⑤
+> receives.
+
 ## Why hooks rather than one `call_next`
 
 An onion wrapper subsumes the flat hooks: it can rewrite arguments before
@@ -165,6 +205,14 @@ This loses one FastMCP pattern (retry-with-different-arguments inside a
 wrapper). That is the intended trade: the hooks are not expressiveness, they
 are **pinning points** where the runtime enforces an order no middleware can
 bypass.
+
+> **Shipped as specified.** ⑥ is the one hook that is a wrapper, and it is
+> deliberately confined to the *outbound* path, where there is no validation
+> ordering to defeat — it can never see or alter arguments. Its own ordering
+> obligation is the mirror image and is enforced rather than requested:
+> `complete` must reach the transport exactly once, and the runtime detects a
+> wrapper that swallows it and answers past the chain instead of letting the
+> request wedge.
 
 ## Ordering: policy sees the resolved identity
 
@@ -310,16 +358,42 @@ borrow the request-scoped contract.
   `resources/updated`. This is now in scope rather than a hole — see "Both
   directions" above — but it is the piece with the hardest contract, because
   it runs concurrently on a producer thread rather than on a request thread.
+
+  > **Still open, and now the only hook-shaped thing that is.** ⑥ shipped for
+  > the request-scoped path and deliberately did not grow to cover fanout: the
+  > two have different threading contracts, and the reason for keeping them
+  > separate types is in "Both directions" above. `wrap_sink` is
+  > request-scoped, so it has no sink to decorate when the frame belongs to no
+  > request.
 - **Nothing ties `tools/list_changed` to middleware state.** The trigger
   itself exists (`maelys_mcp_runtime_notify_tools_list_changed`, fired by
   provider events); what is missing is any way for a change in ⑦'s output, or
   in an upstream's live catalog, to fire it.
+
+  > **Still open, and ⑦ shipping does not close it.** ⑦ is consulted per
+  > listing, so its output can change between two listings with nothing to
+  > tell the client. A middleware that wants a client to re-list must arrange
+  > it through a provider event today.
 - **Result-schema validation versus ④.** `validate_provider_result` runs on the
   provider's result. A ④ that rewrites afterwards yields a result checked
   against no schema — or, if ⑦ rewrote the advertised `outputSchema`, against
   the wrong one. The runtime validates the real result against the real schema;
   keeping ⑦ and ④ consistent is the middleware author's responsibility and the
   runtime cannot check it.
+
+  > **Shipped as stated, and narrowed by one degree.** The provider's result
+  > is validated in full, `outputSchema` included, before ④ is consulted at
+  > all — so a provider breaking its own contract is caught whatever the chain
+  > does. A ④ replacement is then re-checked *structurally*: it must still be
+  > a result the runtime can serialize, and its content blocks still face the
+  > wire checks, so a middleware cannot smuggle an oversized or malformed
+  > block past validation. What is **not** re-checked is the output schema,
+  > because emitting a value the published schema no longer describes is what
+  > redaction is. The hole is therefore exactly as wide as this bullet says
+  > and no wider, and the real schema is handed to ④ so an author who does
+  > want to stay schema-valid can see what to satisfy. A test asserts both
+  > halves: a redaction that drops a required field is delivered, and a
+  > provider that drops the same field is refused.
 - **The resource path needs the same treatment, and this is a hard sequencing
   constraint, not a nicety.** *Three of the five* policy decision points are in
   `resources.c`. Because the chain **replaces** `authorize`/`audit`, shipping
@@ -399,6 +473,44 @@ half.
 > request thread with no runtime lock held, so the lock hierarchy in
 > `src/internal/internal.h` is unchanged; concurrency across channels is the
 > middleware's own to handle.
+
+> **Settled for the rest, and the four bullets are worth answering one by
+> one.**
+>
+> *Refcounts.* One rule across every hook: **borrowed in, owned-or-NULL out**.
+> Nothing on a hook context is owned by the hook; every out parameter is NULL
+> for "unchanged, zero copy" or transfers exactly one reference. The one
+> non-JSON case follows the same shape and is spelled out because C cannot
+> express it in a type: `maelys_mcp_resolution_t.tool_name` is `free()`d by
+> the runtime, so it must come from `strdup`. The table is in
+> `docs/middleware.md`.
+>
+> *Error taxonomy.* The three outcomes hold, and every transformation hook's
+> failure is the third one — a fault in the chain, never a statement about the
+> caller. Each maps to `-32603` with its own message, so a reader of a log can
+> tell which hook broke: `Request transformation failed` (①),
+> `Call substitution failed` or the hook's own text (③),
+> `Result transformation failed` (④), `Response sink wrapping failed` and
+> `Response was not delivered` (⑥), `Catalog transformation failed` (⑦). A
+> failure on the call path is journalled through ⑤ with
+> `MAELYS_MCP_ERR_STATE`.
+>
+> *Threads.* Unchanged, ⑥ included, which was the open question. A wrapper's
+> three functions run on the dispatching thread, in the same serialized
+> window as ①–⑤; the per-request wrapper chain lives on that thread's stack
+> frame and is never published anywhere another thread can reach. No lock is
+> taken and the hierarchy in `src/internal/internal.h` is untouched. The
+> middleware suite is now part of `make tsan` for exactly this reason, and one
+> of its cases drives two channels through one `wrap_sink` from two threads.
+>
+> *⑥'s own contract.* All four clauses shipped. `complete` forwarded exactly
+> once, **and the runtime detects the breach** rather than trusting it — a
+> swallowed completion is answered past the chain with `-32603`, a second one
+> is refused. `cancelled` passes through by default, as does everything else:
+> every member of `maelys_mcp_sink_wrapper_t` is optional and a NULL one
+> forwards untouched. Wrapping order is the reverse of ④'s, so the
+> first-registered middleware is the last to touch a frame before the
+> transport.
 
 ## Checked against the proxy ecosystem
 

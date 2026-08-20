@@ -59,6 +59,37 @@ static void audit_resource(
     maelys_mcp_chain_audit(runtime, &record);
 }
 
+/*
+ * Hook 7 for the two resource catalogs. Returns zero when the chain failed,
+ * and otherwise leaves *entries holding whatever the catalog is now - the
+ * original array, or a replacement the chain owns and this function has taken
+ * over.
+ */
+static int transform_catalog(
+    maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_module_request_t *request,
+    maelys_mcp_catalog_kind_t catalog,
+    json_t **entries) {
+    if (!maelys_mcp_chain_has_list(runtime)) return 1;
+    maelys_mcp_list_context_t context = {
+        .catalog = catalog,
+        .entries = *entries,
+        .params = request->params,
+        .protocol_version = request->protocol_version,
+        .client_name = request->client_name,
+        .channel = request->channel
+    };
+    json_t *transformed = NULL;
+    if (maelys_mcp_chain_list(runtime, &context, &transformed) != MAELYS_MCP_OK) {
+        return 0;
+    }
+    if (transformed) {
+        json_decref(*entries);
+        *entries = transformed;
+    }
+    return 1;
+}
+
 static int set_optional_string(json_t *object, const char *name, const char *value) {
     return !value || !*value || json_object_set_new(object, name, json_string(value)) == 0;
 }
@@ -108,7 +139,7 @@ static json_t *list_resources(
     }
     json_t *result = json_object();
     json_t *resources = json_array();
-    int policy_failed = 0;
+    const char *chain_failure = NULL;
     if (!result || !resources) goto failed;
     for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
         maelys_mcp_provider_t *provider = runtime->providers[provider_index];
@@ -118,13 +149,20 @@ static json_t *list_resources(
                 request, MAELYS_MCP_OPERATION_RESOURCE_LIST, resource->uri);
             /* Only a real deny hides a catalog entry; see list_tools. */
             if (decision == MAELYS_MCP_AUTHORIZE_ERROR) {
-                policy_failed = 1;
+                chain_failure = "Policy evaluation failed";
                 goto failed;
             }
             if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) continue;
             json_t *value = resource_as_json(resource);
             if (!value || json_array_append_new(resources, value) != 0) goto failed;
         }
+    }
+    /* Hook 7, on the resource catalog; see list_tools for what it may and may
+     * not undo. */
+    if (!transform_catalog(runtime, request, MAELYS_MCP_CATALOG_RESOURCES,
+        &resources)) {
+        chain_failure = "Catalog transformation failed";
+        goto failed;
     }
     if (json_object_set_new(result, "resources", resources) != 0) goto failed;
     resources = NULL;
@@ -137,7 +175,7 @@ failed:
     if (resources) json_decref(resources);
     if (result) json_decref(result);
     return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-        policy_failed ? "Policy evaluation failed" : "Internal error", NULL);
+        chain_failure ? chain_failure : "Internal error", NULL);
 }
 
 static json_t *list_templates(
@@ -149,7 +187,7 @@ static json_t *list_templates(
     }
     json_t *result = json_object();
     json_t *templates = json_array();
-    int policy_failed = 0;
+    const char *chain_failure = NULL;
     if (!result || !templates) goto failed;
     for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
         maelys_mcp_provider_t *provider = runtime->providers[provider_index];
@@ -160,13 +198,18 @@ static json_t *list_templates(
                 resource->uri_template);
             /* Only a real deny hides a catalog entry; see list_tools. */
             if (decision == MAELYS_MCP_AUTHORIZE_ERROR) {
-                policy_failed = 1;
+                chain_failure = "Policy evaluation failed";
                 goto failed;
             }
             if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) continue;
             json_t *value = template_as_json(resource);
             if (!value || json_array_append_new(templates, value) != 0) goto failed;
         }
+    }
+    if (!transform_catalog(runtime, request,
+        MAELYS_MCP_CATALOG_RESOURCE_TEMPLATES, &templates)) {
+        chain_failure = "Catalog transformation failed";
+        goto failed;
     }
     if (json_object_set_new(result, "resourceTemplates", templates) != 0) goto failed;
     templates = NULL;
@@ -179,7 +222,7 @@ failed:
     if (templates) json_decref(templates);
     if (result) json_decref(result);
     return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-        policy_failed ? "Policy evaluation failed" : "Internal error", NULL);
+        chain_failure ? chain_failure : "Internal error", NULL);
 }
 
 static maelys_mcp_provider_t *exact_provider(

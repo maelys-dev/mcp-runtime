@@ -22,9 +22,21 @@
   silently shortening a catalog. See `docs/middleware.md`.
 - Policy is decided before arguments are schema-validated, so a denied caller
   cannot map a tool's argument schema through validation error details.
+- Transformation is presentation, never privilege. A middleware may rename a
+  tool for clients (`on_list`) and map that name back (`on_resolve`), but
+  resolution runs *before* the decision, so `on_authorize` always sees the real
+  tool and its real effect. `on_list` runs *after* the decision, so a denied
+  catalog entry cannot be transformed back into view; an entry it invents has no
+  registry backing and a call to it still passes both hooks.
+- Arguments are validated against the real tool's input schema, on
+  `on_resolve`'s output - never against the schema `on_list` published. A
+  provider's result is validated against the real output schema before
+  `on_result` may rewrite it.
 - `tools/call` and `resources/read` are journalled through the chain's
-  `on_audit` hook, denials included, with both the requested and the resolved
-  identity.
+  `on_audit` hook, denials included and middleware faults with them, with both
+  the requested and the resolved identity. The journal carries the **client's**
+  params, not the resolved ones, so a value `on_resolve` injected - a hidden
+  credential is the canonical case - never reaches an audit sink.
 - The host retains the original stdout in a private `FD_CLOEXEC` descriptor and
   redirects process-wide stdout to stderr before provider or runtime initialization.
   Third-party `printf()` output therefore cannot contaminate MCP responses.

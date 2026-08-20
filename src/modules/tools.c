@@ -100,7 +100,7 @@ static json_t *list_tools(
     const maelys_mcp_module_request_t *request) {
     json_t *result = json_object();
     json_t *tools = json_array();
-    int policy_failed = 0;
+    const char *chain_failure = NULL;
     if (!result || !tools) goto failed;
     for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
         maelys_mcp_provider_t *provider = runtime->providers[provider_index];
@@ -114,7 +114,7 @@ static json_t *list_tools(
              * indistinguishable to the client, so only a real deny omits one.
              */
             if (decision == MAELYS_MCP_AUTHORIZE_ERROR) {
-                policy_failed = 1;
+                chain_failure = "Policy evaluation failed";
                 goto failed;
             }
             if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) continue;
@@ -124,6 +124,32 @@ static json_t *list_tools(
                 goto failed;
             }
             json_decref(value);
+        }
+    }
+    /*
+     * Hook 7, after hook 2 has filtered: a denied tool is already gone and
+     * cannot be transformed back into view, and what a middleware renames,
+     * reschemas or invents here is what the client is told exists. Calls to it
+     * come back through hook 1.
+     */
+    if (maelys_mcp_chain_has_list(runtime)) {
+        maelys_mcp_list_context_t list_context = {
+            .catalog = MAELYS_MCP_CATALOG_TOOLS,
+            .entries = tools,
+            .params = request->params,
+            .protocol_version = request->protocol_version,
+            .client_name = request->client_name,
+            .channel = request->channel
+        };
+        json_t *transformed = NULL;
+        if (maelys_mcp_chain_list(runtime, &list_context, &transformed) !=
+            MAELYS_MCP_OK) {
+            chain_failure = "Catalog transformation failed";
+            goto failed;
+        }
+        if (transformed) {
+            json_decref(tools);
+            tools = transformed;
         }
     }
     if (json_object_set(result, "tools", tools) != 0) goto failed;
@@ -137,7 +163,7 @@ failed:
     if (result) json_decref(result);
     if (tools) json_decref(tools);
     return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-        policy_failed ? "Policy evaluation failed" : "Internal error", NULL);
+        chain_failure ? chain_failure : "Internal error", NULL);
 }
 
 static json_t *text_content(const char *text) {
@@ -215,11 +241,22 @@ static json_t *provider_failure(
     return maelys_mcp_success_response(request->id, result);
 }
 
+/*
+ * `enforce_output_schema` is what separates the two callers. The provider's
+ * own result is checked in full, output schema included: a provider that
+ * breaks its declared contract is caught whatever the chain does. A hook 4
+ * replacement is checked for everything except that schema, because emitting
+ * a value the published schema no longer describes is what redaction *is* -
+ * see docs/middleware.md. It still has to be a result this runtime can
+ * serialize, and its content blocks still face the wire checks, so a middleware
+ * cannot smuggle an oversized or malformed block past validation.
+ */
 static maelys_mcp_result_t validate_provider_result(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_owned_tool_t *tool,
     const maelys_mcp_provider_result_t *result,
     json_t *client_capabilities,
+    int enforce_output_schema,
     json_t **out_required_capabilities,
     char **out_error) {
     if (result->type == MAELYS_MCP_PROVIDER_RESULT_INPUT_REQUIRED) {
@@ -264,7 +301,7 @@ static maelys_mcp_result_t validate_provider_result(
             result->content, runtime->max_message_bytes, out_error);
         if (status != MAELYS_MCP_OK) return status;
     }
-    if (tool->output_schema) {
+    if (tool->output_schema && enforce_output_schema) {
         if (!result->structured_content) {
             if (out_error) *out_error = maelys_mcp_strdup(
                 "tool with outputSchema requires structuredContent");
@@ -365,16 +402,67 @@ static json_t *call_tool(
             "Invalid tool call", NULL);
     }
     const char *requested_name = json_string_value(name);
-    maelys_mcp_owned_tool_t *tool = find_tool(runtime, requested_name);
-    if (!tool) return maelys_mcp_error_response(request->id,
-        JSONRPC_INVALID_PARAMS, "Unknown tool", NULL);
     /*
-     * Policy runs ahead of schema validation. That is a deliberate change of
-     * order from the pre-chain runtime, not an accident of the rewrite: a
-     * caller who may not use this tool must not be able to map its argument
-     * schema by reading validation error details. The cost is that hook 2
-     * sees params this runtime has not validated yet, which the public
-     * contract states.
+     * One owned reference for the arguments from here on, whether they came
+     * from the client, were absent, or were rewritten by hook 1. A call that
+     * carried none becomes an empty object before the chain sees it, so a hook
+     * injecting a value never has to special-case "no arguments at all".
+     */
+    json_t *effective_arguments = arguments ?
+        json_incref(arguments) : json_object();
+    if (!effective_arguments) {
+        return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
+            "Internal error", NULL);
+    }
+    /*
+     * Hook 1, before anything resolves. The registry is deliberately not
+     * consulted on the client's spelling first: a name hook 7 published, or
+     * one a proxy invented, has no registry entry of its own and would 404
+     * before the chain ever got the chance to map it.
+     */
+    const char *resolved_name = requested_name;
+    char *renamed = NULL;
+    if (maelys_mcp_chain_has_resolve(runtime)) {
+        maelys_mcp_resolve_context_t resolve_context = {
+            .operation = MAELYS_MCP_OPERATION_CALL,
+            .tool_name = requested_name,
+            .arguments = effective_arguments,
+            .params = params,
+            .protocol_version = request->protocol_version,
+            .client_name = request->client_name,
+            .channel = request->channel
+        };
+        json_t *rewritten = NULL;
+        if (maelys_mcp_chain_resolve(runtime, &resolve_context, &renamed,
+            &rewritten) != MAELYS_MCP_OK) {
+            json_decref(effective_arguments);
+            audit_tool(runtime, request, requested_name, NULL,
+                MAELYS_MCP_ERR_STATE);
+            return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
+                "Request transformation failed", NULL);
+        }
+        if (renamed) resolved_name = renamed;
+        if (rewritten) {
+            json_decref(effective_arguments);
+            effective_arguments = rewritten;
+        }
+    }
+    maelys_mcp_owned_tool_t *tool = find_tool(runtime, resolved_name);
+    if (!tool) {
+        json_decref(effective_arguments);
+        free(renamed);
+        return maelys_mcp_error_response(request->id,
+            JSONRPC_INVALID_PARAMS, "Unknown tool", NULL);
+    }
+    /*
+     * Policy runs on what hook 1 resolved, and ahead of schema validation.
+     * Both halves are deliberate. Deciding after resolution is what stops a
+     * rename being a privilege escalation - re-exposing an apply-effect tool
+     * under a gentler name must still be seen as an apply. Deciding before
+     * validation is the named reorder from the pre-chain runtime: a caller who
+     * may not use this tool must not be able to map its argument schema by
+     * reading validation error details. The cost is that hook 2 sees params
+     * this runtime has not validated yet, which the public contract states.
      */
     maelys_mcp_authorize_decision_t decision = authorize_tool(runtime, request,
         tool, MAELYS_MCP_OPERATION_CALL);
@@ -382,25 +470,28 @@ static json_t *call_tool(
         int failed = decision == MAELYS_MCP_AUTHORIZE_ERROR;
         audit_tool(runtime, request, requested_name, tool,
             failed ? MAELYS_MCP_ERR_STATE : MAELYS_MCP_ERR_DENIED);
+        json_decref(effective_arguments);
+        free(renamed);
         return failed ?
             maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
                 "Policy evaluation failed", NULL) :
             maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
                 "Policy denied", NULL);
     }
-    json_t *owned_arguments = NULL;
-    if (!arguments) {
-        owned_arguments = json_object();
-        arguments = owned_arguments;
-    }
     char *error = NULL;
+    /*
+     * Against the REAL tool's schema, never the one hook 7 published. That is
+     * why a transform changing an argument's type has to convert it in hook 1:
+     * relabelling it in the catalog alone makes every call fail here.
+     */
     maelys_mcp_result_t status = maelys_mcp_validate_schema(
-        tool->input_schema, arguments, &error);
+        tool->input_schema, effective_arguments, &error);
     if (status != MAELYS_MCP_OK) {
         json_t *data = json_pack("{s:s}", "detail",
             error ? error : "schema validation failed");
         free(error);
-        if (owned_arguments) json_decref(owned_arguments);
+        json_decref(effective_arguments);
+        free(renamed);
         json_t *response = maelys_mcp_error_response(request->id,
             JSONRPC_INVALID_PARAMS, "Invalid tool arguments", data);
         if (data) json_decref(data);
@@ -425,7 +516,7 @@ static json_t *call_tool(
     };
     maelys_mcp_provider_request_t provider_request = {
         .tool_name = tool->name,
-        .arguments = arguments,
+        .arguments = effective_arguments,
         .input_responses = input_responses,
         .request_state = request_state,
         .client_capabilities = client_capabilities,
@@ -434,14 +525,80 @@ static json_t *call_tool(
     };
     maelys_mcp_provider_result_t provider_result;
     maelys_mcp_provider_result_init(&provider_result);
-    status = tool->provider->call(tool->provider->context, &provider_request,
-        &provider_result, &error);
-    if (owned_arguments) json_decref(owned_arguments);
+    /*
+     * Hook 3: invoke or substitute. A substituting middleware stands in for
+     * the provider completely - the provider is not called, and the result it
+     * returns faces the same validation the provider's would have, output
+     * schema included, because a cache or a proxy answering in the provider's
+     * name answers to the provider's contract.
+     */
+    int substituted = 0;
+    if (maelys_mcp_chain_has_call(runtime)) {
+        maelys_mcp_call_context_t call_context = {
+            .tool_name = tool->name,
+            .requested_tool_name = requested_name,
+            .effect = tool->effect,
+            .arguments = effective_arguments,
+            .params = params,
+            .protocol_version = request->protocol_version,
+            .client_name = request->client_name,
+            .channel = request->channel
+        };
+        maelys_mcp_call_disposition_t disposition = maelys_mcp_chain_call(
+            runtime, &call_context, &provider_result, &error);
+        if (disposition == MAELYS_MCP_CALL_ERROR) {
+            audit_tool(runtime, request, requested_name, tool,
+                MAELYS_MCP_ERR_STATE);
+            maelys_mcp_provider_result_clear(&provider_result);
+            json_decref(effective_arguments);
+            free(renamed);
+            json_t *response = maelys_mcp_error_response(request->id,
+                JSONRPC_INTERNAL_ERROR,
+                error ? error : "Call substitution failed", NULL);
+            free(error);
+            return response;
+        }
+        substituted = disposition == MAELYS_MCP_CALL_SUBSTITUTE;
+    }
+    status = substituted ? MAELYS_MCP_OK :
+        tool->provider->call(tool->provider->context, &provider_request,
+            &provider_result, &error);
     json_t *required_capabilities = NULL;
     if (status == MAELYS_MCP_OK) {
         status = validate_provider_result(runtime, tool, &provider_result,
-            client_capabilities, &required_capabilities, &error);
+            client_capabilities, 1, &required_capabilities, &error);
     }
+    /*
+     * Hook 4, on a result that has already been checked against the real
+     * schema. A replacement is re-checked structurally but not against that
+     * schema; see validate_provider_result.
+     */
+    if (status == MAELYS_MCP_OK && !required_capabilities &&
+        maelys_mcp_chain_has_result(runtime)) {
+        maelys_mcp_result_context_t result_context = {
+            .tool_name = tool->name,
+            .requested_tool_name = requested_name,
+            .effect = tool->effect,
+            .arguments = effective_arguments,
+            .params = params,
+            .protocol_version = request->protocol_version,
+            .client_name = request->client_name,
+            .channel = request->channel,
+            .result = &provider_result,
+            .output_schema = tool->output_schema
+        };
+        maelys_mcp_result_disposition_t disposition = maelys_mcp_chain_result(
+            runtime, &result_context, &provider_result, &error);
+        if (disposition == MAELYS_MCP_RESULT_ERROR) {
+            status = MAELYS_MCP_ERR_STATE;
+            if (!error) error = maelys_mcp_strdup("Result transformation failed");
+        } else if (disposition == MAELYS_MCP_RESULT_REPLACED) {
+            status = validate_provider_result(runtime, tool, &provider_result,
+                client_capabilities, 0, &required_capabilities, &error);
+        }
+    }
+    json_decref(effective_arguments);
+    free(renamed);
     audit_tool(runtime, request, requested_name, tool, status);
     json_t *response;
     if (required_capabilities) {

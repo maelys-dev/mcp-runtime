@@ -293,6 +293,25 @@ maelys_mcp_response_sink_t maelys_mcp_channel_outbox_sink(
     return sink;
 }
 
+/*
+ * The response a request gets when hook 6 fails, or when a wrapper accepted
+ * the final response and never passed it on. Sent through the real sink, past
+ * the wrappers: the chain has just demonstrated it cannot be trusted with this
+ * request's output, and a client waiting forever is a worse failure than a
+ * blunt internal error.
+ */
+static maelys_mcp_result_t answer_past_the_chain(
+    const maelys_mcp_response_sink_t *base,
+    json_t *id,
+    const char *message) {
+    json_t *response = maelys_mcp_error_response(id, JSONRPC_INTERNAL_ERROR,
+        message, NULL);
+    if (!response) return MAELYS_MCP_ERR_MEMORY;
+    maelys_mcp_result_t status = base->complete(base->context, response);
+    if (status != MAELYS_MCP_OK) json_decref(response);
+    return status;
+}
+
 maelys_mcp_result_t maelys_mcp_channel_handle_with_sink(
     maelys_mcp_channel_t *channel,
     json_t *request,
@@ -302,12 +321,59 @@ maelys_mcp_result_t maelys_mcp_channel_handle_with_sink(
     }
     maelys_mcp_result_t status = begin_operation(channel);
     if (status != MAELYS_MCP_OK) return status;
-    json_t *activate_id = NULL;
-    json_t *response = maelys_mcp_runtime_dispatch(channel, request, sink, &activate_id);
-    if (response) {
-        status = sink->complete(sink->context, response);
-        if (status != MAELYS_MCP_OK) json_decref(response);
+    /*
+     * Hook 6 is established before dispatch and torn down after it, so every
+     * frame this request produces - the request-scoped notifications a module
+     * emits while it runs, and the single response that follows them - travels
+     * the same decorated path, in that order. The runtime never completes
+     * before dispatch has returned, which is what makes "progress ahead of the
+     * response" survive wrapping rather than depend on it.
+     */
+    maelys_mcp_sink_chain_t chain;
+    const maelys_mcp_response_sink_t *effective = sink;
+    int wrapped = maelys_mcp_chain_has_wrap_sink(channel->runtime);
+    if (wrapped) {
+        maelys_mcp_wrap_sink_context_t wrap_request = {
+            .channel = channel,
+            .request = request
+        };
+        maelys_mcp_result_t wrap_status = maelys_mcp_chain_wrap_sink(
+            channel->runtime, &wrap_request, sink, &chain, &effective);
+        if (wrap_status != MAELYS_MCP_OK) {
+            json_t *id = json_is_object(request) ?
+                json_object_get(request, "id") : NULL;
+            status = id ? answer_past_the_chain(sink, id,
+                "Response sink wrapping failed") : MAELYS_MCP_OK;
+            maelys_mcp_channel_release_operation(channel);
+            return status;
+        }
     }
+    json_t *activate_id = NULL;
+    json_t *response = maelys_mcp_runtime_dispatch(channel, request, effective,
+        &activate_id);
+    if (response) {
+        /*
+         * Held across the completion on purpose: on success the response is no
+         * longer ours, and a wrapper that swallowed it may already have
+         * released it, so the id has to survive independently of both.
+         */
+        json_t *id = json_incref(json_object_get(response, "id"));
+        status = effective->complete(effective->context, response);
+        if (status != MAELYS_MCP_OK) {
+            json_decref(response);
+        } else if (wrapped && maelys_mcp_chain_sink_completions(&chain) == 0u) {
+            /*
+             * A wrapper reported success and delivered nothing. Left alone
+             * that wedges this request id for the life of the connection, so
+             * the runtime answers it itself rather than trusting the contract
+             * it just watched being broken.
+             */
+            status = answer_past_the_chain(sink, id,
+                "Response was not delivered");
+        }
+        json_decref(id);
+    }
+    if (wrapped) maelys_mcp_chain_release_sink(&chain);
     if (activate_id) {
         if (status == MAELYS_MCP_OK) {
             maelys_mcp_activate_subscription(channel, activate_id);
