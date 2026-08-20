@@ -573,11 +573,16 @@ static json_t *call_tool(
         substituted = disposition == MAELYS_MCP_CALL_SUBSTITUTE;
     }
     /*
-     * The nested-MRTR leg. It is offered only when something other than this
-     * thread is still reading the connection (request->nestable) - otherwise
-     * a provider that opened a client request would be waiting for a reply
-     * that only this thread could have read. A provider handed a NULL relay
-     * falls back to the resumable input_required result.
+     * The nested-MRTR leg. It is offered only on a legacy-era channel
+     * (!request->modern): the 2026-07-28 profile forbids separate
+     * server-to-client JSON-RPC requests and mandates the resumable
+     * input_required result instead, so a modern caller must never receive
+     * one no matter what its _meta capabilities declare. It further requires
+     * that something other than this thread is still reading the connection
+     * (request->nestable) - otherwise a provider that opened a client
+     * request would be waiting for a reply that only this thread could have
+     * read. A provider handed a NULL relay falls back to the resumable
+     * input_required result.
      */
     maelys_mcp_nested_relay_t relay = {
         .channel = request->channel,
@@ -585,7 +590,8 @@ static json_t *call_tool(
         .outer_id = request->id,
         .client_capabilities = client_capabilities
     };
-    maelys_mcp_nested_relay_t *nested = request->nestable && request->sink &&
+    maelys_mcp_nested_relay_t *nested = !request->modern &&
+        request->nestable && request->sink &&
         request->sink->emit ? &relay : NULL;
     status = substituted ? MAELYS_MCP_OK :
         (tool->provider->call_nested ?

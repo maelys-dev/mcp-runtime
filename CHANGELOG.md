@@ -1,6 +1,25 @@
 # Changelog
 
-## 0.15.0 - 2026-08-20
+## Unreleased
+
+- **All three provider SDKs can now ask the client a question mid-call.** A
+  provider built on the C, TypeScript or Python SDK gets the same nested
+  request surface the in-process API gained in 0.15.0: a blocking helper
+  (C: `maelys_mcp_provider_sdk_request_client`; TS:
+  `context.requestElicitation`/`requestSampling`/`requestRoots`; Python:
+  `context.request_elicitation`/`request_sampling`/`request_roots`) that
+  sends `provider/nestedRequest` and returns the client's answer, with the
+  host's refusal vocabulary mapped onto each language's native error shape.
+  Each SDK was proven end to end against the real `maelys-mcp` binary over
+  actual stdio.
+- **A provider that never nests is byte-identical on the wire to before —
+  and keeps working against older hosts.** The SDKs declare
+  `maelys-provider/4` until the first nested request actually goes out, then
+  `/5` from that frame onward, never lowered. An unconditional `/5` would
+  have been rejected by 0.13/0.14 hosts, whose version check predates
+  0.15.0's floor-to-current range acceptance. Byte-identity was verified by
+  diffing scripted sessions against the previous SDKs, in all three
+  languages.
 
 - **Tools can now ask the user a question in the middle of a call, and older
   MCP clients understand the question.** A provider handling `tools/call` or

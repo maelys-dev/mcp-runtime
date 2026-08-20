@@ -744,8 +744,47 @@ static int two_calls_dispatch_concurrently_on_one_channel(void) {
     return 0;
 }
 
+static int a_modern_call_never_receives_a_nested_request(void) {
+    /*
+     * The 2026-07-28 profile forbids separate server-to-client JSON-RPC
+     * requests: a modern caller gets the resumable input_required result, no
+     * matter what capabilities its _meta declares. So the same provider that
+     * nests on a legacy session (nested_happy_path) must NOT produce a
+     * server-to-client frame here - the first thing the client hears back
+     * must be its own call's response.
+     */
+    fake_client_t client;
+    ASSERT_TRUE(client_start(&client, nested_provider_path, 5000u) == 0);
+    /* No initialize: modern sessions are stateless, era rides in _meta. */
+    json_t *call = json_pack(
+        "{s:s,s:i,s:s,s:{s:s,s:{},s:{s:s,s:{s:s,s:s},s:{s:{}}}}}",
+        "jsonrpc", "2.0", "id", 2, "method", "tools/call",
+        "params", "name", "nested.ask", "arguments",
+        "_meta",
+        "io.modelcontextprotocol/protocolVersion", MAELYS_MCP_PROTOCOL_MODERN,
+        "io.modelcontextprotocol/clientInfo",
+            "name", "nested-test", "version", "1",
+        "io.modelcontextprotocol/clientCapabilities", "elicitation");
+    ASSERT_TRUE(call != NULL);
+    ASSERT_TRUE(client_send(&client, call) == 0);
+
+    json_t *frame = client_next(&client, 4000u);
+    ASSERT_TRUE(frame != NULL);
+    /* The response, not a request: it carries the call's own id and no
+     * method. A nested elicitation/create arriving first is the exact
+     * conformance breach this test pins. */
+    ASSERT_TRUE(json_object_get(frame, "method") == NULL);
+    ASSERT_TRUE(json_is_integer(json_object_get(frame, "id")));
+    ASSERT_TRUE(json_integer_value(json_object_get(frame, "id")) == 2);
+    json_decref(frame);
+    ASSERT_TRUE(client_stop(&client) == MAELYS_MCP_OK);
+    return 0;
+}
+
 static const maelys_test_case_t cases[] = {
     {"nested happy path", nested_happy_path},
+    {"a modern call never receives a nested request",
+        a_modern_call_never_receives_a_nested_request},
     {"nested reply travels with its call", nested_reply_travels_with_the_call},
     {"nested request times out", nested_request_times_out},
     {"cancelling the outer call reaches the nested wait",
