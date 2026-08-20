@@ -27,6 +27,7 @@ static const char *nested_provider_path;
 static const char *double_provider_path;
 static const char *dying_provider_path;
 static const char *legacy4_provider_path;
+static const char *sdk_nested_provider_path;
 
 static long long milliseconds(void) {
     struct timespec now;
@@ -454,6 +455,67 @@ static int a_version_four_provider_still_works(void) {
     return 0;
 }
 
+/*
+ * Phase B end-to-end proof: the same happy-path and undeclared-capability
+ * shapes as above, but against a provider built ON the public C SDK
+ * (tests/helpers/sdk_nested_provider.c, maelys_mcp_provider_sdk_request_client)
+ * rather than adversarial_provider.c's hand-rolled JSON. Nothing about the
+ * host side changes between these and the pair above - same runtime, same
+ * process_provider.c relay, same mrtr capability check - so any difference
+ * in outcome would be the SDK's blocking helper, not the host.
+ */
+
+static int sdk_provider_nested_happy_path(void) {
+    fake_client_t client;
+    ASSERT_TRUE(client_start(&client, sdk_nested_provider_path, 5000u) == 0);
+    ASSERT_TRUE(client_handshake(&client, "elicitation") == 0);
+    ASSERT_TRUE(client_send(&client, call_request(2, "nested.ask")) == 0);
+
+    json_t *nested = client_next(&client, 4000u);
+    ASSERT_TRUE(nested != NULL);
+    ASSERT_TRUE(json_is_string(json_object_get(nested, "id")));
+    ASSERT_TRUE(strncmp(json_string_value(json_object_get(nested, "id")),
+        MAELYS_MCP_NESTED_ID_PREFIX, strlen(MAELYS_MCP_NESTED_ID_PREFIX)) == 0);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(nested, "method")),
+        "elicitation/create") == 0);
+    ASSERT_TRUE(json_is_object(json_object_get(nested, "params")));
+
+    json_t *reply = json_pack("{s:s,s:O,s:{s:s}}", "jsonrpc", "2.0",
+        "id", json_object_get(nested, "id"), "result", "answer", "yes");
+    json_decref(nested);
+    ASSERT_TRUE(client_send(&client, reply) == 0);
+
+    json_t *response = client_next_with_id(&client, 2, 4000u);
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(!result_is_error(response));
+    const char *text = result_text(response);
+    ASSERT_TRUE(text && strcmp(text, "yes") == 0);
+    json_decref(response);
+    ASSERT_TRUE(client_stop(&client) == MAELYS_MCP_OK);
+    return 0;
+}
+
+static int sdk_provider_undeclared_capability_is_refused(void) {
+    fake_client_t client;
+    ASSERT_TRUE(client_start(&client, sdk_nested_provider_path, 5000u) == 0);
+    /* No elicitation capability declared at initialize. */
+    ASSERT_TRUE(client_handshake(&client, NULL) == 0);
+    ASSERT_TRUE(client_send(&client, call_request(2, "nested.ask")) == 0);
+    json_t *frame = client_next(&client, 4000u);
+    ASSERT_TRUE(frame != NULL);
+    /* The very first frame back is the response, not an elicitation request:
+     * nothing was sent to a client that never offered the surface, and the
+     * SDK surfaced the host's `denied` refusal cleanly rather than hanging or
+     * faulting the transport. */
+    ASSERT_TRUE(json_is_integer(json_object_get(frame, "id")));
+    ASSERT_TRUE(json_integer_value(json_object_get(frame, "id")) == 2);
+    const char *text = result_text(frame);
+    ASSERT_TRUE(text && strcmp(text, "error:denied") == 0);
+    json_decref(frame);
+    ASSERT_TRUE(client_stop(&client) == MAELYS_MCP_OK);
+    return 0;
+}
+
 /* ------------------------------------------- channel-level lifecycle hazards
  * These drive maelys_mcp_channel_accept directly rather than through stdio,
  * because they need to do something to the channel - abort it, or run two
@@ -694,6 +756,10 @@ static const maelys_test_case_t cases[] = {
     {"an undeclared capability is refused before it is sent",
         an_undeclared_capability_is_refused_before_it_is_sent},
     {"a version four provider still works", a_version_four_provider_still_works},
+    {"a C SDK provider completes a real nested round trip",
+        sdk_provider_nested_happy_path},
+    {"a C SDK provider surfaces the host's undeclared-capability denial",
+        sdk_provider_undeclared_capability_is_refused},
     {"aborting a channel settles its nested waits",
         aborting_a_channel_settles_its_nested_waits},
     {"two calls dispatch concurrently on one channel",
@@ -701,14 +767,16 @@ static const maelys_test_case_t cases[] = {
 };
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s <nested> <double> <dying> <legacy4>\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr, "usage: %s <nested> <double> <dying> <legacy4> <sdk-nested>\n",
+            argv[0]);
         return 1;
     }
     nested_provider_path = argv[1];
     double_provider_path = argv[2];
     dying_provider_path = argv[3];
     legacy4_provider_path = argv[4];
+    sdk_nested_provider_path = argv[5];
     int failures = maelys_run_tests(cases, sizeof(cases) / sizeof(cases[0]));
     fprintf(stderr, "test_nested_requests: %s\n", failures ? "FAILED" : "OK");
     return failures;

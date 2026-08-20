@@ -96,6 +96,50 @@ maelys_mcp_result_t maelys_mcp_provider_sdk_emit_event(
     maelys_mcp_provider_sdk_t *sdk,
     const maelys_mcp_provider_event_t *event);
 
+/*
+ * Opens one request back at the client in the middle of the call currently
+ * being handled and blocks until the client answers - MCP's older, nested
+ * multi-round-trip pattern (docs/provider-protocol.md, `maelys-provider/5`),
+ * the counterpart of the `input_required` result rather than a replacement
+ * for it. Must be called only from inside a `call`/`read_resource` callback,
+ * on the thread serve() is running on: the SDK's serve loop is single
+ * threaded, so this is a plain blocking call, not a handoff to a second
+ * thread, and the host guarantees the correlated reply is the next thing on
+ * the wire.
+ *
+ * `method` must be one of "elicitation/create", "sampling/createMessage" or
+ * "roots/list"; anything else - and any method whose capability the client
+ * never declared - is refused by the host with `denied` before a byte
+ * reaches the client, which this surfaces as MAELYS_MCP_ERR_DENIED. `params`
+ * is borrowed and may be NULL. On MAELYS_MCP_OK, `*out_result` holds the
+ * client's result, owned by the caller.
+ *
+ * On failure `*out_error` is set (malloc-owned) and the result mirrors the
+ * host's wire codes: MAELYS_MCP_ERR_DENIED ("denied"), MAELYS_MCP_ERR_TIMEOUT
+ * ("timeout"), MAELYS_MCP_ERR_CLOSED ("cancelled" - the outer call was
+ * cancelled, or the connection went away), MAELYS_MCP_ERR_STATE
+ * ("unavailable" - this call cannot nest), or MAELYS_MCP_ERR_PROVIDER for
+ * everything else, including "client_error" (a JSON-RPC error from the
+ * client, which travels back in `*out_result`, mirroring the in-process
+ * maelys_mcp_provider_request_client contract) and "failed". A malformed or
+ * out-of-order reply from the host is reported as MAELYS_MCP_ERR_PROTOCOL.
+ *
+ * Only one nested request may be outstanding per call, matching the wire's
+ * own single-outstanding rule; calling this again before the first returns
+ * fails with MAELYS_MCP_ERR_STATE rather than corrupting the connection.
+ *
+ * Declaring `maelys-provider/5` is unconditional in every SDK response
+ * regardless of whether a provider ever calls this - a /5 provider that never
+ * nests behaves exactly as a /4 one did, so no opt-in flag is needed to keep
+ * that behavior unchanged.
+ */
+maelys_mcp_result_t maelys_mcp_provider_sdk_request_client(
+    maelys_mcp_provider_sdk_t *sdk,
+    const char *method,
+    json_t *params,
+    json_t **out_result,
+    char **out_error);
+
 #ifdef __cplusplus
 }
 #endif

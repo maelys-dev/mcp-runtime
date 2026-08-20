@@ -3,6 +3,7 @@
 #include "src/internal/internal.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -20,10 +21,32 @@ struct maelys_mcp_provider_sdk {
     pthread_cond_t events_idle;
     int state_mutex_initialized;
     int events_idle_initialized;
+    /*
+     * Set once serve()'s reader exists, borrowed from its stack frame for the
+     * duration of the loop. maelys_mcp_provider_sdk_request_client reuses it
+     * rather than opening a second reader on the same fd: the serve loop and
+     * a call it dispatched run on the same thread, so there is only ever one
+     * reader of this connection at a time, and it must stay one buffer so a
+     * reply that arrives back-to-back with whatever the host sends next is
+     * never split across two.
+     */
+    maelys_mcp_line_reader_t *reader;
+    int input_fd;
+    /* Guards against a provider calling the nested-request helper again
+     * before the first call returned, which would corrupt the wire's own
+     * single-outstanding rule rather than just this SDK's bookkeeping. */
+    int nested_inflight;
+    unsigned long long nested_sequence;
 };
 
 static int set_optional_string(json_t *object, const char *name, const char *value) {
     return !value || !*value || json_object_set_new(object, name, json_string(value)) == 0;
+}
+
+static void replace_error(char **out_error, const char *message) {
+    if (!out_error) return;
+    free(*out_error);
+    *out_error = maelys_mcp_strdup(message ? message : "nested request failed");
 }
 
 static json_t *tool_description(const maelys_mcp_tool_t *tool) {
@@ -572,6 +595,168 @@ memory_error:
     return MAELYS_MCP_ERR_MEMORY;
 }
 
+/*
+ * The host's own nested_error_code (src/provider/process_provider.c) run in
+ * reverse: that function is the host turning a result of the client round
+ * trip into the wire string this SDK now has to read back. "client_error" is
+ * folded into MAELYS_MCP_ERR_PROVIDER on purpose, mirroring the in-process
+ * maelys_mcp_provider_request_client contract, where a JSON-RPC error from
+ * the client is reported the same way - the error object itself travels in
+ * `*out_result` rather than in the status code either way.
+ */
+static maelys_mcp_result_t nested_error_status(const json_t *code) {
+    if (maelys_mcp_json_string_equals(code, "denied")) return MAELYS_MCP_ERR_DENIED;
+    if (maelys_mcp_json_string_equals(code, "timeout")) return MAELYS_MCP_ERR_TIMEOUT;
+    if (maelys_mcp_json_string_equals(code, "cancelled")) return MAELYS_MCP_ERR_CLOSED;
+    if (maelys_mcp_json_string_equals(code, "unavailable")) return MAELYS_MCP_ERR_STATE;
+    return MAELYS_MCP_ERR_PROVIDER;
+}
+
+/*
+ * json_object_set_new consumes its value whether it succeeds or fails, so
+ * every handover below stops owning the value on the same line it is handed
+ * over - the same discipline nested_reply_message
+ * (src/provider/process_provider.c) uses for the frame going the other way.
+ */
+static json_t *nested_request_message(const char *nested_id, const char *method, json_t *params) {
+    json_t *inner = json_object();
+    json_t *message = json_object();
+    if (!inner || !message) goto failed;
+    if (json_object_set_new(inner, "nestedId", json_string(nested_id)) != 0 ||
+        json_object_set_new(inner, "method", json_string(method)) != 0 ||
+        (params && json_object_set(inner, "params", params) != 0)) {
+        goto failed;
+    }
+    if (json_object_set_new(message, "protocol",
+            json_string(MAELYS_MCP_PROVIDER_PROTOCOL)) != 0 ||
+        json_object_set_new(message, "method",
+            json_string("provider/nestedRequest")) != 0) {
+        goto failed;
+    }
+    int attached = json_object_set_new(message, "params", inner) == 0;
+    inner = NULL;
+    if (!attached) goto failed;
+    return message;
+failed:
+    if (inner) json_decref(inner);
+    if (message) json_decref(message);
+    return NULL;
+}
+
+maelys_mcp_result_t maelys_mcp_provider_sdk_request_client(
+    maelys_mcp_provider_sdk_t *sdk,
+    const char *method,
+    json_t *params,
+    json_t **out_result,
+    char **out_error) {
+    if (!sdk || !method || !*method || !out_result) return MAELYS_MCP_ERR_ARGUMENT;
+    *out_result = NULL;
+    if (!sdk->reader || sdk->input_fd < 0) {
+        replace_error(out_error, "the SDK is not serving a connection to nest a request on");
+        return MAELYS_MCP_ERR_STATE;
+    }
+    pthread_mutex_lock(&sdk->state_mutex);
+    if (sdk->nested_inflight) {
+        pthread_mutex_unlock(&sdk->state_mutex);
+        replace_error(out_error, "a nested client request is already outstanding");
+        return MAELYS_MCP_ERR_STATE;
+    }
+    sdk->nested_inflight = 1;
+    unsigned long long sequence = ++sdk->nested_sequence;
+    pthread_mutex_unlock(&sdk->state_mutex);
+
+    char nested_id[32];
+    (void)snprintf(nested_id, sizeof(nested_id), "sdk-%llu", sequence);
+    json_t *request = nested_request_message(nested_id, method, params);
+    maelys_mcp_result_t status;
+    if (!request) {
+        replace_error(out_error, "cannot build the nested request");
+        status = MAELYS_MCP_ERR_MEMORY;
+        goto done;
+    }
+    status = write_message(sdk, request);
+    json_decref(request);
+    if (status != MAELYS_MCP_OK) {
+        replace_error(out_error, "cannot write the nested request to the host");
+        goto done;
+    }
+
+    /*
+     * The wire is strictly single-outstanding: the host does not touch this
+     * connection's exchange for any other purpose while it owes this reply,
+     * so the next line read here is guaranteed - by the protocol, not by this
+     * loop - to be the correlated provider/nestedReply. Anything else is the
+     * host breaking that contract, reported as a malformed reply rather than
+     * retried or ignored.
+     */
+    for (;;) {
+        json_t *message = NULL;
+        char *read_error = NULL;
+        maelys_mcp_result_t read_status = maelys_mcp_line_reader_read(
+            sdk->reader, sdk->input_fd, &message, &read_error);
+        if (read_status == MAELYS_MCP_ERR_NOT_FOUND) {
+            free(read_error);
+            replace_error(out_error,
+                "the host closed the connection while a nested request was outstanding");
+            status = MAELYS_MCP_ERR_IO;
+            break;
+        }
+        if (read_status != MAELYS_MCP_OK) {
+            replace_error(out_error, read_error ? read_error :
+                "cannot read the nested reply from the host");
+            free(read_error);
+            status = MAELYS_MCP_ERR_PROTOCOL;
+            break;
+        }
+        free(read_error);
+        json_t *reply_params = json_is_object(message) ?
+            json_object_get(message, "params") : NULL;
+        int shaped = json_is_object(message) &&
+            maelys_mcp_json_string_equals(
+                json_object_get(message, "method"), "provider/nestedReply") &&
+            json_is_object(reply_params);
+        json_t *reply_id = shaped ? json_object_get(reply_params, "nestedId") : NULL;
+        shaped = shaped && json_is_string(reply_id) &&
+            strcmp(json_string_value(reply_id), nested_id) == 0;
+        json_t *result = shaped ? json_object_get(reply_params, "result") : NULL;
+        json_t *error = shaped ? json_object_get(reply_params, "error") : NULL;
+        shaped = shaped && (!!result != !!error) && (!error || json_is_object(error));
+        if (!shaped) {
+            json_decref(message);
+            replace_error(out_error, "the host sent a malformed nested reply");
+            status = MAELYS_MCP_ERR_PROTOCOL;
+            break;
+        }
+        if (result) {
+            *out_result = json_deep_copy(result);
+            json_decref(message);
+            status = *out_result ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+            if (status != MAELYS_MCP_OK) {
+                replace_error(out_error, "cannot copy the client's nested result");
+            }
+            break;
+        }
+        json_t *code = json_object_get(error, "code");
+        json_t *error_message = json_object_get(error, "message");
+        json_t *data = json_object_get(error, "data");
+        status = nested_error_status(code);
+        replace_error(out_error, json_is_string(error_message) &&
+            !maelys_mcp_json_string_has_nul(error_message) ?
+            json_string_value(error_message) : "nested request failed");
+        /* The client's own JSON-RPC error, carried on "client_error" so a
+         * provider can tell "the user declined" from "the request never got
+         * there" - mirroring maelys_mcp_provider_request_client. */
+        if (data) *out_result = json_deep_copy(data);
+        json_decref(message);
+        break;
+    }
+done:
+    pthread_mutex_lock(&sdk->state_mutex);
+    sdk->nested_inflight = 0;
+    pthread_mutex_unlock(&sdk->state_mutex);
+    return status;
+}
+
 maelys_mcp_result_t maelys_mcp_provider_sdk_serve(
     const maelys_mcp_provider_sdk_config_t *config,
     const maelys_mcp_provider_sdk_options_t *options) {
@@ -614,6 +799,11 @@ maelys_mcp_result_t maelys_mcp_provider_sdk_serve(
         &reader, options && options->max_message_bytes ?
             options->max_message_bytes : MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES);
     if (status != MAELYS_MCP_OK) goto done;
+    /* Published only once the reader is live, so a callback invoked before
+     * this point (there is none today, but nothing stops one being added)
+     * sees a NULL reader rather than a half-initialized one. */
+    sdk.reader = &reader;
+    sdk.input_fd = input_fd;
     for (;;) {
         pthread_mutex_lock(&sdk.state_mutex);
         int shutting_down = sdk.shutting_down;

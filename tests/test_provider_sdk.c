@@ -116,6 +116,22 @@ static maelys_mcp_result_t call_tool(
         out_result->structured_content = json_pack("{s:b}", "started", 1);
         return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
     }
+    if (strcmp(request->tool_name, "sdk.nested") == 0) {
+        json_t *method = json_object_get(request->arguments, "method");
+        json_t *inner = json_object_get(request->arguments, "params");
+        json_t *client_result = NULL;
+        char *nested_error = NULL;
+        maelys_mcp_result_t nested_status = maelys_mcp_provider_sdk_request_client(
+            sdk, json_is_string(method) ? json_string_value(method) : "elicitation/create",
+            inner, &client_result, &nested_error);
+        out_result->type = MAELYS_MCP_PROVIDER_RESULT_COMPLETE;
+        out_result->structured_content = json_pack("{s:i,s:s,s:o}",
+            "status", (int)nested_status,
+            "error", nested_error ? nested_error : "",
+            "result", client_result ? client_result : json_null());
+        free(nested_error);
+        return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+    }
     if (strcmp(request->tool_name, "sdk.shutdown-race") == 0) {
         fixture->sdk = sdk;
         if (pthread_create(&fixture->late_producer_thread, NULL, late_producer_main, fixture) != 0) {
@@ -206,6 +222,13 @@ static void *serve_main(void *opaque) {
             .description = "Attempts an event after shutdown begins.",
             .input_schema = fixture->resource_schema,
             .effect = MAELYS_MCP_EFFECT_EXECUTE
+        },
+        {
+            .name = "sdk.nested",
+            .title = "Nested request",
+            .description = "Opens a nested client request and reports what came back.",
+            .input_schema = fixture->resource_schema,
+            .effect = MAELYS_MCP_EFFECT_READ
         }
     };
     const maelys_mcp_resource_t resources[] = {
@@ -353,6 +376,123 @@ static int test_invalid_catalog_descriptors(void) {
     return 0;
 }
 
+/* ------------------------------------------------------- nested requests
+ * maelys_mcp_provider_sdk_request_client, driven end to end over the same
+ * socketpair the rest of this file uses: the SDK writes a real
+ * provider/nestedRequest and these helpers play the host on the other end,
+ * answering (or refusing, or misbehaving) on the same connection the call
+ * arrived on - exactly the shape docs/provider-protocol.md describes.
+ */
+
+static json_t *nested_reply_success(const char *nested_id, const char *answer) {
+    return json_pack("{s:s,s:s,s:{s:s,s:{s:s}}}",
+        "protocol", MAELYS_MCP_PROVIDER_PROTOCOL,
+        "method", "provider/nestedReply",
+        "params", "nestedId", nested_id, "result", "answer", answer);
+}
+
+static json_t *nested_reply_error(const char *nested_id, const char *code, const char *message) {
+    return json_pack("{s:s,s:s,s:{s:s,s:{s:s,s:s}}}",
+        "protocol", MAELYS_MCP_PROVIDER_PROTOCOL,
+        "method", "provider/nestedReply",
+        "params", "nestedId", nested_id, "error", "code", code, "message", message);
+}
+
+/* Reads the provider/nestedRequest the SDK just wrote, checks its envelope
+ * and requested method, and copies the nestedId the reply must echo. */
+static int read_nested_request(FILE *reader, const char *expected_method, char *out_id, size_t out_size) {
+    json_t *request = read_json_line(reader);
+    ASSERT_TRUE(json_is_object(request));
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(request, "protocol")),
+        MAELYS_MCP_PROVIDER_PROTOCOL) == 0);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(request, "method")),
+        "provider/nestedRequest") == 0);
+    json_t *params = json_object_get(request, "params");
+    ASSERT_TRUE(json_is_object(params));
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(params, "method")), expected_method) == 0);
+    json_t *id = json_object_get(params, "nestedId");
+    ASSERT_TRUE(json_is_string(id));
+    (void)snprintf(out_id, out_size, "%s", json_string_value(id));
+    json_decref(request);
+    return 0;
+}
+
+/* Happy path: the client answers, the helper returns the client's result
+ * inside the tool's own response. */
+static int nested_round_trip(int fd, FILE *reader, unsigned long id,
+    const char *method, const char *prompt) {
+    ASSERT_TRUE(send_request(fd, id, "provider/call",
+        json_pack("{s:s,s:{s:s,s:{s:s}}}", "name", "sdk.nested", "arguments",
+            "method", method, "params", "message", prompt)));
+    char nested_id[64];
+    ASSERT_TRUE(read_nested_request(reader, method, nested_id, sizeof(nested_id)) == 0);
+
+    json_t *reply = nested_reply_success(nested_id, "yes");
+    ASSERT_TRUE(reply != NULL);
+    ASSERT_TRUE(write_json_line(fd, reply));
+    json_decref(reply);
+
+    json_t *response = read_json_line(reader);
+    ASSERT_TRUE(json_is_object(response));
+    json_t *structured = json_object_get(json_object_get(response, "result"), "structuredContent");
+    ASSERT_TRUE(json_integer_value(json_object_get(structured, "status")) == (json_int_t)MAELYS_MCP_OK);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(
+        json_object_get(structured, "result"), "answer")), "yes") == 0);
+    json_decref(response);
+    return 0;
+}
+
+/* The host's `denied` refusal - sent for both a disallowed method and a
+ * capability the client never declared, the same wire shape either way - must
+ * surface as MAELYS_MCP_ERR_DENIED with the host's message intact. */
+static int nested_denied(int fd, FILE *reader, unsigned long id,
+    const char *method, const char *message) {
+    ASSERT_TRUE(send_request(fd, id, "provider/call",
+        json_pack("{s:s,s:{s:s}}", "name", "sdk.nested", "arguments", "method", method)));
+    char nested_id[64];
+    ASSERT_TRUE(read_nested_request(reader, method, nested_id, sizeof(nested_id)) == 0);
+
+    json_t *reply = nested_reply_error(nested_id, "denied", message);
+    ASSERT_TRUE(reply != NULL);
+    ASSERT_TRUE(write_json_line(fd, reply));
+    json_decref(reply);
+
+    json_t *response = read_json_line(reader);
+    ASSERT_TRUE(json_is_object(response));
+    json_t *structured = json_object_get(json_object_get(response, "result"), "structuredContent");
+    ASSERT_TRUE(json_integer_value(json_object_get(structured, "status")) ==
+        (json_int_t)MAELYS_MCP_ERR_DENIED);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(structured, "error")), message) == 0);
+    ASSERT_TRUE(json_is_null(json_object_get(structured, "result")));
+    json_decref(response);
+    return 0;
+}
+
+/* A reply that is valid JSON and a valid nestedReply envelope, but does not
+ * carry the nestedId this call is waiting on - the shape the SDK must treat
+ * as protocol corruption rather than accept or silently ignore. */
+static int nested_malformed_reply(int fd, FILE *reader, unsigned long id) {
+    ASSERT_TRUE(send_request(fd, id, "provider/call",
+        json_pack("{s:s,s:{s:s}}", "name", "sdk.nested", "arguments", "method", "roots/list")));
+    char nested_id[64];
+    ASSERT_TRUE(read_nested_request(reader, "roots/list", nested_id, sizeof(nested_id)) == 0);
+
+    json_t *reply = nested_reply_success("not-the-right-id", "nope");
+    ASSERT_TRUE(reply != NULL);
+    ASSERT_TRUE(write_json_line(fd, reply));
+    json_decref(reply);
+
+    json_t *response = read_json_line(reader);
+    ASSERT_TRUE(json_is_object(response));
+    json_t *structured = json_object_get(json_object_get(response, "result"), "structuredContent");
+    ASSERT_TRUE(json_integer_value(json_object_get(structured, "status")) ==
+        (json_int_t)MAELYS_MCP_ERR_PROTOCOL);
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(structured, "error")),
+        "the host sent a malformed nested reply") == 0);
+    json_decref(response);
+    return 0;
+}
+
 int main(void) {
     ASSERT_TRUE(test_options_default_stdout_isolation() == 0);
     ASSERT_TRUE(test_invalid_catalog_descriptors() == 0);
@@ -378,9 +518,15 @@ int main(void) {
     ASSERT_TRUE(send_request(sockets[0], 1u, "provider/describe", NULL));
     json_t *response = read_json_line(reader);
     ASSERT_TRUE(json_is_object(response));
+    /* Declared unconditionally, even before this provider has ever nested a
+     * request: a /5 declaration that never nests must behave exactly as /4
+     * did, so nothing here is gated on the provider having called
+     * maelys_mcp_provider_sdk_request_client yet. */
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(response, "protocol")),
+        MAELYS_MCP_PROVIDER_PROTOCOL) == 0);
     json_t *result = json_object_get(response, "result");
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(result, "name")), "sdk-test") == 0);
-    ASSERT_TRUE(json_array_size(json_object_get(result, "tools")) == 4u);
+    ASSERT_TRUE(json_array_size(json_object_get(result, "tools")) == 5u);
     ASSERT_TRUE(json_array_size(json_object_get(result, "resources")) == 1u);
     json_decref(response);
 
@@ -408,7 +554,20 @@ int main(void) {
         "SDK resource") == 0);
     json_decref(response);
 
-    ASSERT_TRUE(send_request(sockets[0], 5u, "provider/call",
+    /* ---------------------------------------------------------- nested requests
+     * The blocking helper, driven end to end over this same socketpair: the
+     * SDK writes a real provider/nestedRequest and this thread plays the
+     * host, answering (or refusing, or misbehaving) on the same connection.
+     */
+    ASSERT_TRUE(nested_round_trip(sockets[0], reader, 5u,
+        "elicitation/create", "Proceed?") == 0);
+    ASSERT_TRUE(nested_denied(sockets[0], reader, 6u,
+        "tools/call", "method not allowed") == 0);
+    ASSERT_TRUE(nested_denied(sockets[0], reader, 7u,
+        "sampling/createMessage", "capability not declared") == 0);
+    ASSERT_TRUE(nested_malformed_reply(sockets[0], reader, 8u) == 0);
+
+    ASSERT_TRUE(send_request(sockets[0], 9u, "provider/call",
         json_pack("{s:s,s:{}}", "name", "sdk.events", "arguments")));
     json_t *event = read_json_line(reader);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(event, "method")),
@@ -424,33 +583,33 @@ int main(void) {
         json_object_get(result, "structuredContent"), "emitted")) == 2);
     json_decref(response);
 
-    ASSERT_TRUE(send_request(sockets[0], 6u, "provider/call",
+    ASSERT_TRUE(send_request(sockets[0], 10u, "provider/call",
         json_pack("{s:s,s:{}}", "name", "sdk.async", "arguments")));
     json_t *first = read_json_line(reader);
     json_t *second = read_json_line(reader);
     ASSERT_TRUE(json_is_object(first) && json_is_object(second));
     json_t *async_response = json_is_integer(json_object_get(first, "id")) ? first : second;
     json_t *async_event = async_response == first ? second : first;
-    ASSERT_TRUE(json_integer_value(json_object_get(async_response, "id")) == 6);
+    ASSERT_TRUE(json_integer_value(json_object_get(async_response, "id")) == 10);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(async_event, "method")),
         "provider/notifications/resources/list_changed") == 0);
     json_decref(first);
     json_decref(second);
 
-    ASSERT_TRUE(send_request(sockets[0], 7u, "provider/call",
+    ASSERT_TRUE(send_request(sockets[0], 11u, "provider/call",
         json_pack("{s:s,s:{}}", "name", "sdk.shutdown-race", "arguments")));
     response = read_json_line(reader);
-    ASSERT_TRUE(json_integer_value(json_object_get(response, "id")) == 7);
+    ASSERT_TRUE(json_integer_value(json_object_get(response, "id")) == 11);
     json_decref(response);
 
-    ASSERT_TRUE(send_request(sockets[0], 8u, "provider/readResource",
+    ASSERT_TRUE(send_request(sockets[0], 12u, "provider/readResource",
         json_pack("{s:s}", "uri", "sdk://missing")));
     response = read_json_line(reader);
     ASSERT_TRUE(strcmp(json_string_value(json_object_get(
         json_object_get(response, "error"), "code")), "not_found") == 0);
     json_decref(response);
 
-    ASSERT_TRUE(send_request(sockets[0], 9u, "provider/shutdown", NULL));
+    ASSERT_TRUE(send_request(sockets[0], 13u, "provider/shutdown", NULL));
     response = read_json_line(reader);
     ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
     json_decref(response);
