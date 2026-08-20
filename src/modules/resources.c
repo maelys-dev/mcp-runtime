@@ -373,15 +373,18 @@ static json_t *read_resource(
         .request_state = request_state,
         .client_capabilities = client_capabilities
     };
-    /* See call_tool: offered only while another thread is still reading the
-     * connection, and NULL means this read cannot nest. */
+    /* See call_tool: offered only on a legacy-era channel - the modern
+     * profile forbids server-to-client requests and mandates the resumable
+     * input_required result - and only while another thread is still reading
+     * the connection. NULL means this read cannot nest. */
     maelys_mcp_nested_relay_t relay = {
         .channel = request->channel,
         .sink = request->sink,
         .outer_id = request->id,
         .client_capabilities = client_capabilities
     };
-    maelys_mcp_nested_relay_t *nested = request->nestable && request->sink &&
+    maelys_mcp_nested_relay_t *nested = !request->modern &&
+        request->nestable && request->sink &&
         request->sink->emit ? &relay : NULL;
     maelys_mcp_provider_t *provider = exact_provider(runtime, canonical);
     maelys_mcp_resource_result_t provider_result;
