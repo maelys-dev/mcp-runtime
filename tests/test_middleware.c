@@ -213,6 +213,19 @@ static maelys_mcp_provider_t *fixture_provider(fixture_state_t *state) {
     return status == MAELYS_MCP_OK ? provider : NULL;
 }
 
+/*
+ * Tears a half-built runtime down and reports the failure that caused it.
+ * A helper rather than a (void) cast because GCC's -Wunused-result does not
+ * honour one on a warn_unused_result function, so the teardown status has to
+ * be captured and folded in.
+ */
+static maelys_mcp_result_t abandon_runtime(
+    maelys_mcp_runtime_t *runtime,
+    maelys_mcp_result_t failure) {
+    maelys_mcp_result_t destroyed = maelys_mcp_runtime_destroy(runtime);
+    return failure != MAELYS_MCP_OK ? failure : destroyed;
+}
+
 static maelys_mcp_result_t build_runtime(
     fixture_state_t *state,
     maelys_mcp_runtime_t **out_runtime) {
@@ -225,19 +238,16 @@ static maelys_mcp_result_t build_runtime(
     if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK ||
         maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR) != MAELYS_MCP_OK ||
         maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) != MAELYS_MCP_OK) {
-        (void)maelys_mcp_runtime_destroy(runtime);
-        return MAELYS_MCP_ERR_STATE;
+        return abandon_runtime(runtime, MAELYS_MCP_ERR_STATE);
     }
     maelys_mcp_provider_t *provider = fixture_provider(state);
     if (!provider) {
-        (void)maelys_mcp_runtime_destroy(runtime);
-        return MAELYS_MCP_ERR_MEMORY;
+        return abandon_runtime(runtime, MAELYS_MCP_ERR_MEMORY);
     }
     status = maelys_mcp_runtime_add_provider(runtime, provider, NULL);
     if (status != MAELYS_MCP_OK) {
         maelys_mcp_provider_destroy(provider);
-        (void)maelys_mcp_runtime_destroy(runtime);
-        return status;
+        return abandon_runtime(runtime, status);
     }
     *out_runtime = runtime;
     return MAELYS_MCP_OK;

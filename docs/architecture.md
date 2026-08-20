@@ -11,7 +11,7 @@ MCP client
     v
 maelys-mcp host
     |- JSON-RPC and MCP validation
-    |- policy and audit hooks
+    |- middleware chain (policy and audit hooks)
     |- channel registry and provider-event fan-out
     |- module registry
     |   |- Tools
@@ -68,6 +68,27 @@ client-specific adapter belongs in this library.
 - `maelys_mcp_provider_emit_event` borrows the event payload only for the duration of
   the call. Process providers activate once when the first channel is created and
   remain active until runtime destruction.
+
+## Policy boundary
+
+Policy and audit are a chain of middleware, registered on the runtime while it is
+cold and immutable from its first channel onward, so dispatch reads it with no
+lock. Two hooks are implemented: `on_authorize`, consulted at all five decision
+points (`tools/list` per tool, `tools/call`, `resources/list` per resource,
+`resources/templates/list` per template, `resources/read`), and `on_audit`, which
+journals `tools/call` and `resources/read` including their denials. Both run on
+the request thread with no runtime lock held, so the chain does not extend the
+lock hierarchy.
+
+The runtime holds no policy vocabulary of its own. A decision is taken on the
+resolved identity - the tool the runtime will actually invoke, the canonical URI
+it will actually read - and on the opaque, embedder-owned pointer bound to the
+channel, which the runtime carries and never interprets. It is never taken on
+`clientInfo.name`, which is client-asserted in both protocol eras. On
+`tools/call` the decision precedes schema validation, so a denied caller cannot
+probe argument schemas through validation error details, and the hook sees the
+request's whole params, `inputResponses` and `requestState` included, so MRTR
+continuation traffic is not invisible to policy. See `docs/middleware.md`.
 
 ## Protocol eras
 

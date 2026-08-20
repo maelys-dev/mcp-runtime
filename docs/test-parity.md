@@ -14,6 +14,7 @@ stdio, CLI, and Maelys L0/L1 suites.
 | JSON-RPC envelopes | integer and string ids, invalid id types, invalid version/method, notifications, error ownership and callback propagation |
 | MCP lifecycle | modern metadata, unsupported versions, legacy initialization, duplicate initialization, initialized notification, pre-initialization rejection |
 | MCP tools | list/call, unknown tools, input validation, output validation, effects, policy denial, audit, provider failure |
+| Middleware chain | registration gating and ordering, deny short-circuit, all five decision points, denial at each site, policy-before-validation, continuation params visibility, undecidable-verdict mapping, both audit views, per-channel principal, compatibility middleware, reverse-order teardown |
 | MCP modules | empty core, explicit/idempotent activation, capability derivation, method isolation, Tools-before-provider invariant |
 | Rich results | text, image, audio, embedded resources, mixed content, base64/MIME validation and structured output |
 | MRTR | input-required/complete rounds, retry context, opaque state validation, capability enforcement and official elicitation scenario |

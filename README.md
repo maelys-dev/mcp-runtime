@@ -27,7 +27,7 @@ The first milestone provides:
 - input and output validation for a documented JSON Schema subset;
 - registration-time rejection of unsupported or ambiguous schema definitions;
 - explicit `read`/`preview`/`apply`/`commit`/`execute` authorization classes;
-- injectable authorization and audit callbacks;
+- a middleware chain for policy and audit, per channel and per principal;
 - an external example provider and conformance tests;
 - isolated protocol stdout that cannot be contaminated by ordinary `printf()` calls;
 - opaque per-client channels with bounded passive output queues, response priority,

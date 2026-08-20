@@ -1,9 +1,18 @@
 # Middleware chain — design
 
-> **Status: design, not implemented.** Nothing in this document describes
-> current behaviour except the sections explicitly marked *today*. It is
-> recorded here so the decisions and their reasons survive, and so the
-> implementation can be reviewed against them rather than against memory.
+> **Status: partly implemented.** The chain core — registration, ordering,
+> invocation — and its two decision hooks, ② `on_authorize` and ⑤ `on_audit`,
+> are shipped, and all five policy decision points go through them.
+> `docs/middleware.md` documents that surface. Hooks ①③④⑥⑦ and the fanout
+> direction remain design only, as does everything the sections below describe
+> in the future tense. The sections marked *today* now describe the **pre-chain**
+> runtime and are kept as the record of what was replaced.
+>
+> This document is recorded so the decisions and their reasons survive, and so
+> the implementation can be reviewed against them rather than against memory.
+> Each section below that a shipped piece has overtaken carries a **Shipped**
+> note saying what actually happened, including where reality and the design
+> diverged.
 
 ## Purpose
 
@@ -24,9 +33,9 @@ to the orchestrator adapter, which suspends *before* calling
 `maelys_mcp_channel_handle`; `input_required`/MRTR is a provider mechanism and
 must not be repurposed to carry policy decisions.
 
-## What exists today
+## What existed before the chain
 
-Policy is a portal and a journal, not a pipeline:
+Policy was a portal and a journal, not a pipeline:
 
 ```c
 typedef struct maelys_mcp_request_context {
@@ -57,8 +66,15 @@ typedef struct maelys_mcp_response_sink {
 } maelys_mcp_response_sink_t;
 ```
 
-**Today's order in `call_tool` is validation, then policy** — schema
+**That order in `call_tool` was validation, then policy** — schema
 validation at `tools.c:344`, `policy_allows` at `tools.c:356`.
+
+> **Shipped.** All five decision points now build a
+> `maelys_mcp_authorize_context_t` and call the chain; no legacy invocation
+> remains. `maelys_mcp_runtime_config_t` lost `authorize`, `audit` and
+> `policy_context` (ABI 2 → 3), and the runtime-global `policy_context` is
+> replaced by the per-channel opaque pointer plus each middleware's own
+> context. The order in `call_tool` is now policy, then validation.
 
 ## The chain
 
@@ -95,6 +111,18 @@ proxy ③, a redactor ④⑥.
 change**, not the status quo. It is wanted — a denied caller should not be
 able to probe argument schemas through validation error details — but it must
 ship as a named change, not slip in as a side effect.
+
+> **Shipped**, and named: the reorder landed with ②, is stated in
+> `docs/middleware.md` and in `CHANGELOG.md`, and is covered by a test that
+> calls a denied tool with arguments its schema rejects and requires `-32003`
+> with no `data`. One consequence the design did not spell out follows from
+> it and is now in the public contract: ② sees params this runtime has not
+> validated, so a middleware must treat them as untrusted input.
+>
+> A second behaviour change was made that this document did not call for: a
+> denied `resources/read` is now journalled, as a denied `tools/call` always
+> was. The asymmetry was an omission rather than a decision, and a policy
+> surface whose refusals leave no trace is the wrong half to leave alone.
 
 ## Checked against real transformation use cases
 
@@ -182,6 +210,15 @@ the stock transport has a seam to bind the context too.
 Without it no chain can distinguish two clients sharing one runtime, however
 many hooks it has. It is a prerequisite, not a later refinement.
 
+> **Shipped, with one precision.** "Before `serve`" is enforced as *while the
+> runtime is cold* — `maelys_mcp_runtime_add_middleware` returns
+> `MAELYS_MCP_ERR_STATE` once a channel exists, which is the point at which
+> dispatch can read the array, and is a stricter and more checkable line than
+> `serve`. ② receives the channel rather than a copied pointer, and reads the
+> slot through `maelys_mcp_channel_context()`; a test denies on one channel
+> and allows on another within one runtime, which is the property this section
+> exists for.
+
 ## Both directions, and why they cannot be one interface
 
 The chain is bidirectional. The inbound half is ①–⑤; the outbound half is ⑥
@@ -257,6 +294,16 @@ borrow the request-scoped contract.
   not today's observable ordering — the policy/validation reorder above is a
   deliberate, named change.
 
+> **Shipped.** `maelys_mcp_runtime_add_compat_policy(runtime, authorize,
+> audit, context)` takes the same three values the config struct did, in one
+> call, and allocates and frees its own shim state. Registering just an
+> authorizer is one struct field (`.on_authorize`) or one argument. What the
+> shim cannot forward is what the old signature has no field for — the channel
+> and the request params — which is the cost that motivates migrating to ②
+> proper. The runtime's own reference host moved to a native ② rather than to
+> the shim; `tests/test_runtime.c` moved to the shim with none of its policy
+> assertions changed, which is the evidence that migration is mechanical.
+
 ## Known holes, named rather than hidden
 
 - **Subscription fanout bypasses the sink**, so ⑥ does not cover
@@ -279,6 +326,10 @@ borrow the request-scoped contract.
   it before resource hooks exist would silently remove resource authorization
   altogether — the compat middleware would have nowhere to hang it. Resource
   hooks must land in the same release as the replacement.
+
+  > **Closed.** The three `resources.c` sites converted in the same change as
+  > the two tools sites. They had no test coverage at all before this; they do
+  > now, including one that denies at each of the five sites in turn.
 - **MRTR continuation traffic is invisible to every hook.** `requestState` is
   an opaque provider blob round-tripped through the client, and
   `inputResponses` carries elicitation answers and sampling completions — the
@@ -289,6 +340,16 @@ borrow the request-scoped contract.
   "swap anonymous for authenticated" scenario leaves pre-auth continuations
   valid after the swap. ① and ② must see the full call params, or a
   continuation hook must exist. This is the largest genuine gap in the design.
+
+  > **Half closed, and the halves are worth separating.** ② now receives the
+  > request's whole `params` object — `inputResponses` and `requestState`
+  > included — on both `tools/call` and `resources/read`, so continuation
+  > traffic is no longer invisible to policy. That is *visibility*. It is not
+  > *binding*: a continuation may still arrive on a different channel than the
+  > one that issued it, and nothing in this release fences a stale or stolen
+  > `requestState`. The pre-auth-continuation scenario above survives, and
+  > closing it needs either a continuation identity the runtime can check or a
+  > dedicated hook. ① will inherit the same params when it lands.
 - **`server/discover` and `initialize` sit outside every hook and every policy
   point.** Consistent with today, but a MITM claiming to govern what a
   principal may know should name it.
@@ -327,6 +388,17 @@ half.
 - `⑥` needs a contract: `complete` forwarded exactly once (a middleware that
   swallows it wedges the request, and the runtime should detect that),
   `cancelled` passed through by default, wrapping order the reverse of ④'s.
+
+> **Settled for ② and ⑤.** Refcounts: nothing crosses these two hooks as owned
+> — `params` is borrowed for the call and read-only, and neither hook returns
+> JSON, so the leak-and-double-free surface this bullet worried about does not
+> exist yet. It arrives with ①③④. Error taxonomy: three outcomes, three
+> results — allow, deny (`-32003`, or omission from a listing), and "could not
+> decide" (`-32603`), which is deliberately *not* a denial and fails a whole
+> listing rather than silently shortening it. Threads: both hooks run on the
+> request thread with no runtime lock held, so the lock hierarchy in
+> `src/internal/internal.h` is unchanged; concurrency across channels is the
+> middleware's own to handle.
 
 ## Checked against the proxy ecosystem
 
