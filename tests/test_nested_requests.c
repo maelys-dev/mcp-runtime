@@ -64,7 +64,20 @@ static maelys_mcp_runtime_t *new_runtime(
     if (provider_path) {
         maelys_mcp_provider_t *provider = NULL;
         char *error = NULL;
-        if (maelys_mcp_provider_spawn(provider_path, 65536u, &provider,
+        /*
+         * A loose describe deadline, for the reason
+         * tests/test_provider_perf.c gives: spawning the fixture is a liveness
+         * bound this suite does not measure, and the default 5s has been seen
+         * to miss under a sanitizer on a loaded machine - which fails the test
+         * for the machine's reasons rather than the runtime's. The call
+         * timeout stays at its default, because that one is under test.
+         */
+        maelys_mcp_provider_process_options_t spawn_options = {
+            .executable_path = provider_path,
+            .max_message_bytes = 65536u,
+            .describe_timeout_ms = 30000u
+        };
+        if (maelys_mcp_provider_spawn_with_options(&spawn_options, &provider,
                 &error) != MAELYS_MCP_OK ||
             maelys_mcp_runtime_add_provider(runtime, provider, &error) !=
                 MAELYS_MCP_OK) {
