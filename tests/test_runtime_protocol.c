@@ -182,6 +182,56 @@ static int test_legacy_lifecycle_and_unknown_method(void) {
     return 0;
 }
 
+static int test_ping_answers_in_every_state(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    /*
+     * Before any initialize: a liveness probe must not be refused for
+     * lifecycle reasons - the protocol allows a ping at any time, and this is
+     * the state where being able to answer one matters most.
+     */
+    json_t *response = dispatch(channel,
+        request(json_integer(1), "ping", json_object()));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(json_object_get(response, "error") == NULL);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    ASSERT_TRUE(json_object_size(json_object_get(response, "result")) == 0u);
+    json_decref(response);
+    /* Modern, with full per-request metadata. */
+    response = dispatch(channel,
+        request(json_integer(2), "ping", modern_params()));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(json_object_get(response, "error") == NULL);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    /* Legacy, after the ordinary handshake. */
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "client", "version", "1");
+    response = dispatch(channel, request(json_integer(3), "initialize", init));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = request(NULL, "notifications/initialized", json_object());
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+    response = dispatch(channel,
+        request(json_integer(4), "ping", json_object()));
+    ASSERT_TRUE(response != NULL);
+    ASSERT_TRUE(json_object_get(response, "error") == NULL);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    /* Malformed modern metadata on a ping is still rejected: answering in
+     * every lifecycle state does not mean skipping request validation. */
+    json_t *bad_meta = json_pack("{s:{s:s}}", "_meta",
+        "io.modelcontextprotocol/protocolVersion", "2099-01-01");
+    response = dispatch(channel, request(json_integer(5), "ping", bad_meta));
+    ASSERT_TRUE(json_object_get(response, "error") != NULL);
+    json_decref(response);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
 static maelys_mcp_result_t invalid_output_call(
     void *context,
     const maelys_mcp_provider_request_t *request,
@@ -301,6 +351,7 @@ int main(void) {
         {"legacy initialization lifecycle and unknown method", test_legacy_lifecycle_and_unknown_method},
         {"legacy protocol version negotiation", test_legacy_version_negotiation},
         {"legacy channel ignores opaque request meta", test_legacy_channel_ignores_opaque_request_meta},
+        {"ping answers in every state", test_ping_answers_in_every_state},
         {"invalid provider output is fail-closed", test_output_schema_failure_is_fail_closed}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));

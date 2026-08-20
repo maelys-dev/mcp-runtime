@@ -258,13 +258,11 @@ static maelys_mcp_result_t read_with_provider(
 }
 
 /*
- * Unlike tools.c's call_tool, resources/read has never validated which
- * specific capability (roots/elicitation/sampling) a client declared before
- * honoring input_required here - only whether MRTR is enabled at all. That
- * pre-existing, modern-and-legacy-alike simplification is out of scope for
- * this fix. What was legacy-specific (and wrong) was gating input_required
- * on request->modern unconditionally, denying it to every legacy channel
- * regardless of what it declared at initialize - dropped below.
+ * Shape-only checks here; the per-capability validation that tools/call has
+ * always applied happens at the read_resource call site (see
+ * maelys_mcp_validate_input_requests), where the client's declared
+ * capabilities are in scope and a missing one becomes the same
+ * -32021/requiredCapabilities response a tool call produces.
  */
 static int valid_input_required(
     maelys_mcp_runtime_t *runtime,
@@ -405,15 +403,43 @@ static json_t *read_resource(
             maelys_mcp_resource_result_clear(&provider_result);
         }
     }
+    /*
+     * The same per-capability validation tools/call has always applied:
+     * every inputRequest names an MRTR method, and each maps to a client
+     * capability that must actually have been declared. Runs before the
+     * audit so the journal records the denial, and turns into the same
+     * -32021/requiredCapabilities response a tool call produces.
+     */
+    json_t *required_capabilities = NULL;
+    if (status == MAELYS_MCP_OK &&
+        provider_result.type == MAELYS_MCP_RESOURCE_RESULT_INPUT_REQUIRED &&
+        provider_result.input_requests) {
+        int validation = maelys_mcp_validate_input_requests(
+            provider_result.input_requests, client_capabilities,
+            &required_capabilities, &error);
+        if (validation < 0) status = MAELYS_MCP_ERR_PROTOCOL;
+        else if (validation > 0) status = MAELYS_MCP_ERR_DENIED;
+    }
     audit_resource(runtime, request, requested_uri, canonical, status);
     json_t *error_data = status == MAELYS_MCP_ERR_NOT_FOUND ?
         json_pack("{s:s}", "uri", canonical) : NULL;
     maelys_uri_destroy(parsed);
-    json_t *response = status == MAELYS_MCP_OK ?
-        serialize_read_result(runtime, request, &provider_result) :
-        maelys_mcp_error_response(request->id,
-            status == MAELYS_MCP_ERR_NOT_FOUND ? JSONRPC_INVALID_PARAMS : JSONRPC_INTERNAL_ERROR,
-            error ? error : "Resource not found", error_data);
+    json_t *response;
+    if (required_capabilities) {
+        json_t *data = json_object();
+        if (data) (void)json_object_set(data, "requiredCapabilities", required_capabilities);
+        response = maelys_mcp_error_response(request->id,
+            MCP_MISSING_REQUIRED_CLIENT_CAPABILITY,
+            "Client did not declare a required capability", data);
+        if (data) json_decref(data);
+        json_decref(required_capabilities);
+    } else {
+        response = status == MAELYS_MCP_OK ?
+            serialize_read_result(runtime, request, &provider_result) :
+            maelys_mcp_error_response(request->id,
+                status == MAELYS_MCP_ERR_NOT_FOUND ? JSONRPC_INVALID_PARAMS : JSONRPC_INTERNAL_ERROR,
+                error ? error : "Resource not found", error_data);
+    }
     if (error_data) json_decref(error_data);
     maelys_mcp_resource_result_clear(&provider_result);
     free(error);

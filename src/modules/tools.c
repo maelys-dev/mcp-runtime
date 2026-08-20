@@ -190,49 +190,6 @@ static json_t *text_content(const char *text) {
     return content;
 }
 
-static int validate_input_requests(
-    json_t *requests,
-    json_t *client_capabilities,
-    json_t **out_required_capabilities,
-    char **out_error) {
-    if (!json_is_object(requests) || json_object_size(requests) == 0u) {
-        if (out_error) *out_error = maelys_mcp_strdup("inputRequests must be a non-empty object");
-        return -1;
-    }
-    const char *key;
-    json_t *value;
-    json_object_foreach(requests, key, value) {
-        json_t *method = json_is_object(value) ? json_object_get(value, "method") : NULL;
-        json_t *params = json_is_object(value) ? json_object_get(value, "params") : NULL;
-        if (!*key || !json_is_string(method) || maelys_mcp_json_string_has_nul(method) ||
-            !json_is_object(params)) {
-            if (out_error) *out_error = maelys_mcp_strdup(
-                "each inputRequest requires a key, method, and params object");
-            return -1;
-        }
-        const char *name = json_string_value(method);
-        if (strcmp(name, "elicitation/create") != 0 &&
-            strcmp(name, "sampling/createMessage") != 0 &&
-            strcmp(name, "roots/list") != 0) {
-            if (out_error) *out_error = maelys_mcp_strdup("unsupported inputRequest method");
-            return -1;
-        }
-        const char *capability = strcmp(name, "elicitation/create") == 0 ? "elicitation" :
-            (strcmp(name, "sampling/createMessage") == 0 ? "sampling" : "roots");
-        if (!json_is_object(client_capabilities) ||
-            !json_is_object(json_object_get(client_capabilities, capability))) {
-            if (out_required_capabilities) {
-                if (!*out_required_capabilities) *out_required_capabilities = json_object();
-                if (*out_required_capabilities) {
-                    (void)json_object_set_new(*out_required_capabilities,
-                        capability, json_object());
-                }
-            }
-        }
-    }
-    return out_required_capabilities && *out_required_capabilities ? 1 : 0;
-}
-
 static json_t *provider_failure(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_module_request_t *request,
@@ -284,7 +241,7 @@ static maelys_mcp_result_t validate_provider_result(
             return MAELYS_MCP_ERR_PROTOCOL;
         }
         if (result->input_requests) {
-            int validation = validate_input_requests(result->input_requests,
+            int validation = maelys_mcp_validate_input_requests(result->input_requests,
                 client_capabilities, out_required_capabilities, out_error);
             if (validation < 0) return MAELYS_MCP_ERR_PROTOCOL;
             if (validation > 0) return MAELYS_MCP_ERR_DENIED;

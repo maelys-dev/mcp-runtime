@@ -353,6 +353,102 @@ static int test_legacy_mrtr_capability_negotiation(void) {
     return 0;
 }
 
+static maelys_mcp_result_t asking_read(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error) {
+    (void)context; (void)request; (void)out_error;
+    out_result->type = MAELYS_MCP_RESOURCE_RESULT_INPUT_REQUIRED;
+    out_result->input_requests = json_pack("{s:{s:s,s:{s:s}}}",
+        "confirmation", "method", "elicitation/create",
+        "params", "message", "Proceed?");
+    out_result->request_state = json_string("read-state-1");
+    return out_result->input_requests && out_result->request_state ?
+        MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+}
+
+static int test_resources_read_validates_declared_capabilities(void) {
+    /*
+     * The same -32021 contract tools/call has always enforced: a read whose
+     * input_required asks for elicitation is refused - naming the missing
+     * capability - when the client never declared it, and honored when it
+     * did. Before this test's fix, resources/read only checked that MRTR was
+     * enabled at all.
+     */
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "resource-caps-test", .server_version = "1.0"
+    };
+    maelys_mcp_runtime_t *core = NULL;
+    ASSERT_TRUE(maelys_mcp_runtime_create(&config, &core) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_RESOURCES) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_enable_module(core, MAELYS_MCP_MODULE_MRTR) == MAELYS_MCP_OK);
+
+    static const maelys_mcp_resource_t resources[] = {{
+        .uri = "test://asking/document",
+        .name = "asking-document",
+        .title = "Asks before answering",
+        .description = "Returns input_required with an elicitation request.",
+        .mime_type = "text/plain"
+    }};
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "asking", .version = "1",
+        .resources = resources, .resource_count = 1,
+        .read_resource = asking_read
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    ASSERT_TRUE(maelys_mcp_provider_create(&provider_config, &provider) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(core, provider, NULL) == MAELYS_MCP_OK);
+
+    /* Legacy channel that declared nothing: refused with -32021, naming
+     * elicitation, exactly like the tools path. */
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel) == MAELYS_MCP_OK);
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "no-caps", "version", "1");
+    json_t *response = dispatch(channel, "initialize", init);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = json_pack("{s:s,s:s}", "jsonrpc", "2.0",
+        "method", "notifications/initialized");
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+    json_t *params = json_pack("{s:s}", "uri", "test://asking/document");
+    response = dispatch(channel, "resources/read", params);
+    ASSERT_TRUE(json_integer_value(json_object_get(
+        json_object_get(response, "error"), "code")) == -32021);
+    ASSERT_TRUE(json_is_object(json_object_get(json_object_get(
+        json_object_get(json_object_get(response, "error"), "data"),
+        "requiredCapabilities"), "elicitation")));
+    json_decref(response);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+
+    /* The same read with elicitation declared passes through unchanged. */
+    ASSERT_TRUE(maelys_mcp_channel_create(core, NULL, &channel) == MAELYS_MCP_OK);
+    init = json_pack("{s:s,s:{s:{}},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY,
+        "capabilities", "elicitation",
+        "clientInfo", "name", "with-caps", "version", "1");
+    response = dispatch(channel, "initialize", init);
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    initialized = json_pack("{s:s,s:s}", "jsonrpc", "2.0",
+        "method", "notifications/initialized");
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+    params = json_pack("{s:s}", "uri", "test://asking/document");
+    response = dispatch(channel, "resources/read", params);
+    json_t *result = json_object_get(response, "result");
+    ASSERT_TRUE(json_is_object(json_object_get(result, "inputRequests")));
+    ASSERT_TRUE(strcmp(json_string_value(json_object_get(result,
+        "requestState")), "read-state-1") == 0);
+    json_decref(response);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(core) == MAELYS_MCP_OK);
+    return 0;
+}
+
 /*
  * notifications/progress, and above all its ordering.
  *
@@ -493,6 +589,8 @@ int main(void) {
         {"content block validation", test_content_validation},
         {"module registry, rich content, and MRTR", test_modules_rich_content_and_mrtr},
         {"legacy channel MRTR capability negotiation", test_legacy_mrtr_capability_negotiation},
+        {"resources/read validates declared capabilities",
+            test_resources_read_validates_declared_capabilities},
         {"progress notifications and their ordering", test_progress_notifications}
     };
     return maelys_run_tests(tests, sizeof(tests) / sizeof(tests[0]));

@@ -581,6 +581,21 @@ json_t *maelys_mcp_runtime_dispatch(
     if (strcmp(method_name, "server/discover") == 0) return discover(runtime, id);
 
     int modern = modern_version != NULL;
+    /*
+     * ping answers in every state, deliberately placed before the
+     * initialization gate: the protocol allows either side to ping at any
+     * time, including before initialize completes, and a liveness probe that
+     * can be refused for lifecycle reasons is not a liveness probe. Modern
+     * metadata, when present, was already validated above.
+     */
+    if (strcmp(method_name, "ping") == 0) {
+        json_t *pong = json_object();
+        if (!pong) {
+            return maelys_mcp_error_response(id, JSONRPC_INTERNAL_ERROR,
+                "Out of memory", NULL);
+        }
+        return maelys_mcp_success_response(id, pong);
+    }
     if (!modern && !legacy_initialized) {
         return maelys_mcp_error_response(id, MCP_SERVER_NOT_INITIALIZED,
             "Server not initialized", NULL);

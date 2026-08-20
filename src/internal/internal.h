@@ -477,6 +477,18 @@ maelys_mcp_result_t maelys_mcp_stdio_finish_status(
 int maelys_mcp_json_string_has_nul(const json_t *value);
 int maelys_mcp_json_string_equals(const json_t *value, const char *expected);
 int maelys_mcp_json_string_has_prefix(const json_t *value, const char *prefix);
+
+/*
+ * Shared input_required capability validation (mrtr.c). Returns -1 for a
+ * malformed inputRequests set, 1 when a required client capability is missing
+ * (collected into *out_required_capabilities for the -32021 response), 0 when
+ * valid and fully declared.
+ */
+int maelys_mcp_validate_input_requests(
+    json_t *requests,
+    json_t *client_capabilities,
+    json_t **out_required_capabilities,
+    char **out_error);
 maelys_mcp_result_t maelys_mcp_write_json_line(int fd, json_t *value);
 maelys_mcp_result_t maelys_mcp_write_json_line_with_timeout(
     int fd,

@@ -89,7 +89,6 @@ LEGACY_EXCLUDED = {
     # Feature not implemented by mcp-runtime at all - it has exactly four
     # modules (tools, MRTR, resources, subscriptions); none of these exist.
     "logging-set-level": "no logging module",
-    "ping": "no ping handler",
     "completion-complete": "no completion module",
     "tools-call-with-logging": "no logging notifications",
     "prompts-list": "no prompts module",
@@ -475,7 +474,6 @@ UNIMPLEMENTED_METHODS = (
     "resources/unsubscribe",
     "prompts/list",
     "logging/setLevel",
-    "ping",
     "completion/complete",
 )
 

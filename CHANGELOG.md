@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **Fix: a modern client can never receive a server-to-client request.** The
+  `2026-07-28` profile forbids them and mandates the resumable
+  `input_required` result, but 0.15.0 offered the nested-request relay
+  era-blind — a modern `tools/call` or `resources/read` whose `_meta`
+  declared a capability could be sent a provider-initiated
+  `elicitation/create`. Both call sites now gate the relay on the request's
+  era; a provider that nests anyway gets the established refusal and falls
+  back to `input_required`. Found by an external conformance review of
+  0.15.0.
+- **`ping` is answered, in every lifecycle state.** The protocol allows
+  either side to ping at any time — including before `initialize` — and a
+  liveness probe that can be refused for lifecycle reasons is not a liveness
+  probe. Closes the official suite's `ping` scenario, previously excluded as
+  "no ping handler".
+- **`resources/read` now validates the specific capability an
+  `input_required` result asks for**, exactly as `tools/call` always has: a
+  read whose provider requests elicitation from a client that never declared
+  it is refused with `-32021`/`requiredCapabilities` (and journalled),
+  instead of being passed through on the strength of the MRTR module merely
+  being enabled.
+- **Official conformance coverage grows from 28 to 33 scenarios, zero
+  failures.** The four legacy MRTR scenarios excluded as "requires the
+  nested in-band pattern" (`tools-call-sampling`, `tools-call-elicitation`,
+  and both `elicitation-sep*`) now run and pass against the Python SDK's
+  nested helpers, plus the newly enabled `ping`. Getting there surfaced a
+  real defect in the HTTP-to-stdio test adapter — it buffered whole
+  exchanges and swallowed nested requests — fixed in the adapter; no runtime
+  change was needed.
+- **The black-box provider-conformance runner now exercises nested requests
+  against all three SDKs**, answering `provider/nestedRequest` inline per
+  scenario and asserting the fabricated answer really travels back through
+  the provider's handler — C, TypeScript and Python fixtures alike.
+
 - **All three provider SDKs can now ask the client a question mid-call.** A
   provider built on the C, TypeScript or Python SDK gets the same nested
   request surface the in-process API gained in 0.15.0: a blocking helper
