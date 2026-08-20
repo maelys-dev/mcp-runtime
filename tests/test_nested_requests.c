@@ -81,6 +81,11 @@ static maelys_mcp_runtime_t *new_runtime(
                 &error) != MAELYS_MCP_OK ||
             maelys_mcp_runtime_add_provider(runtime, provider, &error) !=
                 MAELYS_MCP_OK) {
+            /* Named, not swallowed: the difference between "the runtime broke"
+             * and "this machine could not fork another sanitized process" is
+             * the whole diagnosis, and a bare assertion hides it. */
+            fprintf(stderr, "provider spawn failed (%s): %s\n", provider_path,
+                error ? error : "no detail");
             free(error);
             maelys_mcp_result_t destroyed = maelys_mcp_runtime_destroy(runtime);
             (void)destroyed;
@@ -119,8 +124,13 @@ static int client_start(
     memset(client, 0, sizeof(*client));
     client->runtime = new_runtime(provider_path, nested_timeout_ms);
     if (!client->runtime) return -1;
-    if (pipe(client->to_host) != 0 || pipe(client->from_host) != 0) return -1;
-    return pthread_create(&client->thread, NULL, serve_main, client) == 0 ? 0 : -1;
+    if (pipe(client->to_host) != 0 || pipe(client->from_host) != 0) {
+        fprintf(stderr, "pipe failed: %s\n", strerror(errno));
+        return -1;
+    }
+    int started = pthread_create(&client->thread, NULL, serve_main, client);
+    if (started != 0) fprintf(stderr, "serve thread failed: %d\n", started);
+    return started == 0 ? 0 : -1;
 }
 
 static maelys_mcp_result_t client_stop(fake_client_t *client) {
