@@ -148,6 +148,16 @@ closing, by the provider dying, or by that deadline. Providers reach it through
 carry one, and the provider falls back to `input_required`. See
 `docs/provider-protocol.md` for the wire.
 
+The official `2025-11-25` conformance requirements test exactly this shape, not
+the resumable one: `tools-call-sampling`, `tools-call-elicitation`,
+`elicitation-sep1034-defaults` and `elicitation-sep1330-enums` each drive a real
+client that answers a server-initiated request mid-`tools/call` and expects the
+call to complete once it does. `conformance/official_tools_provider.py`'s
+`test_sampling`/`test_elicitation`/`test_elicitation_sep1034_defaults`/
+`test_elicitation_sep1330_enums` handlers exercise this path through the Python
+SDK's `context.request_sampling`/`context.request_elicitation`, and
+`docs/official-conformance.md` records the resulting scenario coverage.
+
 ## Module boundary
 
 The core owns lifecycle, version negotiation, discovery and generic JSON-RPC routing.
