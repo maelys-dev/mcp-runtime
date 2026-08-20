@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 - 2026-08-21
 
 - **Fix: a modern client can never receive a server-to-client request.** The
   `2026-07-28` profile forbids them and mandates the resumable
@@ -34,6 +34,18 @@
   against all three SDKs**, answering `provider/nestedRequest` inline per
   scenario and asserting the fabricated answer really travels back through
   the provider's handler — C, TypeScript and Python fixtures alike.
+- **Every mutation survivor now has a verdict: 43 killed by new tests, 85
+  written down with a reason.** The first sweeps' finding was that the test
+  suites did not constrain iteration bounds or error paths in the two newest
+  core files; ten new tests close the real gaps (projected scores: nested.c
+  36.6% → 58.5%, middleware.c 58.7% → 68.6%, to be confirmed by the weekly
+  scheduled sweep), and `docs/mutation-triage.md` records every survivor
+  deliberately left alive — equivalent mutants, undocumented internal
+  guards, allocation-failure paths — so silent acceptance is no longer a
+  category. An optional ASan kill-command variant (`mutation-asan.json`,
+  `make asan-build`) ships for the leak-shaped survivors, with its limits
+  documented: sanitizers cannot see the intra-object bounds class at all,
+  because the address-of form these loops use is not instrumented.
 
 - **All three provider SDKs can now ask the client a question mid-call.** A
   provider built on the C, TypeScript or Python SDK gets the same nested
