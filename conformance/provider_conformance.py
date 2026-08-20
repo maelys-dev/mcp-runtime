@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
-"""Black-box conformance runner for persistent maelys-provider executables."""
+"""Black-box conformance runner for persistent maelys-provider executables.
+
+Speaks the wire directly to one provider subprocess, playing the host's side
+of the protocol - including, for a case that declares a `nested` exchange,
+the host's side of the `provider/nestedRequest` / `provider/nestedReply`
+round trip (docs/provider-protocol.md "Nested requests"). That is why this
+runner is interactive (one request written, its response read, before the
+next is written) rather than batching every request up front the way it did
+before nested support existed: a provider blocked mid-call waiting on a
+nested reply would never see the rest of a batch that was already flushed to
+its stdin, and a batch-then-read-everything runner has nothing to answer it
+with until long after the provider gave up.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -163,6 +178,57 @@ def validate_event(message: Any) -> None:
     raise ConformanceError(f"unsupported or malformed provider event: {method}")
 
 
+def is_nested_request(message: Any) -> bool:
+    """True for a `provider/nestedRequest` frame - the one id-less envelope
+    this runner does not treat as a provider/3 event, because it demands a
+    reply rather than being fire-and-forget. See exchange()."""
+    return (isinstance(message, dict) and "id" not in message and
+        message.get("method") == "provider/nestedRequest")
+
+
+def validate_nested_request(message: Any, spec: dict[str, Any]) -> str:
+    """Checks a `provider/nestedRequest` frame against the case's declared
+    expectation and returns the `nestedId` to answer.
+
+    `spec` is one entry of a case's `nested` list (see read_cases) - the
+    fixture author's own description of the request they expect the provider
+    to open next, so a provider that nests the wrong method, or nests when
+    the case did not expect it at all, fails loudly here rather than getting
+    an answer that happens to satisfy it anyway.
+    """
+    if message.get("protocol") not in SUPPORTED_PROTOCOLS:
+        raise ConformanceError("nested request must declare a supported provider protocol")
+    params = message.get("params")
+    if not isinstance(params, dict):
+        raise ConformanceError("nested request params must be an object")
+    nested_id = params.get("nestedId")
+    if not isinstance(nested_id, str) or not nested_id:
+        raise ConformanceError("nested request must carry a non-empty nestedId")
+    if not isinstance(params.get("method"), str) or not params["method"]:
+        raise ConformanceError("nested request must carry a non-empty method")
+    if not isinstance(params.get("params"), dict):
+        raise ConformanceError("nested request params.params must be an object")
+    expected_method = spec.get("method")
+    if expected_method is not None and params["method"] != expected_method:
+        raise ConformanceError(
+            f"nested request method mismatch: expected {expected_method!r}, got {params['method']!r}"
+        )
+    return nested_id
+
+
+def build_nested_reply(nested_id: str, spec: dict[str, Any]) -> dict[str, Any]:
+    """The `provider/nestedReply` this runner - playing the host - sends back
+    for one entry of a case's `nested` list. Exactly one of `result`/`error`
+    per docs/provider-protocol.md; `read_cases` already rejected a spec
+    carrying both or neither."""
+    payload: dict[str, Any] = {"nestedId": nested_id}
+    if "error" in spec:
+        payload["error"] = spec["error"]
+    else:
+        payload["result"] = spec.get("result", {})
+    return {"protocol": PROTOCOL, "method": "provider/nestedReply", "params": payload}
+
+
 def validate_call_result(result: Any) -> None:
     if not isinstance(result, dict):
         raise ConformanceError("provider call result must be an object")
@@ -178,6 +244,34 @@ def validate_call_result(result: Any) -> None:
             raise ConformanceError("input_required result requires inputRequests or requestState")
         return
     raise ConformanceError("provider call resultType must be complete or input_required")
+
+
+def apply_call_assertions(result: Any, case: dict[str, Any]) -> None:
+    """Checks a case's optional `assertContentText` / `assertStructuredContent`
+    against a successful call result.
+
+    Structural validation (validate_call_result) only proves a result is
+    shaped like a complete result - not that a nested case's round trip
+    actually carried the answer this runner sent in build_nested_reply()
+    back out through the provider's handler. A case that declares one of
+    these two keys is asking for that stronger proof.
+    """
+    if "assertContentText" in case:
+        expected = case["assertContentText"]
+        content = result.get("content") if isinstance(result, dict) else None
+        first = content[0] if isinstance(content, list) and content else None
+        actual = first.get("text") if isinstance(first, dict) else None
+        if actual != expected:
+            raise ConformanceError(
+                f"call result content[0].text was {actual!r}, expected {expected!r}"
+            )
+    if "assertStructuredContent" in case:
+        expected = case["assertStructuredContent"]
+        actual = result.get("structuredContent") if isinstance(result, dict) else None
+        if actual != expected:
+            raise ConformanceError(
+                f"call result structuredContent was {actual!r}, expected {expected!r}"
+            )
 
 
 def validate_description(description: Any) -> dict[str, dict[str, Any]]:
@@ -237,76 +331,211 @@ def read_cases(path: Path | None) -> list[dict[str, Any]]:
             raise ConformanceError(f"calls[{index}] must contain tool and object arguments")
         if case.get("expect", "success") not in {"success", "error"}:
             raise ConformanceError(f"calls[{index}].expect must be success or error")
+        if "nested" in case:
+            nested = case["nested"]
+            if not isinstance(nested, list) or not nested:
+                raise ConformanceError(f"calls[{index}].nested must be a non-empty array")
+            for offset, spec in enumerate(nested):
+                label = f"calls[{index}].nested[{offset}]"
+                if not isinstance(spec, dict):
+                    raise ConformanceError(f"{label} must be an object")
+                if "method" in spec and (not isinstance(spec["method"], str) or not spec["method"]):
+                    raise ConformanceError(f"{label}.method must be a non-empty string")
+                has_result = "result" in spec
+                has_error = "error" in spec
+                if has_result == has_error:
+                    raise ConformanceError(f"{label} must contain exactly one of result or error")
+                if has_result and not isinstance(spec["result"], dict):
+                    raise ConformanceError(f"{label}.result must be an object")
+                if has_error and (not isinstance(spec["error"], dict) or
+                        not isinstance(spec["error"].get("code"), str) or
+                        not isinstance(spec["error"].get("message"), str)):
+                    raise ConformanceError(f"{label}.error must have a string code and message")
+        if "assertContentText" in case and not isinstance(case["assertContentText"], str):
+            raise ConformanceError(f"calls[{index}].assertContentText must be a string")
+        if "assertStructuredContent" in case and not isinstance(case["assertStructuredContent"], dict):
+            raise ConformanceError(f"calls[{index}].assertStructuredContent must be an object")
     return calls
+
+
+class ProviderSession:
+    """One provider subprocess, driven one request at a time.
+
+    A background thread pumps stdout lines into a queue rather than this
+    class calling readline() directly on the deadline path: a plain
+    `select()` on a text-mode pipe can report "not ready" while a complete
+    line already sits in Python's own decode buffer (left over from a
+    previous larger read), which would stall a request that has already been
+    answered. Pulling from a queue with `Queue.get(timeout=...)` has no such
+    blind spot - the pump thread only ever puts whole lines on it.
+    """
+
+    def __init__(self, executable: Path, timeout: float) -> None:
+        self._deadline = time.monotonic() + timeout
+        self._process = subprocess.Popen(
+            [str(executable), "--provider"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        self._stdout_pump = threading.Thread(target=self._pump_stdout, daemon=True)
+        self._stdout_pump.start()
+        self._stderr_chunks: list[str] = []
+        self._stderr_pump = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._stderr_pump.start()
+
+    def _pump_stdout(self) -> None:
+        assert self._process.stdout is not None
+        for line in self._process.stdout:
+            self._lines.put(line)
+        self._lines.put(None)  # EOF sentinel: unblocks a waiter forever, not just once.
+
+    def _pump_stderr(self) -> None:
+        assert self._process.stderr is not None
+        for line in self._process.stderr:
+            self._stderr_chunks.append(line)
+
+    def send(self, message: dict[str, Any]) -> None:
+        assert self._process.stdin is not None
+        try:
+            self._process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise ConformanceError(f"provider closed stdin: {error}") from error
+
+    def read_message(self) -> Any:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise ConformanceError(f"provider produced no output within the timeout")
+        try:
+            line = self._lines.get(timeout=remaining)
+        except queue.Empty:
+            raise ConformanceError(f"provider produced no output within the timeout")
+        if line is None:
+            raise ConformanceError("provider closed stdout unexpectedly")
+        try:
+            return load_json(line, "provider stdout")
+        except ConformanceError as error:
+            raise ConformanceError(f"provider stdout protocol contamination: {error}") from error
+
+    def stderr(self) -> str:
+        self._stderr_pump.join(timeout=2)
+        return "".join(self._stderr_chunks)
+
+    def close(self) -> int:
+        if self._process.stdin is not None and not self._process.stdin.closed:
+            try:
+                self._process.stdin.close()
+            except OSError:
+                pass
+        remaining = self._deadline - time.monotonic()
+        try:
+            self._process.wait(timeout=remaining if remaining > 0 else 1)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=5)
+        self._stdout_pump.join(timeout=2)
+        self._stderr_pump.join(timeout=2)
+        if self._process.stdout is not None:
+            self._process.stdout.close()
+        if self._process.stderr is not None:
+            self._process.stderr.close()
+        return self._process.returncode
+
+
+def exchange(
+    session: ProviderSession,
+    envelope: dict[str, Any],
+    expect_error: bool,
+    nested_specs: list[dict[str, Any]] | None = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Sends one request and returns its validated result-or-error, plus any
+    provider/3 events observed along the way.
+
+    A `provider/nestedRequest` frame arriving here is answered inline, in
+    the order `nested_specs` declares - this runner playing the host's side
+    of docs/provider-protocol.md's nested round trip - and two mismatches are
+    both reported as errors rather than silently tolerated: a nested request
+    the case did not declare, and a declared one the provider never opened
+    before the call's own response arrived.
+    """
+    session.send(envelope)
+    remaining_nested = list(nested_specs or [])
+    events: list[dict[str, Any]] = []
+    while True:
+        message = session.read_message()
+        if is_nested_request(message):
+            if not remaining_nested:
+                raise ConformanceError(
+                    f"unexpected provider/nestedRequest during {envelope['method']} (id {envelope['id']})"
+                )
+            spec = remaining_nested.pop(0)
+            nested_id = validate_nested_request(message, spec)
+            session.send(build_nested_reply(nested_id, spec))
+            continue
+        if isinstance(message, dict) and "id" not in message:
+            validate_event(message)
+            events.append(message)
+            continue
+        if remaining_nested:
+            raise ConformanceError(
+                f"{envelope['method']} (id {envelope['id']}) completed with "
+                f"{len(remaining_nested)} declared nested request(s) never opened"
+            )
+        result = validate_envelope(message, envelope["id"], expect_error)
+        return result, events
 
 
 def run_conformance(executable: Path, cases: list[dict[str, Any]], timeout: float) -> dict[str, Any]:
     if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise ConformanceError("provider must be an absolute executable file")
-    requests = [request(1, "provider/describe"), request(2, "provider/activate")]
-    expectations: list[bool] = [False, False]
-    requests.append(request(3, "provider/call", {
-        "name": "org.maelys.conformance.unknown-tool",
-        "arguments": {},
-    }))
-    expectations.append(True)
-    next_id = 4
-    for case in cases:
-        requests.append(request(next_id, "provider/call", {
-            "name": case["tool"],
-            "arguments": case.get("arguments", {}),
-        }))
-        expectations.append(case.get("expect", "success") == "error")
-        next_id += 1
-    requests.append(request(next_id, "provider/shutdown"))
-    expectations.append(False)
-    serialized = "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n" for item in requests)
+    session = ProviderSession(executable, timeout)
+    events: list[dict[str, Any]] = []
     try:
-        completed = subprocess.run(
-            [str(executable), "--provider"],
-            input=serialized,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise ConformanceError(f"provider exceeded {timeout:g}s") from error
-    if completed.returncode != 0:
-        raise ConformanceError(f"provider exited with {completed.returncode}: {completed.stderr.strip()}")
-    lines = completed.stdout.splitlines()
-    try:
-        messages = [load_json(line, f"stdout line {index + 1}")
-            for index, line in enumerate(lines)]
-    except ConformanceError as error:
-        raise ConformanceError(f"provider stdout protocol contamination: {error}") from error
-    events = [message for message in messages if isinstance(message, dict) and "id" not in message]
-    responses = [message for message in messages if not (isinstance(message, dict) and "id" not in message)]
-    for event in events:
-        validate_event(event)
-    if len(responses) != len(requests):
-        raise ConformanceError(
-            f"provider stdout contains {len(responses)} response(s), expected {len(requests)}; protocol contamination or missing response"
-        )
-    results = [validate_envelope(response, item["id"], expected) for response, item, expected in zip(responses, requests, expectations)]
-    catalog = validate_description(results[0])
-    if results[1] != {}:
-        raise ConformanceError("provider/activate must return an empty object")
-    for offset, case in enumerate(cases, start=3):
-        if case["tool"] not in catalog:
-            raise ConformanceError(f"case references an unpublished tool: {case['tool']}")
-        if case.get("expect", "success") == "success":
-            validate_call_result(results[offset])
-    if results[-1] != {}:
+        describe_result, seen = exchange(session, request(1, "provider/describe"), False)
+        events += seen
+        activate_result, seen = exchange(session, request(2, "provider/activate"), False)
+        events += seen
+        _, seen = exchange(session, request(3, "provider/call", {
+            "name": "org.maelys.conformance.unknown-tool",
+            "arguments": {},
+        }), True)
+        events += seen
+        catalog = validate_description(describe_result)
+        if activate_result != {}:
+            raise ConformanceError("provider/activate must return an empty object")
+        next_id = 4
+        results: list[Any] = []
+        for case in cases:
+            if case["tool"] not in catalog:
+                raise ConformanceError(f"case references an unpublished tool: {case['tool']}")
+            expect_error = case.get("expect", "success") == "error"
+            result, seen = exchange(session, request(next_id, "provider/call", {
+                "name": case["tool"],
+                "arguments": case.get("arguments", {}),
+            }), expect_error, case.get("nested"))
+            events += seen
+            if not expect_error:
+                validate_call_result(result)
+                apply_call_assertions(result, case)
+            results.append(result)
+            next_id += 1
+        shutdown_result, seen = exchange(session, request(next_id, "provider/shutdown"), False)
+        events += seen
+    finally:
+        returncode = session.close()
+    if returncode != 0:
+        raise ConformanceError(f"provider exited with {returncode}: {session.stderr().strip()}")
+    if shutdown_result != {}:
         raise ConformanceError("provider/shutdown must return an empty object")
     return {
         "valid": True,
-        "provider": results[0]["name"],
-        "version": results[0]["version"],
+        "provider": describe_result["name"],
+        "version": describe_result["version"],
         "toolCount": len(catalog),
         "callCount": len(cases),
         "eventCount": len(events),
-        "stderr": completed.stderr,
+        "stderr": session.stderr(),
     }
 
 

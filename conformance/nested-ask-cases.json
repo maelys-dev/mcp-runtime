@@ -1,0 +1,22 @@
+{
+  "calls": [
+    {
+      "tool": "nested.ask",
+      "arguments": { "message": "Proceed?" },
+      "expect": "success",
+      "nested": [
+        { "method": "elicitation/create", "result": { "answer": "yes" } }
+      ],
+      "assertContentText": "yes"
+    },
+    {
+      "tool": "nested.ask",
+      "arguments": {},
+      "expect": "success",
+      "nested": [
+        { "method": "elicitation/create", "error": { "code": "denied", "message": "the user declined" } }
+      ],
+      "assertContentText": "error:denied"
+    }
+  ]
+}

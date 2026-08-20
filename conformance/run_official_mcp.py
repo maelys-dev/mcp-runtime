@@ -97,35 +97,36 @@ LEGACY_EXCLUDED = {
     "prompts-get-with-args": "no prompts module",
     "prompts-get-embedded-resource": "no prompts module",
     "prompts-get-with-image": "no prompts module",
-    # Architectural mismatch: these require the server to send a NESTED
-    # sampling/createMessage or elicitation/create request mid-tools/call,
-    # synchronously, over the same connection, blocking for the client's
-    # reply before completing the original call (verified against the
-    # official scenario source, src/scenarios/server/tools.ts and
-    # elicitation-{defaults,enums}.ts). mcp-runtime's MRTR module implements
-    # only the resumable pattern (return an input_required result; the caller
-    # retries tools/call with inputResponses) - the same pattern the
-    # 2026-07-28 input-required-result-* scenarios test, which this script
-    # already runs. That's also why 2026-07-28 dropped the nested variant:
-    # no tools-call-sampling or tools-call-elicitation scenario exists in the
-    # 2026-07-28 requirement set at all.
+    # tools-call-sampling, tools-call-elicitation, elicitation-sep1034-defaults
+    # and elicitation-sep1330-enums used to be excluded here: they require the
+    # server to send a NESTED sampling/createMessage or elicitation/create
+    # request mid-tools/call, synchronously over the same connection, blocking
+    # for the client's reply before completing the original call (verified
+    # against the official scenario source, src/scenarios/server/tools.ts and
+    # elicitation-{defaults,enums}.ts) - a second MRTR shape mcp-runtime's host
+    # core, all three provider SDKs and this fixture provider now implement
+    # alongside the resumable one (return an input_required result; the caller
+    # retries tools/call with inputResponses), which is what the 2026-07-28
+    # input-required-result-* scenarios this script already runs exercise
+    # instead. See docs/architecture.md's MRTR section for both shapes, and
+    # conformance/official_tools_provider.py's test_sampling/test_elicitation/
+    # test_elicitation_sep1034_defaults/test_elicitation_sep1330_enums
+    # handlers (built on the Python SDK's context.request_sampling /
+    # context.request_elicitation) for this fixture's side of it. That is
+    # also still why 2026-07-28 has no nested variant of its own: no
+    # tools-call-sampling or tools-call-elicitation scenario exists in the
+    # 2026-07-28 requirement set at all, only the resumable one.
     #
-    # Caveat this exclusion surfaced: InputRequiredResult (resultType,
-    # inputRequests, requestState) is itself a 2026-07-28-only schema type -
-    # the official 2025-06-18/2025-11-25 CallToolResult schema has no
-    # resultType field and requires `content` unconditionally. So today's
-    # legacy input_required support (see docs/architecture.md) is understood
-    # by mcp-runtime and by clients that were specifically updated for it
-    # (e.g. Hermes) - not by a generic, schema-validating 2025-11-25 client,
-    # which would see a response missing its required `content` field. That's
-    # a real gap in spec fidelity, not just a missing test scenario; closing
-    # it needs an explicit decision on how far to take it (see the PR/commit
-    # this constant landed in for that discussion), not a silent scenario
-    # addition here.
-    "tools-call-sampling": "requires the nested in-band pattern; see the block comment above",
-    "tools-call-elicitation": "requires the nested in-band pattern; see the block comment above",
-    "elicitation-sep1034-defaults": "same nested pattern as tools-call-elicitation",
-    "elicitation-sep1330-enums": "same nested pattern as tools-call-elicitation",
+    # The InputRequiredResult (resultType, inputRequests, requestState) caveat
+    # the old exclusion recorded still stands and is unrelated to this: it is
+    # itself a 2026-07-28-only schema type - the official 2025-06-18/2025-11-25
+    # CallToolResult schema has no resultType field and requires `content`
+    # unconditionally - so legacy input_required support (see
+    # docs/architecture.md) remains understood only by mcp-runtime and clients
+    # specifically updated for it (e.g. Hermes), not by a generic,
+    # schema-validating 2025-11-25 client. The nested shape closes exactly the
+    # four scenarios above; it does not change that caveat.
+    #
     # Standard method not implemented: mcp-runtime's resources module handles
     # exactly resources/list, resources/templates/list, resources/read (see
     # handles() in src/modules/resources.c). Its "subscriptions" module
@@ -192,18 +193,24 @@ def legacy_scenarios(package: str) -> list[str]:
     return [name for name in all_scenarios if name not in LEGACY_EXCLUDED]
 
 
-def _is_notification(body: bytes) -> bool:
-    """A JSON-RPC message with no `id` is a notification: mcp-runtime writes no
-    response line for it. A bridge that unconditionally blocks on readline()
-    after forwarding one hangs forever - this is what makes the legacy pass
-    different from the modern one, since the stateless modern era never sends
-    `notifications/initialized` (no session, no handshake) while every legacy
-    session does."""
+def _expects_reply(body: bytes) -> bool:
+    """True only for a JSON-RPC REQUEST - has both `method` and `id`.
+
+    A notification (no `id`) gets no response line from mcp-runtime, ever.
+    Neither does a plain JSON-RPC response (has `id`, no `method`) - the shape
+    a real MCP client's reply to a server-initiated NESTED request takes
+    (`elicitation/create`/`sampling/createMessage` mid-`tools/call`; see
+    docs/architecture.md "Nested requests"). Both are forward-and-forget: a
+    bridge that unconditionally blocked on readline() after forwarding either
+    one would hang forever, waiting for "a response to a response" that the
+    runtime never sends - a reply is answered by the ORIGINAL call's own
+    still-open stream resuming, not by a response of its own.
+    """
     try:
         parsed = json.loads(body)
     except (ValueError, json.JSONDecodeError):
         return False
-    return isinstance(parsed, dict) and "id" not in parsed
+    return isinstance(parsed, dict) and "id" in parsed and "method" in parsed
 
 
 class StdioBridge:
@@ -219,29 +226,52 @@ class StdioBridge:
             raise RuntimeError("failed to open runtime stdio")
         self._input: BinaryIO = self._process.stdin
         self._output: BinaryIO = self._process.stdout
-        self._lock = threading.Lock()
+        # Two locks, not one: writing a reply to an outstanding nested
+        # request (`send`, below) must never wait behind a call that is still
+        # mid-`stream()` - that was exactly the deadlock this replaced (see
+        # the commit this landed in). `_write_lock` alone serializes writes;
+        # `_stream_lock` additionally serializes one call's whole read
+        # lifecycle, since only one call is ever "the current streaming
+        # exchange" in these scenarios (the client never pipelines a second
+        # tools/call before the first completes).
+        self._write_lock = threading.Lock()
+        self._stream_lock = threading.Lock()
 
-    def request(self, body: bytes) -> list[bytes] | None:
-        """Returns every line the runtime emits for this request, the final
-        response last.
-
-        A request can produce request-scoped notifications - progress - ahead
-        of its response. Reading exactly one line would hand the caller the
-        first notification as if it were the response, and leave the rest to
-        corrupt the next request; that is precisely what happened when
-        tools-call-with-progress was first enabled. Lines are therefore read
-        until the one carrying this request's id arrives.
-        """
-        with self._lock:
-            if self._process.poll() is not None:
-                raise RuntimeError(f"runtime exited with status {self._process.returncode}")
-            frame = body.rstrip(b"\r\n") + b"\n"
+    def _write(self, body: bytes) -> None:
+        if self._process.poll() is not None:
+            raise RuntimeError(f"runtime exited with status {self._process.returncode}")
+        frame = body.rstrip(b"\r\n") + b"\n"
+        with self._write_lock:
             self._input.write(frame)
             self._input.flush()
-            if _is_notification(body):
-                return None
-            wanted = json.loads(body).get("id")
-            lines: list[bytes] = []
+
+    def send(self, body: bytes) -> None:
+        """Forwards a notification or a nested-request reply and returns
+        immediately - see _expects_reply for why neither waits for output."""
+        self._write(body)
+
+    def stream(self, body: bytes):
+        """Writes a JSON-RPC request and yields `(line, is_final)` for every
+        line the runtime emits for it, one at a time as it arrives - the line
+        carrying this request's own id last, with `is_final` True only on it.
+
+        Progressive, not buffered-then-returned: a request can produce
+        request-scoped notifications - progress - or, since nested MRTR
+        landed, a server-initiated request (`elicitation/create`,
+        `sampling/createMessage`) ahead of its own response. A caller that
+        only sees the whole batch once every line has already arrived can
+        never forward an intervening line to the real HTTP client while this
+        call's connection is still open - and a client that is never shown a
+        nested request it must answer has nothing to reply to, which is what
+        produced "-32001: Request timed out" on tools-call-sampling/
+        tools-call-elicitation before this generator existed. Reading exactly
+        one line and stopping has the mirror-image bug (tools-call-with-progress
+        first caught it): the first notification would be handed back as if
+        it were the response, corrupting whatever reads the connection next.
+        """
+        wanted = json.loads(body).get("id")
+        with self._stream_lock:
+            self._write(body)
             while True:
                 line = self._output.readline(MAX_BODY_BYTES + 1)
                 if not line:
@@ -249,13 +279,25 @@ class StdioBridge:
                 if len(line) > MAX_BODY_BYTES:
                     raise RuntimeError("runtime response exceeds the bridge limit")
                 line = line.rstrip(b"\r\n")
-                lines.append(line)
                 try:
                     parsed = json.loads(line)
                 except json.JSONDecodeError:
                     raise RuntimeError("runtime emitted a line that is not JSON")
-                if isinstance(parsed, dict) and parsed.get("id") == wanted:
-                    return lines
+                is_final = isinstance(parsed, dict) and parsed.get("id") == wanted
+                yield line, is_final
+                if is_final:
+                    return
+
+    def request(self, body: bytes) -> list[bytes] | None:
+        """The fully-buffered convenience `check_exclusions_still_hold` uses:
+        every line for one simple, non-nesting exchange, response last. The
+        HTTP-facing handler below does not use this - it needs `stream`'s
+        progressive delivery, not a batch collected after the fact.
+        """
+        if not _expects_reply(body):
+            self.send(body)
+            return None
+        return [line for line, _ in self.stream(body)]
 
     def close(self) -> None:
         process = getattr(self, "_process", None)
@@ -290,26 +332,59 @@ def handler_for(bridge: StdioBridge) -> type[BaseHTTPRequestHandler]:
                 parsed = json.loads(body)
                 if not isinstance(parsed, dict):
                     raise ValueError("request body must be a JSON object")
-                lines = bridge.request(body)
             except (ValueError, json.JSONDecodeError) as error:
                 payload = json.dumps({"error": str(error)}).encode()
                 self._send(400, payload)
                 return
+            if not _expects_reply(body):
+                # Notification, or a client's reply to a server-initiated
+                # nested request: forward-and-forget either way (see
+                # _expects_reply) - no JSON-RPC reply is ever generated, per
+                # the Streamable HTTP spec.
+                try:
+                    bridge.send(body)
+                except Exception as error:  # keep diagnostics at the test boundary
+                    payload = json.dumps({"error": str(error)}).encode()
+                    self._send(502, payload)
+                    return
+                self._send(202, b"")
+                return
+            try:
+                self._relay(bridge.stream(body))
             except Exception as error:  # keep diagnostics at the test boundary
                 payload = json.dumps({"error": str(error)}).encode()
                 self._send(502, payload)
+
+        def _relay(self, lines) -> None:
+            """Sends the first line as a plain JSON response if it is already
+            the final one - unchanged from before streaming existed, for
+            every scenario that never nests or reports progress - or switches
+            to a chunked SSE stream the moment a line turns out not to be
+            final, flushing each line to the wire as it arrives rather than
+            once the whole exchange is done. See StdioBridge.stream for why
+            that distinction matters for the nested pattern.
+            """
+            iterator = iter(lines)
+            try:
+                line, is_final = next(iterator)
+            except StopIteration:
+                raise RuntimeError("runtime produced no output for a request expecting one")
+            if is_final:
+                self._send(200, line)
                 return
-            if lines is None:
-                # Notification: no JSON-RPC reply, per the Streamable HTTP spec.
-                self._send(202, b"")
-                return
-            if len(lines) == 1:
-                self._send(200, lines[0])
-                return
-            # Notifications preceded the response, so the spec requires this
-            # exchange to be an SSE stream rather than a single JSON object.
-            payload = b"".join(b"data: " + line + b"\r\n\r\n" for line in lines)
-            self._send(200, payload, content_type="text/event-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self._write_chunk(line)
+            for line, _ in iterator:
+                self._write_chunk(line)
+            self._write_chunk(b"")  # zero-length chunk: end of body, per RFC 9112
+
+        def _write_chunk(self, line: bytes) -> None:
+            payload = b"data: " + line + b"\r\n\r\n" if line else b""
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+            self.wfile.flush()
 
         def _send(self, status: int, payload: bytes,
                   content_type: str = "application/json") -> None:

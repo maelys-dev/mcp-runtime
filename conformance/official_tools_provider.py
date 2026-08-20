@@ -20,6 +20,20 @@ EMPTY_OBJECT_SCHEMA = {
     "additionalProperties": False,
 }
 
+SAMPLING_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"prompt": {"type": "string"}},
+    "required": ["prompt"],
+    "additionalProperties": False,
+}
+
+ELICITATION_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"message": {"type": "string"}},
+    "required": ["message"],
+    "additionalProperties": False,
+}
+
 
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nXsAAAAASUVORK5CYII="
 WAV = "UklGRgQAAABXQVZF"
@@ -71,6 +85,117 @@ def input_required_elicitation(_arguments: dict[str, object], context: object):
             "required": ["name"],
         }},
     }})
+
+
+def sampling_tool(arguments: dict[str, object], context: object):
+    """Fixture for the official `tools-call-sampling` scenario: opens a real
+    NESTED sampling/createMessage request mid-call and blocks for the
+    client's reply, rather than mcp-runtime's other MRTR shape (ending the
+    call with an input_required result the caller retries) - the official
+    scenario's own client handler answers synchronously on the same
+    connection and expects the tool call to complete once it does, which
+    only the nested pattern satisfies. See docs/architecture.md's MRTR
+    section for both shapes.
+    """
+    prompt = arguments.get("prompt") if isinstance(arguments, dict) else None
+    prompt = prompt if isinstance(prompt, str) else "Test prompt for sampling"
+    result = context.request_sampling({
+        "messages": [{"role": "user", "content": {"type": "text", "text": prompt}}],
+        "maxTokens": 100,
+    })
+    content = result.get("content") if isinstance(result, dict) else None
+    text = content.get("text") if isinstance(content, dict) else None
+    return complete_result(content=[{
+        "type": "text", "text": text if isinstance(text, str) else "sampling response",
+    }])
+
+
+def elicitation_tool(arguments: dict[str, object], context: object):
+    """Fixture for the official `tools-call-elicitation` scenario: same
+    nested pattern as sampling_tool above, but elicitation/create."""
+    message = arguments.get("message") if isinstance(arguments, dict) else None
+    message = message if isinstance(message, str) else "Please provide your information"
+    result = context.request_elicitation({
+        "message": message,
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string"},
+                "email": {"type": "string"},
+            },
+            "required": ["username", "email"],
+        },
+    })
+    content = result.get("content") if isinstance(result, dict) else None
+    username = content.get("username") if isinstance(content, dict) else None
+    return complete_result(content=[{
+        "type": "text",
+        "text": f"Hello, {username}!" if isinstance(username, str) else "no response",
+    }])
+
+
+def elicitation_sep1034_defaults(_arguments: dict[str, object], context: object):
+    """Fixture for `elicitation-sep1034-defaults`: the official scenario
+    inspects the requestedSchema this handler sends - not the client's
+    answer - so every property below carries the exact type/default pair
+    SEP-1034 requires (one of each JSON Schema primitive type)."""
+    context.request_elicitation({
+        "message": "Please provide your details",
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "default": "John Doe"},
+                "age": {"type": "integer", "default": 30},
+                "score": {"type": "number", "default": 95.5},
+                "status": {
+                    "type": "string", "enum": ["active", "inactive"], "default": "active",
+                },
+                "verified": {"type": "boolean", "default": True},
+            },
+        },
+    })
+    return complete_result(content=[{"type": "text", "text": "elicitation-sep1034-defaults-ok"}])
+
+
+def elicitation_sep1330_enums(_arguments: dict[str, object], context: object):
+    """Fixture for `elicitation-sep1330-enums`: same shape as the SEP-1034
+    fixture above, but exercising SEP-1330's five enum-schema forms (plain
+    enum, titled oneOf, legacy enumNames, and both as array items)."""
+    context.request_elicitation({
+        "message": "Please choose",
+        "requestedSchema": {
+            "type": "object",
+            "properties": {
+                "untitledSingle": {"type": "string", "enum": ["option1", "option2"]},
+                "titledSingle": {
+                    "type": "string",
+                    "oneOf": [
+                        {"const": "value1", "title": "Value 1"},
+                        {"const": "value2", "title": "Value 2"},
+                    ],
+                },
+                "legacyEnum": {
+                    "type": "string",
+                    "enum": ["opt1", "opt2"],
+                    "enumNames": ["Option 1", "Option 2"],
+                },
+                "untitledMulti": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["option1", "option2"]},
+                },
+                "titledMulti": {
+                    "type": "array",
+                    "items": {
+                        "anyOf": [
+                            {"const": "value1", "title": "Value 1"},
+                            {"const": "value2", "title": "Value 2"},
+                        ],
+                    },
+                },
+            },
+        },
+    })
+    return complete_result(content=[{"type": "text", "text": "elicitation-sep1330-enums-ok"}])
 
 
 def capability_aware_input(_arguments: dict[str, object], context: object):
@@ -170,6 +295,20 @@ PROVIDER = create_provider(
             effect="read",
             handler=intentional_error,
         ),
+        Tool(name="test_sampling", title="Request LLM sampling",
+            description="Opens a nested sampling/createMessage request mid-call.",
+            input_schema=SAMPLING_INPUT_SCHEMA, effect="read", handler=sampling_tool),
+        Tool(name="test_elicitation", title="Request user input",
+            description="Opens a nested elicitation/create request mid-call.",
+            input_schema=ELICITATION_INPUT_SCHEMA, effect="read", handler=elicitation_tool),
+        Tool(name="test_elicitation_sep1034_defaults", title="Elicit with schema defaults",
+            description="Nested elicitation/create exercising SEP-1034 default values.",
+            input_schema=EMPTY_OBJECT_SCHEMA, effect="read",
+            handler=elicitation_sep1034_defaults),
+        Tool(name="test_elicitation_sep1330_enums", title="Elicit with enum schemas",
+            description="Nested elicitation/create exercising SEP-1330 enum schemas.",
+            input_schema=EMPTY_OBJECT_SCHEMA, effect="read",
+            handler=elicitation_sep1330_enums),
     ),
     resources=(
         Resource(uri="test://static-text", name="Static text",
