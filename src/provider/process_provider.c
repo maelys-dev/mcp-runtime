@@ -250,7 +250,12 @@ static void *process_reader_main(void *opaque) {
                     while (json_array_size(process->pending_progress) >= MAX_PENDING_PROGRESS) {
                         (void)json_array_remove(process->pending_progress, 0);
                     }
-                    (void)json_array_append(process->pending_progress, frame);
+                    /* Copied for the same reason the nested request below is:
+                     * the reader releases its message as soon as it has
+                     * queued this, and the thread that drains the queue must
+                     * not be reading a node this one is still releasing. */
+                    (void)json_array_append_new(process->pending_progress,
+                        json_deep_copy(frame));
                     pthread_cond_broadcast(&process->response_ready);
                 }
             }
@@ -285,7 +290,22 @@ static void *process_reader_main(void *opaque) {
                 json_decref(message);
                 break;
             }
-            process->pending_nested = json_incref(params);
+            /*
+             * A copy, so the reader and the thread that acts on this frame
+             * share no node. A reference would leave the worker reading the
+             * request's strings while this thread releases the message they
+             * belong to, which is the same "two threads, one jansson node"
+             * race the rest of this runtime is built to avoid - and the wake
+             * below is precisely what lets those two run at once.
+             */
+            process->pending_nested = json_deep_copy(params);
+            if (!process->pending_nested) {
+                set_process_failure_locked(process, MAELYS_MCP_ERR_MEMORY,
+                    "cannot take the provider's nested request");
+                pthread_mutex_unlock(&process->state_mutex);
+                json_decref(message);
+                break;
+            }
             pthread_cond_broadcast(&process->response_ready);
             pthread_mutex_unlock(&process->state_mutex);
             json_decref(message);

@@ -50,6 +50,16 @@
   `denied` before a byte is sent — the same rule `input_required` already
   enforced, so which surfaces a provider may reach does not depend on which
   multi-round-trip shape it chose.
+- **Fix: threads no longer share JSON nodes.** A provider's reader thread
+  handed the thread inside the call a reference into the message it was about
+  to release (progress frames, and now nested requests); a response took a
+  reference to the request's own `id`; a `notifications/progress` frame took
+  one to the request's `progressToken`. In each case two threads could write
+  one jansson refcount, or one could read a node the other was freeing, with
+  nothing ordering them. The progress cases predate this release and were
+  invisible because no suite ran `serve_stdio` under ThreadSanitizer; some
+  reproduced only on Linux. Everything crossing a thread boundary is copied
+  now.
 - **Fix: an outbound frame no longer shares a node with the request that
   produced it.** A response took a reference to the request's own `id`, and a
   `notifications/progress` frame took one to the request's `progressToken`, so
