@@ -383,7 +383,7 @@ static maelys_mcp_result_t dispatch_admitted(
          * longer ours, and a wrapper that swallowed it may already have
          * released it, so the id has to survive independently of both.
          */
-        json_t *id = json_incref(json_object_get(response, "id"));
+        json_t *id = json_deep_copy(json_object_get(response, "id"));
         status = effective->complete(effective->context, response);
         if (status != MAELYS_MCP_OK) {
             json_decref(response);
