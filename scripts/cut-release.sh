@@ -3,8 +3,9 @@
 # One-command release. From a clean, up-to-date main, this:
 #   1. writes VERSION — the single source of truth — and regenerates
 #      include/maelys/mcp/version.h from it (scripts/generate-version-header.sh);
-#   2. runs `make check` LOCALLY — the gate that catches a broken bump before
-#      it ever reaches CI or a tag;
+#   2. runs `make check` LOCALLY, then `make check CC=gcc` in a Linux
+#      container — the gate that catches a broken bump, on both compilers
+#      this codebase actually ships on, before it ever reaches CI or a tag;
 #   3. opens a release PR and waits for the required checks;
 #   4. merges it, then creates and pushes the annotated vX.Y.Z tag.
 #
@@ -13,6 +14,14 @@
 #
 # Usage: scripts/cut-release.sh X.Y.Z
 #   Write the CHANGELOG entry (`## X.Y.Z - <date>`) before running.
+#
+# v0.13.0 shipped a GCC-only -Werror bug that every clang-based check (this
+# script's own local `make check`, plus ci.yml before check-gcc existed)
+# missed - it only surfaced on the tag-triggered release build's Ubuntu
+# runners, after the tag was already public. ci.yml's check-gcc job (#28)
+# now catches this class of bug on every PR; the Docker step below catches
+# it here too, before a release branch is even opened. Belt and suspenders,
+# deliberately - CI is the enforced backstop, this is the fast local one.
 set -euo pipefail
 
 repo_slug="maelys-dev/mcp-runtime"
@@ -45,6 +54,33 @@ bash scripts/generate-version-header.sh
 echo "==> make check (local gate)"
 make clean >/dev/null
 make check
+
+# --- second local gate: the release build's actual compiler. CC ?= cc in
+# the Makefile resolves to GCC on the release workflow's Ubuntu runners;
+# make check above just ran with whatever `cc` this machine has (clang, on
+# macOS), which never exercises GCC's stricter -Werror findings (see the
+# header comment). Reproduce it in a throwaway Linux container instead -
+# same pinned image and platform as RELEASING.md's manual reproduction
+# recipe, just wired in here instead of staying documentation nobody runs
+# before tagging. Architecture doesn't matter for a compiler-diagnostic
+# bug, so this only reproduces one of the release matrix's three targets -
+# fast, and sufficient for what this gate is actually checking. ---
+if [ -n "${SKIP_DOCKER_CHECK:-}" ]; then
+  echo "==> SKIP_DOCKER_CHECK set - skipping the GCC/Linux gate. Only do this if you have a real reason." >&2
+elif ! command -v docker >/dev/null 2>&1; then
+  echo "docker not found - required for the GCC/Linux gate (see RELEASING.md)." >&2
+  echo "Install/start Docker, or set SKIP_DOCKER_CHECK=1 to bypass (not recommended)." >&2
+  exit 1
+else
+  echo "==> make check CC=gcc, in a Linux container (second local gate)"
+  docker run --rm --platform linux/arm64 -v "$root:/source:ro" ubuntu:24.04 bash -c '
+    set -e
+    apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+      gcc libc6-dev make pkg-config libjansson-dev liburiparser-dev
+    cp -a /source /work && cd /work && rm -rf build
+    make check CC=gcc
+  '
+fi
 
 # --- branch, commit, PR ---
 branch="release/${tag}"
