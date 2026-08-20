@@ -52,6 +52,7 @@ LIB_SOURCES := \
 	src/core/resources.c \
 	src/core/schema.c \
 	src/core/runtime.c \
+	src/core/middleware.c \
 	src/modules/registry.c \
 	src/modules/mrtr.c \
 	src/modules/tools.c \
@@ -99,6 +100,10 @@ $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider
 	ln -sf $(notdir $<) $@
 
 $(BIN)/test-runtime: $(OBJ)/tests/test_runtime.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+$(BIN)/test-middleware: $(OBJ)/tests/test_middleware.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -177,7 +182,7 @@ $(NO_THREAD_BIN): tests/test_channel_no_thread.c $(LIB_SOURCES)
 test-channel-no-thread-nosanitize: $(NO_THREAD_BIN)
 	$(NO_THREAD_BIN)
 
-test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
+test: all $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
 	$(BIN)/test-jsonrpc-core
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
@@ -187,6 +192,7 @@ test: all $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-p
 	$(BIN)/test-subscriptions
 	$(BIN)/test-channels
 	$(BIN)/test-channel-perf
+	$(BIN)/test-middleware
 	$(BIN)/test-runtime
 	$(BIN)/test-runtime-protocol
 	$(BIN)/test-provider-sdk

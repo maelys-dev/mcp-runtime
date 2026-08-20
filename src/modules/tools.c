@@ -17,36 +17,56 @@ static maelys_mcp_owned_tool_t *find_tool(
     return NULL;
 }
 
-static int policy_allows(
+/*
+ * Hook 2 for the tools surface. The chain decides on the resolved tool, never
+ * on the name the client wrote, so no future rename can route around a deny.
+ * Whole params rather than just arguments: inputResponses and requestState
+ * are their siblings, and a policy blind to continuation traffic is not a
+ * policy over this protocol.
+ */
+static maelys_mcp_authorize_decision_t authorize_tool(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_module_request_t *request,
     const maelys_mcp_owned_tool_t *tool,
     maelys_mcp_operation_t operation) {
-    if (!runtime->authorize) return 1;
-    maelys_mcp_request_context_t context = {
+    if (!maelys_mcp_chain_has_authorize(runtime)) return MAELYS_MCP_AUTHORIZE_ALLOW;
+    maelys_mcp_authorize_context_t context = {
+        .operation = operation,
+        .effect = tool ? tool->effect : MAELYS_MCP_EFFECT_UNSPECIFIED,
+        .tool_name = tool ? tool->name : NULL,
         .protocol_version = request->protocol_version,
         .client_name = request->client_name,
-        .tool_name = tool ? tool->name : NULL,
-        .operation = operation,
-        .effect = tool ? tool->effect : MAELYS_MCP_EFFECT_UNSPECIFIED
+        .channel = request->channel,
+        .params = request->params
     };
-    return runtime->authorize(runtime->policy_context, &context) != 0;
+    return maelys_mcp_chain_authorize(runtime, &context);
 }
 
-static void audit(
+/*
+ * Hook 5. `requested_name` is the string the client sent and `tool` is what
+ * resolved from it; they are equal until hook 1 exists, and the journal is
+ * written against the pair rather than against one of them so that they may
+ * diverge later without every audit sink changing meaning.
+ */
+static void audit_tool(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_module_request_t *request,
+    const char *requested_name,
     const maelys_mcp_owned_tool_t *tool,
     maelys_mcp_result_t outcome) {
-    if (!runtime->audit) return;
-    maelys_mcp_request_context_t context = {
+    if (!maelys_mcp_chain_has_audit(runtime)) return;
+    maelys_mcp_audit_context_t record = {
+        .operation = MAELYS_MCP_OPERATION_CALL,
+        .effect = tool ? tool->effect : MAELYS_MCP_EFFECT_UNSPECIFIED,
+        .requested_tool_name = requested_name,
+        .tool_name = tool ? tool->name : NULL,
         .protocol_version = request->protocol_version,
         .client_name = request->client_name,
-        .tool_name = tool ? tool->name : NULL,
-        .operation = MAELYS_MCP_OPERATION_CALL,
-        .effect = tool ? tool->effect : MAELYS_MCP_EFFECT_UNSPECIFIED
+        .channel = request->channel,
+        .params = request->params,
+        .outcome = outcome
     };
-    runtime->audit(runtime->policy_context, &context, outcome);
+    maelys_mcp_chain_audit(runtime, &record);
 }
 
 static json_t *tool_as_json(maelys_mcp_owned_tool_t *tool) {
@@ -80,12 +100,24 @@ static json_t *list_tools(
     const maelys_mcp_module_request_t *request) {
     json_t *result = json_object();
     json_t *tools = json_array();
+    int policy_failed = 0;
     if (!result || !tools) goto failed;
     for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
         maelys_mcp_provider_t *provider = runtime->providers[provider_index];
         for (size_t tool_index = 0; tool_index < provider->tool_count; ++tool_index) {
             maelys_mcp_owned_tool_t *tool = &provider->tools[tool_index];
-            if (!policy_allows(runtime, request, tool, MAELYS_MCP_OPERATION_LIST)) continue;
+            maelys_mcp_authorize_decision_t decision = authorize_tool(runtime,
+                request, tool, MAELYS_MCP_OPERATION_LIST);
+            /*
+             * A chain that could not reach a verdict must not quietly shorten
+             * the catalog: a hidden entry and an unevaluated one are
+             * indistinguishable to the client, so only a real deny omits one.
+             */
+            if (decision == MAELYS_MCP_AUTHORIZE_ERROR) {
+                policy_failed = 1;
+                goto failed;
+            }
+            if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) continue;
             json_t *value = tool_as_json(tool);
             if (!value || json_array_append(tools, value) != 0) {
                 if (value) json_decref(value);
@@ -105,7 +137,7 @@ failed:
     if (result) json_decref(result);
     if (tools) json_decref(tools);
     return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-        "Internal error", NULL);
+        policy_failed ? "Policy evaluation failed" : "Internal error", NULL);
 }
 
 static json_t *text_content(const char *text) {
@@ -332,9 +364,30 @@ static json_t *call_tool(
         return maelys_mcp_error_response(request->id, JSONRPC_INVALID_PARAMS,
             "Invalid tool call", NULL);
     }
-    maelys_mcp_owned_tool_t *tool = find_tool(runtime, json_string_value(name));
+    const char *requested_name = json_string_value(name);
+    maelys_mcp_owned_tool_t *tool = find_tool(runtime, requested_name);
     if (!tool) return maelys_mcp_error_response(request->id,
         JSONRPC_INVALID_PARAMS, "Unknown tool", NULL);
+    /*
+     * Policy runs ahead of schema validation. That is a deliberate change of
+     * order from the pre-chain runtime, not an accident of the rewrite: a
+     * caller who may not use this tool must not be able to map its argument
+     * schema by reading validation error details. The cost is that hook 2
+     * sees params this runtime has not validated yet, which the public
+     * contract states.
+     */
+    maelys_mcp_authorize_decision_t decision = authorize_tool(runtime, request,
+        tool, MAELYS_MCP_OPERATION_CALL);
+    if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) {
+        int failed = decision == MAELYS_MCP_AUTHORIZE_ERROR;
+        audit_tool(runtime, request, requested_name, tool,
+            failed ? MAELYS_MCP_ERR_STATE : MAELYS_MCP_ERR_DENIED);
+        return failed ?
+            maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
+                "Policy evaluation failed", NULL) :
+            maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
+                "Policy denied", NULL);
+    }
     json_t *owned_arguments = NULL;
     if (!arguments) {
         owned_arguments = json_object();
@@ -352,12 +405,6 @@ static json_t *call_tool(
             JSONRPC_INVALID_PARAMS, "Invalid tool arguments", data);
         if (data) json_decref(data);
         return response;
-    }
-    if (!policy_allows(runtime, request, tool, MAELYS_MCP_OPERATION_CALL)) {
-        audit(runtime, request, tool, MAELYS_MCP_ERR_DENIED);
-        if (owned_arguments) json_decref(owned_arguments);
-        return maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
-            "Policy denied", NULL);
     }
     /*
      * params._meta.progressToken is a bare key in both eras - the modern
@@ -395,7 +442,7 @@ static json_t *call_tool(
         status = validate_provider_result(runtime, tool, &provider_result,
             client_capabilities, &required_capabilities, &error);
     }
-    audit(runtime, request, tool, status);
+    audit_tool(runtime, request, requested_name, tool, status);
     json_t *response;
     if (required_capabilities) {
         json_t *data = json_object();

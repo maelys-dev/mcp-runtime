@@ -64,9 +64,6 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
         config->max_message_bytes : MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES;
     runtime->max_subscriptions = config->max_subscriptions ?
         config->max_subscriptions : 64u;
-    runtime->authorize = config->authorize;
-    runtime->audit = config->audit;
-    runtime->policy_context = config->policy_context;
     runtime->providers = calloc(runtime->max_providers, sizeof(*runtime->providers));
     if (!runtime->server_name || !runtime->server_version || !runtime->instructions ||
         !runtime->providers) goto failed;
@@ -153,6 +150,11 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
         maelys_mcp_provider_bind_event_sink(runtime->providers[index], NULL, NULL);
         maelys_mcp_provider_destroy(runtime->providers[index]);
     }
+    /*
+     * After the last channel is gone and provider events have stopped, so no
+     * hook can still be running when a middleware's state is released.
+     */
+    maelys_mcp_chain_destroy(runtime);
     pthread_cond_destroy(&runtime->provider_events_idle);
     pthread_mutex_destroy(&runtime->provider_events_mutex);
     pthread_mutex_destroy(&runtime->channels_mutex);

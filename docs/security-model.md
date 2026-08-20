@@ -12,7 +12,19 @@
 - Tools declare one mandatory effect: `read`, `preview`, `apply`, `commit`, or `execute`.
 - `apply`, `commit`, and `execute` are denied by the reference host unless
   each effect is explicitly enabled with `--allow-effect`.
-- Authorization can hide tools from discovery and deny invocation independently.
+- Authorization can hide tools and resources from discovery and deny invocation
+  independently. Every one of the runtime's five decision points - `tools/list`,
+  `tools/call`, `resources/list`, `resources/templates/list` and
+  `resources/read` - goes through the middleware chain's `on_authorize` hook,
+  which decides on the resolved identity and on the channel's embedder-bound
+  principal, never on the client-asserted `clientInfo.name`. A middleware that
+  cannot reach a verdict fails the request rather than being read as a denial or
+  silently shortening a catalog. See `docs/middleware.md`.
+- Policy is decided before arguments are schema-validated, so a denied caller
+  cannot map a tool's argument schema through validation error details.
+- `tools/call` and `resources/read` are journalled through the chain's
+  `on_audit` hook, denials included, with both the requested and the resolved
+  identity.
 - The host retains the original stdout in a private `FD_CLOEXEC` descriptor and
   redirects process-wide stdout to stderr before provider or runtime initialization.
   Third-party `printf()` output therefore cannot contaminate MCP responses.

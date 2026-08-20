@@ -17,11 +17,21 @@ typedef struct host_policy {
     unsigned int allowed_effects;
 } host_policy_t;
 
-static int authorize(void *context, const maelys_mcp_request_context_t *request) {
+/*
+ * The reference host's whole policy: an effect allowlist, expressed as one
+ * middleware implementing hook 2. It reads nothing per-channel, so it never
+ * looks at maelys_mcp_channel_context - a host that authenticates its clients
+ * would decide on that pointer instead, never on request->client_name, which
+ * is client-asserted.
+ */
+static maelys_mcp_authorize_decision_t authorize_effect(
+    void *context,
+    const maelys_mcp_authorize_context_t *request) {
     const host_policy_t *policy = context;
-    return request->effect == MAELYS_MCP_EFFECT_READ ||
+    int allowed = request->effect == MAELYS_MCP_EFFECT_READ ||
         request->effect == MAELYS_MCP_EFFECT_PREVIEW ||
         (policy->allowed_effects & (1u << (unsigned int)request->effect)) != 0;
+    return allowed ? MAELYS_MCP_AUTHORIZE_ALLOW : MAELYS_MCP_AUTHORIZE_DENY;
 }
 
 static void usage(FILE *stream) {
@@ -132,9 +142,7 @@ int main(int argc, char **argv) {
         .server_version = MAELYS_MCP_VERSION,
         .instructions = "A policy-enforced local MCP runtime for explicitly configured providers.",
         .max_providers = provider_count + manifest.provider_count,
-        .max_message_bytes = MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES,
-        .authorize = authorize,
-        .policy_context = &policy
+        .max_message_bytes = MAELYS_MCP_DEFAULT_MAX_MESSAGE_BYTES
     };
     maelys_mcp_runtime_t *runtime = NULL;
     status = maelys_mcp_runtime_create(&config, &runtime);
@@ -145,7 +153,15 @@ int main(int argc, char **argv) {
         free(provider_paths);
         return 1;
     }
-    status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS);
+    maelys_mcp_middleware_t effect_policy = {
+        .name = "host-effect-allowlist",
+        .context = &policy,
+        .on_authorize = authorize_effect
+    };
+    status = maelys_mcp_runtime_add_middleware(runtime, &effect_policy, NULL);
+    if (status == MAELYS_MCP_OK) {
+        status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS);
+    }
     if (status == MAELYS_MCP_OK) {
         status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_MRTR);
     }
@@ -156,7 +172,7 @@ int main(int argc, char **argv) {
         status = maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_SUBSCRIPTIONS);
     }
     if (status != MAELYS_MCP_OK) {
-        fprintf(stderr, "Cannot enable MCP modules: %s\n",
+        fprintf(stderr, "Cannot configure the MCP runtime: %s\n",
             maelys_mcp_result_string(status));
         maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
         if (destroy_status != MAELYS_MCP_OK) {

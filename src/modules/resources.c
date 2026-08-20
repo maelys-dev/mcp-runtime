@@ -4,36 +4,59 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int resource_policy_allows(
+/*
+ * Hook 2 for the resource surface. Three of the runtime's five decision
+ * points are here, which is why the chain could not ship for tools alone:
+ * with the chain replacing the old callbacks, a tools-only conversion would
+ * have removed resource authorization outright.
+ *
+ * The URI passed in is always the canonical one for a read - parsed and
+ * normalized before the decision - so a policy cannot be evaded by spelling a
+ * URI differently. Catalog entries are already normalized at registration.
+ */
+static maelys_mcp_authorize_decision_t authorize_resource(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_module_request_t *request,
     maelys_mcp_operation_t operation,
     const char *uri) {
-    if (!runtime->authorize) return 1;
-    maelys_mcp_request_context_t context = {
+    if (!maelys_mcp_chain_has_authorize(runtime)) return MAELYS_MCP_AUTHORIZE_ALLOW;
+    maelys_mcp_authorize_context_t context = {
+        .operation = operation,
+        /* Reading is the only effect this surface has. */
+        .effect = MAELYS_MCP_EFFECT_READ,
+        .resource_uri = uri,
         .protocol_version = request->protocol_version,
         .client_name = request->client_name,
-        .resource_uri = uri,
-        .operation = operation,
-        .effect = MAELYS_MCP_EFFECT_READ
+        .channel = request->channel,
+        .params = request->params
     };
-    return runtime->authorize(runtime->policy_context, &context) != 0;
+    return maelys_mcp_chain_authorize(runtime, &context);
 }
 
-static void resource_audit(
+/*
+ * Hook 5. `requested_uri` is the string the client sent, `uri` the canonical
+ * form that was read; unlike the tools path these two genuinely differ today,
+ * whenever normalization rewrites the URI.
+ */
+static void audit_resource(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_module_request_t *request,
+    const char *requested_uri,
     const char *uri,
     maelys_mcp_result_t outcome) {
-    if (!runtime->audit) return;
-    maelys_mcp_request_context_t context = {
+    if (!maelys_mcp_chain_has_audit(runtime)) return;
+    maelys_mcp_audit_context_t record = {
+        .operation = MAELYS_MCP_OPERATION_RESOURCE_READ,
+        .effect = MAELYS_MCP_EFFECT_READ,
+        .requested_resource_uri = requested_uri,
+        .resource_uri = uri,
         .protocol_version = request->protocol_version,
         .client_name = request->client_name,
-        .resource_uri = uri,
-        .operation = MAELYS_MCP_OPERATION_RESOURCE_READ,
-        .effect = MAELYS_MCP_EFFECT_READ
+        .channel = request->channel,
+        .params = request->params,
+        .outcome = outcome
     };
-    runtime->audit(runtime->policy_context, &context, outcome);
+    maelys_mcp_chain_audit(runtime, &record);
 }
 
 static int set_optional_string(json_t *object, const char *name, const char *value) {
@@ -85,13 +108,20 @@ static json_t *list_resources(
     }
     json_t *result = json_object();
     json_t *resources = json_array();
+    int policy_failed = 0;
     if (!result || !resources) goto failed;
     for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
         maelys_mcp_provider_t *provider = runtime->providers[provider_index];
         for (size_t index = 0; index < provider->resource_count; ++index) {
             maelys_mcp_owned_resource_t *resource = &provider->resources[index];
-            if (!resource_policy_allows(runtime, request,
-                MAELYS_MCP_OPERATION_RESOURCE_LIST, resource->uri)) continue;
+            maelys_mcp_authorize_decision_t decision = authorize_resource(runtime,
+                request, MAELYS_MCP_OPERATION_RESOURCE_LIST, resource->uri);
+            /* Only a real deny hides a catalog entry; see list_tools. */
+            if (decision == MAELYS_MCP_AUTHORIZE_ERROR) {
+                policy_failed = 1;
+                goto failed;
+            }
+            if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) continue;
             json_t *value = resource_as_json(resource);
             if (!value || json_array_append_new(resources, value) != 0) goto failed;
         }
@@ -107,7 +137,7 @@ failed:
     if (resources) json_decref(resources);
     if (result) json_decref(result);
     return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-        "Internal error", NULL);
+        policy_failed ? "Policy evaluation failed" : "Internal error", NULL);
 }
 
 static json_t *list_templates(
@@ -119,13 +149,21 @@ static json_t *list_templates(
     }
     json_t *result = json_object();
     json_t *templates = json_array();
+    int policy_failed = 0;
     if (!result || !templates) goto failed;
     for (size_t provider_index = 0; provider_index < runtime->provider_count; ++provider_index) {
         maelys_mcp_provider_t *provider = runtime->providers[provider_index];
         for (size_t index = 0; index < provider->resource_template_count; ++index) {
             maelys_mcp_owned_resource_template_t *resource = &provider->resource_templates[index];
-            if (!resource_policy_allows(runtime, request,
-                MAELYS_MCP_OPERATION_RESOURCE_TEMPLATE_LIST, resource->uri_template)) continue;
+            maelys_mcp_authorize_decision_t decision = authorize_resource(runtime,
+                request, MAELYS_MCP_OPERATION_RESOURCE_TEMPLATE_LIST,
+                resource->uri_template);
+            /* Only a real deny hides a catalog entry; see list_tools. */
+            if (decision == MAELYS_MCP_AUTHORIZE_ERROR) {
+                policy_failed = 1;
+                goto failed;
+            }
+            if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) continue;
             json_t *value = template_as_json(resource);
             if (!value || json_array_append_new(templates, value) != 0) goto failed;
         }
@@ -141,7 +179,7 @@ failed:
     if (templates) json_decref(templates);
     if (result) json_decref(result);
     return maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
-        "Internal error", NULL);
+        policy_failed ? "Policy evaluation failed" : "Internal error", NULL);
 }
 
 static maelys_mcp_provider_t *exact_provider(
@@ -237,11 +275,25 @@ static json_t *read_resource(
         return response;
     }
     const char *canonical = maelys_uri_canonical(parsed);
-    if (!resource_policy_allows(runtime, request,
-        MAELYS_MCP_OPERATION_RESOURCE_READ, canonical)) {
+    const char *requested_uri = json_string_value(uri_value);
+    maelys_mcp_authorize_decision_t decision = authorize_resource(runtime,
+        request, MAELYS_MCP_OPERATION_RESOURCE_READ, canonical);
+    if (decision != MAELYS_MCP_AUTHORIZE_ALLOW) {
+        /*
+         * A denied read is journalled, which a denied tool call already was
+         * and this path was not - the asymmetry was an omission, not a
+         * decision, and a policy surface whose refusals leave no trace is the
+         * wrong half to leave untouched.
+         */
+        int failed = decision == MAELYS_MCP_AUTHORIZE_ERROR;
+        audit_resource(runtime, request, requested_uri, canonical,
+            failed ? MAELYS_MCP_ERR_STATE : MAELYS_MCP_ERR_DENIED);
         maelys_uri_destroy(parsed);
-        return maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
-            "Policy denied", NULL);
+        return failed ?
+            maelys_mcp_error_response(request->id, JSONRPC_INTERNAL_ERROR,
+                "Policy evaluation failed", NULL) :
+            maelys_mcp_error_response(request->id, MCP_POLICY_DENIED,
+                "Policy denied", NULL);
     }
     /*
      * Same era-aware source as tools.c's call_tool: modern clients declare
@@ -281,7 +333,7 @@ static json_t *read_resource(
             maelys_mcp_resource_result_clear(&provider_result);
         }
     }
-    resource_audit(runtime, request, canonical, status);
+    audit_resource(runtime, request, requested_uri, canonical, status);
     json_t *error_data = status == MAELYS_MCP_ERR_NOT_FOUND ?
         json_pack("{s:s}", "uri", canonical) : NULL;
     maelys_uri_destroy(parsed);

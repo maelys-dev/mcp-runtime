@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+- **Middleware chain**, the runtime's single policy and observation seam. The
+  design in `docs/middleware-design.md` specifies seven hooks; this lands the chain
+  core — registration, ordering, invocation — and its two decision points,
+  `on_authorize` and `on_audit`. All five of the runtime's policy decision points go
+  through it: `tools/list` (per tool), `tools/call`, `resources/list` (per resource),
+  `resources/templates/list` (per template) and `resources/read`. Decisions are taken
+  on the resolved identity and on the channel's embedder-bound opaque pointer, and a
+  hook that cannot reach a verdict is distinct from one that denies. See
+  `docs/middleware.md`.
+- **API break (ABI 2 → 3): `maelys_mcp_runtime_config_t` loses `authorize`, `audit`
+  and `policy_context`.** The chain replaces those callbacks rather than coexisting
+  with them; two similar-looking mechanisms on the security-critical path double the
+  surface that has to be audited. **Migration is one call**:
+  `maelys_mcp_runtime_add_compat_policy(runtime, authorize, audit, policy_context)`
+  registers a built-in middleware that calls the same callbacks with the same
+  metadata, before the first channel. Registering just an authorizer is one struct
+  field. `maelys_mcp_request_context_t`, `maelys_mcp_authorize_fn` and
+  `maelys_mcp_audit_fn` moved from `maelys/mcp/runtime.h` to
+  `maelys/mcp/middleware.h`, which `maelys/mcp.h` includes.
+- **Named behaviour change: policy now runs before schema validation on
+  `tools/call`.** A denied caller returns `-32003` with no data whether or not its
+  arguments would have validated, so it cannot map a tool's argument schema through
+  validation error details. The consequence for middleware authors is in the public
+  contract: `on_authorize` sees params this runtime has not validated yet.
+- **Named behaviour change: a denied `resources/read` is journalled**, as a denied
+  `tools/call` always was. The asymmetry was an omission.
+- **Named behaviour change: an undecidable verdict is not a denial.**
+  `MAELYS_MCP_AUTHORIZE_ERROR` maps to `-32603`, never `-32003`, and fails a whole
+  listing rather than dropping the entry it could not evaluate — a hidden catalog
+  entry and an unevaluated one are indistinguishable to a client.
+- `on_authorize` receives the request's whole params, `inputResponses` and
+  `requestState` included, so MRTR continuation traffic — elicitation answers and
+  sampling completions — is no longer invisible to policy. This is visibility, not
+  binding: a continuation can still arrive on a different channel than the one that
+  issued it.
+- `on_audit` carries both the requested and the resolved identity, so a journal
+  records what the client asked for rather than what a future transform injected.
+
 ## 0.13.1 - 2026-08-20
 
 - **Fix**: the release build's Linux (GCC) runners failed on

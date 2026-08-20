@@ -3,6 +3,7 @@
 #include "maelys/mcp/content.h"
 #include "maelys/mcp/channel.h"
 #include "maelys/mcp/error.h"
+#include "maelys/mcp/middleware.h"
 #include "maelys/mcp/module.h"
 #include "maelys/mcp/outbox.h"
 #include "maelys/mcp/provider.h"
