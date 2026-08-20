@@ -118,6 +118,36 @@ is enabled, a provider may instead return `input_required`; the retry's
 `inputResponses`, opaque `requestState`, and client capabilities are passed back to
 the same provider.
 
+## Nested requests
+
+MRTR has two shapes, and the runtime serves both. The resumable one is
+`input_required` above: the call ends, and the client retries. The nested one keeps
+the call open - the runtime sends a real server-to-client request
+(`elicitation/create`, `sampling/createMessage` or `roots/list`) on the same
+connection and blocks the call until the client answers. Older clients understand
+only the nested shape, because `resultType`/`inputRequests` is a `2026-07-28` draft
+type that a schema-validating `2025-11-25` client rejects.
+
+Correlation lives at the channel, not in a transport: each channel keeps a table of
+outstanding host-to-client requests keyed by a host-generated
+`maelys/nested/<n>` id (string-prefixed, so it can never collide with a
+client-chosen one), guarded by the channel mutex and woken by its own condition.
+`maelys_mcp_channel_accept` is the seam a transport calls: it matches an inbound
+frame against that table before dispatching anything, offloads the two nestable
+methods, and dispatches everything else inline. `stdio.c` is a thin adapter over
+it, and a future HTTP transport reuses it unchanged.
+
+The nested request travels the request's own response sink, so it stays ordered
+ahead of the final result and remains visible to a `wrap_sink` middleware. Its
+deadline is separate from the provider call deadline, which is suspended while it
+is outstanding; a person answering an elicitation is not the provider being slow.
+The wait is settled - never left standing - by the client's reply, by a
+`notifications/cancelled` naming the outer call, by the channel faulting or
+closing, by the provider dying, or by that deadline. Providers reach it through
+`maelys_mcp_provider_request_client`; a NULL relay means this dispatch cannot
+carry one, and the provider falls back to `input_required`. See
+`docs/provider-protocol.md` for the wire.
+
 ## Module boundary
 
 The core owns lifecycle, version negotiation, discovery and generic JSON-RPC routing.
@@ -164,15 +194,28 @@ notification is selected. Keyed notification replacement moves the event to the 
 preserving the most recent causal position rather than its first occurrence.
 
 The queues accept multiple producers. Native and process-provider event APIs are
-asynchronous with respect to protocol writes, while request dispatch and provider calls
-remain synchronous. A slow channel's bounded admission cannot indefinitely block
+asynchronous with respect to protocol writes. Request dispatch is synchronous with
+exactly two exceptions, `tools/call` and `resources/read`: a transport that delivers
+through `maelys_mcp_channel_accept` hands those two to a short-lived worker thread and
+returns to reading, because they are the only methods that can end up blocked on a
+client round trip (see "Nested requests" below), and the thread that must read that
+round trip's reply cannot be the thread waiting for it. Every other method - the
+handshake, the list operations, `subscriptions/listen`, notifications - still
+dispatches inline on the caller's thread, and `maelys_mcp_channel_handle` is
+synchronous for all of them, unchanged. Provider calls remain synchronous from the
+caller's point of view and strictly single-outstanding per provider process.
+A slow channel's bounded admission cannot indefinitely block
 another channel, and fan-out continues after a local admission failure.
 The lock hierarchy is provider lifecycle, then runtime channel registry, then channel;
 the global provider-callback inflight gate is never nested. A provider's private event
 mutex stays held while its sink callback runs so sink detachment cannot race callback
-entry; it precedes the inflight gate and is never acquired from that gate. Each process provider has
-one reader thread that separates id-less events from the one serialized
-request/response exchange. A mandatory subscription acknowledgement uses the priority lane so a
+entry; it precedes the inflight gate and is never acquired from that gate. One further
+edge exists in one direction only: a process provider's state mutex may precede a
+channel mutex, so that a provider's death can cancel the nested wait a worker is
+blocked on; nothing takes a channel mutex before a provider state mutex.
+Each process provider has
+one reader thread that separates id-less events and nested requests from the one
+serialized request/response exchange. A mandatory subscription acknowledgement uses the priority lane so a
 later completion response cannot overtake the stream's first message.
 
 Creating a channel or outbox creates no thread. The stdio transport owns one writer

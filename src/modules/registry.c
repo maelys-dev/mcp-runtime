@@ -42,6 +42,17 @@ maelys_mcp_result_t maelys_mcp_runtime_enable_module(
     return MAELYS_MCP_OK;
 }
 
+int maelys_mcp_runtime_method_nestable(
+    const maelys_mcp_runtime_t *runtime,
+    const char *method) {
+    if (!runtime || !method) return 0;
+    for (size_t index = 0; index < runtime->module_count; ++index) {
+        const maelys_mcp_module_descriptor_t *module = runtime->modules[index];
+        if (module->nestable && module->nestable(method)) return 1;
+    }
+    return 0;
+}
+
 json_t *maelys_mcp_runtime_capabilities(
     const maelys_mcp_runtime_t *runtime,
     int modern) {

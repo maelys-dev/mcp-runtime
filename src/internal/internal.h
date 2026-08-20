@@ -15,6 +15,13 @@
 
 #define MAELYS_MCP_MAX_MODULES 16u
 #define MAELYS_MCP_MAX_MIDDLEWARE 16u
+/*
+ * Long enough for "maelys/nested/" plus a 64-bit counter and its terminator.
+ * The prefix is what makes a host-generated id incapable of colliding with a
+ * client-chosen one, so no id-space negotiation is needed.
+ */
+#define MAELYS_MCP_NESTED_ID_PREFIX "maelys/nested/"
+#define MAELYS_MCP_NESTED_ID_MAX 40u
 #define JSONRPC_INVALID_REQUEST (-32600)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
 #define JSONRPC_INVALID_PARAMS (-32602)
@@ -89,6 +96,15 @@ typedef enum maelys_mcp_channel_state {
  * gate has its own mutex and condition and is never nested with another lock.
  * It admits creators before allocation, then runtime destruction closes and
  * drains it before acquiring lifecycle_mutex.
+ *
+ * One further edge exists, and only in one direction: a process provider's
+ * state_mutex may precede a channel->mutex. It is taken when a provider
+ * failure has to cancel the nested client request a worker is blocked on, so
+ * that a dead provider does not strand that worker until the nested deadline.
+ * Nothing acquires channel->mutex before state_mutex - the thread inside a
+ * nested wait releases channel->mutex in pthread_cond_wait, and every path
+ * that calls into a provider does so with no channel lock held - so the edge
+ * cannot close into a cycle.
  */
 
 struct maelys_mcp_provider {
@@ -102,6 +118,15 @@ struct maelys_mcp_provider {
     size_t resource_template_count;
     maelys_mcp_provider_call_fn call;
     maelys_mcp_provider_read_resource_fn read_resource;
+    /*
+     * The nesting-capable forms, registered separately (see
+     * maelys_mcp_provider_set_nested_handlers). When one is set the module
+     * prefers it and hands it the dispatch's relay; when it is not, the plain
+     * callback above runs exactly as before. Adding them here rather than to
+     * maelys_mcp_provider_config_t is what keeps the ABI at 3.
+     */
+    maelys_mcp_provider_call_nested_fn call_nested;
+    maelys_mcp_provider_read_resource_nested_fn read_resource_nested;
     maelys_mcp_result_t (*activate)(void *context, char **out_error);
     int activated;
     maelys_mcp_provider_destroy_fn destroy;
@@ -143,6 +168,14 @@ struct maelys_mcp_runtime {
     size_t audit_hook_count;
     size_t wrap_sink_hook_count;
     size_t list_hook_count;
+    /*
+     * Nested-request settings, bound while the runtime is cold exactly like
+     * the middleware chain and read without a lock afterwards. They live on
+     * the runtime rather than on maelys_mcp_channel_config_t because widening
+     * that released public structure would break the ABI (docs/abi-policy.md);
+     * every channel inherits these at creation.
+     */
+    maelys_mcp_nested_config_t nested;
     pthread_mutex_t lifecycle_mutex;
     pthread_cond_t lifecycle_changed;
     int lifecycle_mutex_initialized;
@@ -168,6 +201,38 @@ struct maelys_mcp_runtime {
     size_t provider_events_inflight;
 };
 
+/*
+ * One outstanding host-to-client request, correlated by a host-generated id.
+ * Sibling of maelys_mcp_subscription_t above, and guarded by the same
+ * channel->mutex: the reader settles an entry, the worker blocked on it wakes
+ * and takes the payload. `outer_id` is the id of the client request that
+ * caused this one, so cancelling that request can reach in here.
+ */
+typedef struct maelys_mcp_nested_request {
+    int in_use;
+    int settled;
+    char id[MAELYS_MCP_NESTED_ID_MAX];
+    json_t *outer_id;
+    maelys_mcp_result_t status;
+    /* The client's `result` on success, its `error` object on a refusal. */
+    json_t *payload;
+} maelys_mcp_nested_request_t;
+
+/*
+ * One offloaded request. `tools/call` and `resources/read` are the only two
+ * methods that can ever block on a client round trip, so they - and nothing
+ * else - run on a short-lived thread, leaving the transport reader free to
+ * carry that round trip's reply back. The slot outlives the thread until it is
+ * reaped, which is what keeps pthread_join paired with pthread_create.
+ */
+typedef struct maelys_mcp_channel_worker {
+    maelys_mcp_channel_t *channel;
+    json_t *request;
+    pthread_t thread;
+    int active;
+    int finished;
+} maelys_mcp_channel_worker_t;
+
 struct maelys_mcp_channel {
     maelys_mcp_runtime_t *runtime;
     struct maelys_mcp_channel *next;
@@ -187,6 +252,27 @@ struct maelys_mcp_channel {
     json_t *legacy_capabilities;
     maelys_mcp_subscription_t *subscriptions;
     size_t subscription_count;
+    /* Nested (in-band) host-to-client requests. See src/core/nested.c. */
+    maelys_mcp_nested_request_t *nested_requests;
+    size_t nested_capacity;
+    unsigned long long next_nested_id;
+    unsigned int nested_timeout_ms;
+    pthread_cond_t nested_ready;
+    int nested_ready_initialized;
+    /* Offload pool for the two nestable methods. See src/core/channel.c. */
+    maelys_mcp_channel_worker_t *workers;
+    size_t worker_capacity;
+    /*
+     * Set once this channel's traffic is arriving through
+     * maelys_mcp_channel_accept, which is the only entry point that offloads a
+     * call and therefore the only one under which a reply to a nested request
+     * can still be read. An embedder pumping maelys_mcp_channel_handle on its
+     * own thread never sets it, and its provider calls are told they cannot
+     * nest rather than being allowed to block on a reply nobody will read.
+     */
+    int transport_demuxes;
+    /* First failure a worker's dispatch reported, for the transport to see. */
+    maelys_mcp_result_t dispatch_status;
 };
 
 /*
@@ -231,6 +317,33 @@ struct maelys_mcp_progress_reporter {
     json_t *token;
 };
 
+/*
+ * Everything one provider callback needs to open a request back at the client
+ * and block for its reply. Built on the dispatching thread's stack for exactly
+ * one callback, exactly like the progress reporter above; every member except
+ * the two waiter fields is borrowed from that frame.
+ *
+ * The nested request travels this request's own sink, not the outbox
+ * directly, so it stays ordered ahead of the final response and stays visible
+ * to a wrap_sink middleware rather than going around it.
+ *
+ * `waiter_bind` is filled in by the provider implementation, not by the
+ * dispatching module: it is how a provider that can die independently (the
+ * process provider) learns which nested wait to cancel when it does. NULL
+ * means nothing needs telling.
+ */
+struct maelys_mcp_nested_relay {
+    maelys_mcp_channel_t *channel;
+    const maelys_mcp_response_sink_t *sink;
+    json_t *outer_id;
+    json_t *client_capabilities;
+    void *waiter_context;
+    void (*waiter_bind)(
+        void *context,
+        maelys_mcp_channel_t *channel,
+        const char *nested_id);
+};
+
 typedef struct maelys_mcp_module_request {
     maelys_mcp_channel_t *channel;
     /* Where this request's own output goes. Borrowed from the caller, valid
@@ -245,6 +358,9 @@ typedef struct maelys_mcp_module_request {
     const char *client_name;
     json_t *legacy_capabilities;
     int modern;
+    /* Whether this dispatch can carry a nested client request, i.e. whether
+     * something other than this thread is still reading the connection. */
+    int nestable;
     json_t **post_enqueue_subscription_id;
 } maelys_mcp_module_request_t;
 
@@ -254,6 +370,16 @@ typedef struct maelys_mcp_module_descriptor {
     const char *capability_name;
     json_t *(*capability)(const maelys_mcp_runtime_t *runtime, int modern);
     int (*handles)(const char *method);
+    /*
+     * Whether this module's handling of `method` can end up blocked on a
+     * client round trip, and therefore belongs on a thread of its own. The
+     * predicate lives with the module for the same reason `handles` does: the
+     * protocol core owns routing, not method names, and a core that had to
+     * spell "tools/call" to know what to offload would have taken tools
+     * knowledge back (see docs/architecture.md and scripts/audit_boundaries.sh).
+     * NULL means nothing this module handles ever nests.
+     */
+    int (*nestable)(const char *method);
     json_t *(*handle)(
         maelys_mcp_runtime_t *runtime,
         const char *method,
@@ -303,6 +429,24 @@ typedef struct maelys_mcp_process_context {
      * progress interceptable by a middleware sink instead of bypassing it.
      */
     json_t *pending_progress;
+    /*
+     * The nested request the reader has taken off the wire and not yet handed
+     * to the thread inside the call, and the flag saying that thread is still
+     * relaying one. Together they make "a second nested request while one is
+     * outstanding" detectable in the reader, which is where the protocol says
+     * it is fatal.
+     */
+    json_t *pending_nested;
+    int nested_inflight;
+    /*
+     * Set only while that thread is blocked on the client. Borrowed: the
+     * thread that publishes it is the thread inside the call, which holds an
+     * operation reference on the channel for the whole window, so the pointer
+     * cannot outlive the channel. Read under state_mutex by whichever thread
+     * declares the provider failed, which then cancels the wait.
+     */
+    maelys_mcp_channel_t *nested_channel;
+    char nested_wait_id[MAELYS_MCP_NESTED_ID_MAX];
     struct maelys_mcp_provider *owner;
 } maelys_mcp_process_context_t;
 
@@ -375,6 +519,10 @@ const maelys_mcp_module_descriptor_t *maelys_mcp_module_descriptor(
 json_t *maelys_mcp_runtime_capabilities(
     const maelys_mcp_runtime_t *runtime,
     int modern);
+/* Non-zero when an enabled module says this method can block on the client. */
+int maelys_mcp_runtime_method_nestable(
+    const maelys_mcp_runtime_t *runtime,
+    const char *method);
 int maelys_mcp_add_server_meta(
     maelys_mcp_runtime_t *runtime,
     json_t *result,
@@ -496,6 +644,59 @@ maelys_mcp_result_t maelys_mcp_channel_handle_with_sink(
     maelys_mcp_channel_t *channel,
     json_t *request,
     const maelys_mcp_response_sink_t *sink);
+/*
+ * One inbound transport frame, demultiplexed. This is the seam a transport
+ * calls instead of maelys_mcp_channel_handle, and the reason stdio.c is a thin
+ * adapter: everything that makes a connection able to carry more than one
+ * conversation at a time lives here, not in the transport.
+ *
+ * Three outcomes, in the order they are tested:
+ *   - the frame is the reply to a nested request this channel issued: it is
+ *     matched against the pending table, the blocked worker is woken, and
+ *     nothing is dispatched;
+ *   - the frame is a `tools/call` or `resources/read` request: it is handed to
+ *     a worker thread, so the caller returns to reading immediately and can
+ *     carry that call's nested reply back;
+ *   - anything else, a stray response included: dispatched inline, exactly as
+ *     maelys_mcp_channel_handle always did.
+ *
+ * Borrows `message`. The returned status is the transport's, not the
+ * request's: a protocol error is answered through the channel and still
+ * returns MAELYS_MCP_OK.
+ */
+maelys_mcp_result_t maelys_mcp_channel_accept(
+    maelys_mcp_channel_t *channel,
+    json_t *message);
+/* The first failure an offloaded dispatch reported, or MAELYS_MCP_OK. */
+maelys_mcp_result_t maelys_mcp_channel_dispatch_status(
+    maelys_mcp_channel_t *channel);
+/*
+ * The pending nested-request table. Every entry is guarded by channel->mutex
+ * and woken through channel->nested_ready.
+ */
+maelys_mcp_result_t maelys_mcp_channel_nested_init(maelys_mcp_channel_t *channel);
+void maelys_mcp_channel_nested_clear(maelys_mcp_channel_t *channel);
+/* Non-zero when `message` was the reply to an outstanding nested request. */
+int maelys_mcp_channel_nested_resolve(
+    maelys_mcp_channel_t *channel,
+    json_t *message);
+/* Caller holds channel->mutex. Settles every entry, so nothing survives a
+ * channel that can no longer carry a reply. */
+void maelys_mcp_channel_nested_fail_all_locked(
+    maelys_mcp_channel_t *channel,
+    maelys_mcp_result_t status);
+void maelys_mcp_channel_nested_fail_all(
+    maelys_mcp_channel_t *channel,
+    maelys_mcp_result_t status);
+/* Settles the one entry with this host-generated id, if it is still pending. */
+void maelys_mcp_channel_nested_fail_id(
+    maelys_mcp_channel_t *channel,
+    const char *nested_id,
+    maelys_mcp_result_t status);
+/* Settles every entry issued underneath the client request `outer_id`. */
+void maelys_mcp_channel_nested_cancel_outer(
+    maelys_mcp_channel_t *channel,
+    const json_t *outer_id);
 maelys_mcp_result_t maelys_mcp_channel_enqueue_take(
     maelys_mcp_channel_t *channel,
     json_t *message,

@@ -328,12 +328,21 @@ without transforming as cheap as no chain at all.
 
 Every hook — the five inbound ones and the three functions of a ⑥ wrapper —
 runs on the thread dispatching one request, serialized within that request,
-and may block. They may be entered concurrently for different channels, so a
-middleware sharing mutable state across channels owns its own locking. No
+and may block. They may be entered concurrently for **different requests**,
+including two requests on the *same* channel: `tools/call` and
+`resources/read` dispatch on their own worker threads so that a call can block
+on a nested client round trip without stalling the connection (see
+`docs/architecture.md`). A middleware sharing mutable state across requests
+therefore owns its own locking — the "different channels" caveat this
+paragraph used to make was never the whole of it, and is now visibly not. No
 runtime lock is held while a hook runs, and the documented lock hierarchy in
 `src/internal/internal.h` is therefore not extended by the chain, ⑥ included:
 a wrapper's per-request state lives on the dispatching thread's stack frame
 and is never shared with another request or another channel.
+
+A dispatched request's JSON — the object every hook's `params` points into — is
+private to the thread dispatching it, so a hook may read it without
+coordinating with any other request.
 
 `name` and `context` are borrowed, not copied, and must outlive the runtime.
 The descriptor itself is copied, so it may live on the caller's stack. If

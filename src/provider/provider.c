@@ -87,6 +87,16 @@ void maelys_mcp_provider_result_clear(maelys_mcp_provider_result_t *result) {
     maelys_mcp_provider_result_init(result);
 }
 
+maelys_mcp_result_t maelys_mcp_provider_set_nested_handlers(
+    maelys_mcp_provider_t *provider,
+    const maelys_mcp_provider_nested_handlers_t *handlers) {
+    if (!provider || !handlers) return MAELYS_MCP_ERR_ARGUMENT;
+    if (!handlers->call && !handlers->read_resource) return MAELYS_MCP_ERR_ARGUMENT;
+    provider->call_nested = handlers->call;
+    provider->read_resource_nested = handlers->read_resource;
+    return MAELYS_MCP_OK;
+}
+
 void maelys_mcp_provider_bind_event_sink(
     maelys_mcp_provider_t *provider,
     maelys_mcp_result_t (*sink)(
@@ -116,7 +126,11 @@ maelys_mcp_result_t maelys_mcp_provider_report_progress(
     if (!params || !notification) goto failed;
     /* progressToken and progress are the only required params; total and
      * message are omitted rather than sent empty when not supplied. */
-    if (json_object_set(params, "progressToken", reporter->token) != 0 ||
+    /* Copied, not referenced: this notification is released by whichever
+     * thread drains the outbox, and the token is a node of the request, which
+     * is released by the thread that dispatched it. */
+    if (json_object_set_new(params, "progressToken",
+            json_deep_copy(reporter->token)) != 0 ||
         json_object_set_new(params, "progress", json_real(progress)) != 0 ||
         (total >= 0.0 &&
             json_object_set_new(params, "total", json_real(total)) != 0) ||

@@ -413,12 +413,20 @@ maelys_mcp_result_t maelys_mcp_read_json_line(
     return status;
 }
 
+/*
+ * The id is copied into the response, never shared with the request it came
+ * from. A response is released by whichever thread drains the outbox, and the
+ * request by whichever thread read it off the wire; those are different
+ * threads, and a shared node between them is two threads writing one jansson
+ * refcount - which the memory model calls a race and ThreadSanitizer reports
+ * as one. Ids are scalars, so the copy costs one allocation.
+ */
 json_t *maelys_mcp_error_response(json_t *id, int code, const char *message, json_t *data) {
     json_t *root = json_object();
     json_t *error = json_object();
     if (!root || !error) goto failed;
     if (json_object_set_new(root, "jsonrpc", json_string("2.0")) != 0 ||
-        json_object_set(root, "id", id ? id : json_null()) != 0 ||
+        json_object_set_new(root, "id", id ? json_deep_copy(id) : json_null()) != 0 ||
         json_object_set_new(error, "code", json_integer(code)) != 0 ||
         json_object_set_new(error, "message", json_string(message ? message : "Error")) != 0 ||
         (data && json_object_set(error, "data", data) != 0) ||
@@ -439,8 +447,9 @@ json_t *maelys_mcp_success_response(json_t *id, json_t *result) {
         if (result) json_decref(result);
         return NULL;
     }
+    /* Copied, not shared; see maelys_mcp_error_response. */
     if (json_object_set_new(root, "jsonrpc", json_string("2.0")) != 0 ||
-        json_object_set(root, "id", id ? id : json_null()) != 0 ||
+        json_object_set_new(root, "id", id ? json_deep_copy(id) : json_null()) != 0 ||
         json_object_set(root, "result", result) != 0) {
         json_decref(root);
         json_decref(result);

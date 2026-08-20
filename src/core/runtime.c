@@ -240,12 +240,41 @@ static void handle_cancelled_notification(
     maelys_mcp_channel_t *channel,
     json_t *params) {
     maelys_mcp_runtime_t *runtime = channel->runtime;
-    if (!maelys_mcp_runtime_module_enabled(runtime,
-        MAELYS_MCP_MODULE_SUBSCRIPTIONS) || !json_is_object(params)) return;
+    if (!json_is_object(params)) return;
     json_t *request_id = json_object_get(params, "requestId");
-    if (valid_request_id(request_id)) {
+    if (!valid_request_id(request_id)) return;
+    /*
+     * Two things can be waiting under one client request id. A subscription is
+     * one; a call blocked on a nested request it opened is the other, and it
+     * is not gated on the subscriptions module - a client cancelling a
+     * `tools/call` means that call, whether or not this runtime also serves
+     * subscriptions.
+     */
+    maelys_mcp_channel_nested_cancel_outer(channel, request_id);
+    if (maelys_mcp_runtime_module_enabled(runtime,
+        MAELYS_MCP_MODULE_SUBSCRIPTIONS)) {
         maelys_mcp_cancel_subscription(channel, request_id);
     }
+}
+
+maelys_mcp_result_t maelys_mcp_runtime_configure_nested(
+    maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_nested_config_t *config) {
+    if (!runtime || !config) return MAELYS_MCP_ERR_ARGUMENT;
+    pthread_mutex_lock(&runtime->lifecycle_mutex);
+    /*
+     * Same cold-only gate as the middleware chain, for the same reason: every
+     * channel reads these values without a lock, so they have to stop changing
+     * before the first channel exists.
+     */
+    if (runtime->lifecycle != MAELYS_MCP_RUNTIME_COLD ||
+        runtime->shutdown_requested) {
+        pthread_mutex_unlock(&runtime->lifecycle_mutex);
+        return MAELYS_MCP_ERR_STATE;
+    }
+    runtime->nested = *config;
+    pthread_mutex_unlock(&runtime->lifecycle_mutex);
+    return MAELYS_MCP_OK;
 }
 
 maelys_mcp_result_t maelys_mcp_runtime_add_provider(
@@ -527,6 +556,7 @@ json_t *maelys_mcp_runtime_dispatch(
      * incremented before calling here.
      */
     json_t *legacy_capabilities = channel->legacy_capabilities;
+    int nestable = channel->transport_demuxes;
     pthread_mutex_unlock(&channel->mutex);
 
     /*
@@ -564,6 +594,7 @@ json_t *maelys_mcp_runtime_dispatch(
         .client_name = modern ? client_name_from_params(params) : legacy_client_name,
         .legacy_capabilities = legacy_capabilities,
         .modern = modern,
+        .nestable = nestable,
         .post_enqueue_subscription_id = out_post_enqueue_subscription_id
     };
     for (size_t index = 0; index < runtime->module_count; ++index) {
