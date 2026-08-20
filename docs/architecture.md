@@ -71,14 +71,20 @@ client-specific adapter belongs in this library.
 
 ## Policy boundary
 
-Policy and audit are a chain of middleware, registered on the runtime while it is
-cold and immutable from its first channel onward, so dispatch reads it with no
-lock. Two hooks are implemented: `on_authorize`, consulted at all five decision
-points (`tools/list` per tool, `tools/call`, `resources/list` per resource,
-`resources/templates/list` per template, `resources/read`), and `on_audit`, which
-journals `tools/call` and `resources/read` including their denials. Both run on
-the request thread with no runtime lock held, so the chain does not extend the
-lock hierarchy.
+Policy, audit and transformation are a chain of middleware, registered on the
+runtime while it is cold and immutable from its first channel onward, so dispatch
+reads it with no lock. Seven hooks are implemented, in the order one request meets
+them: `on_resolve` maps the client's tool name and arguments onto the real ones;
+`on_authorize` is consulted at all five decision points (`tools/list` per tool,
+`tools/call`, `resources/list` per resource, `resources/templates/list` per
+template, `resources/read`); `on_call` invokes or substitutes with read-only
+arguments; `on_result` rewrites or redacts; `on_audit` journals `tools/call` and
+`resources/read` including their denials. Around all of them, `wrap_sink`
+decorates the request's outbound delivery path, and `on_list` transforms a
+catalog after `on_authorize` has filtered it. Every hook — a `wrap_sink`
+wrapper's three functions included — runs on the request thread with no runtime
+lock held, so the chain does not extend the lock hierarchy; a wrapper's
+per-request state lives on that thread's stack frame and is never shared.
 
 The runtime holds no policy vocabulary of its own. A decision is taken on the
 resolved identity - the tool the runtime will actually invoke, the canonical URI
@@ -88,7 +94,14 @@ channel, which the runtime carries and never interprets. It is never taken on
 `tools/call` the decision precedes schema validation, so a denied caller cannot
 probe argument schemas through validation error details, and the hook sees the
 request's whole params, `inputResponses` and `requestState` included, so MRTR
-continuation traffic is not invisible to policy. See `docs/middleware.md`.
+continuation traffic is not invisible to policy.
+
+Transformation is ordered so that it can never become privilege: `on_resolve`
+runs before the decision, so a rename resolves to the real tool and the real
+effect before anything is allowed, and `on_list` runs after it, so a denied
+catalog entry cannot be transformed back into view. Arguments are validated
+against the real tool's schema, on `on_resolve`'s output. See
+`docs/middleware.md`.
 
 ## Protocol eras
 

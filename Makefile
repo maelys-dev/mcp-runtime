@@ -262,7 +262,7 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-middleware $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
 		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider \
@@ -272,6 +272,10 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channels
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channel-perf
+	# The middleware suite is here for hook 6: it decorates the delivery path
+	# every request's output travels, and its concurrency case drives two
+	# channels through one wrap_sink from two threads.
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-middleware
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-provider-sdk
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-process-provider $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/bad-json-provider) $(abspath $(BIN)/bad-envelope-provider) \

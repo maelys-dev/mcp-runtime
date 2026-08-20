@@ -129,14 +129,20 @@ struct maelys_mcp_runtime {
      * The middleware chain. Appended to under lifecycle_mutex while the
      * runtime is cold, then read without any lock for the rest of its life -
      * the immutability the public header promises is what makes that safe.
-     * The two counters let a dispatch path skip building a hook context at
-     * all when no middleware implements that hook, so an empty chain costs
-     * the same branch the removed authorize/audit pointers used to.
+     * One counter per hook lets a dispatch path skip building a hook context
+     * at all when no middleware implements that hook, so an empty chain costs
+     * the same branch the removed authorize/audit pointers used to - and a
+     * chain of pure authorizers costs nothing on the transformation paths.
      */
     maelys_mcp_middleware_t middleware[MAELYS_MCP_MAX_MIDDLEWARE];
     size_t middleware_count;
+    size_t resolve_hook_count;
     size_t authorize_hook_count;
+    size_t call_hook_count;
+    size_t result_hook_count;
     size_t audit_hook_count;
+    size_t wrap_sink_hook_count;
+    size_t list_hook_count;
     pthread_mutex_t lifecycle_mutex;
     pthread_cond_t lifecycle_changed;
     int lifecycle_mutex_initialized;
@@ -202,13 +208,18 @@ struct maelys_mcp_channel {
  * Ownership follows the outbox convention (see
  * maelys_mcp_outbox_enqueue_take): `emit` and `complete` steal the caller's
  * reference on success and leave it with the caller on failure.
+ *
+ * The type name is public (maelys/mcp/middleware.h forward-declares it, so
+ * hook 6 can forward to a sink through maelys_mcp_sink_emit and friends); this
+ * layout is not, and stays here so that decorating the delivery path never
+ * became an ABI commitment to its shape.
  */
-typedef struct maelys_mcp_response_sink {
+struct maelys_mcp_response_sink {
     maelys_mcp_result_t (*emit)(void *context, json_t *message);
     maelys_mcp_result_t (*complete)(void *context, json_t *response);
     int (*cancelled)(void *context);
     void *context;
-} maelys_mcp_response_sink_t;
+};
 
 /*
  * Binds a progress token to the sink of the request that carried it. Both
@@ -369,19 +380,98 @@ int maelys_mcp_add_server_meta(
     json_t *result,
     const char *result_type);
 /*
- * Middleware chain, hooks 2 and 5. The has_* predicates exist so a caller can
- * skip filling a hook context - list paths ask once per catalog entry - and
- * they are exactly the branch the pre-chain `if (!runtime->authorize)` was.
- * Both invocations run with no runtime lock held.
+ * The middleware chain. The has_* predicates exist so a caller can skip
+ * filling a hook context - list paths ask once per catalog entry - and they
+ * are exactly the branch the pre-chain `if (!runtime->authorize)` was. Every
+ * invocation runs with no runtime lock held.
  */
+int maelys_mcp_chain_has_resolve(const maelys_mcp_runtime_t *runtime);
 int maelys_mcp_chain_has_authorize(const maelys_mcp_runtime_t *runtime);
+int maelys_mcp_chain_has_call(const maelys_mcp_runtime_t *runtime);
+int maelys_mcp_chain_has_result(const maelys_mcp_runtime_t *runtime);
 int maelys_mcp_chain_has_audit(const maelys_mcp_runtime_t *runtime);
+int maelys_mcp_chain_has_wrap_sink(const maelys_mcp_runtime_t *runtime);
+int maelys_mcp_chain_has_list(const maelys_mcp_runtime_t *runtime);
+/*
+ * Hook 1. `request` is advanced in place so each middleware sees the previous
+ * one's output. On MAELYS_MCP_OK the out params hold the accumulated rewrite,
+ * each NULL when nothing changed it; the caller owns both (free / json_decref).
+ * On failure nothing is returned and the partial rewrite is already released.
+ */
+maelys_mcp_result_t maelys_mcp_chain_resolve(
+    const maelys_mcp_runtime_t *runtime,
+    maelys_mcp_resolve_context_t *request,
+    char **out_tool_name,
+    json_t **out_arguments);
 maelys_mcp_authorize_decision_t maelys_mcp_chain_authorize(
     const maelys_mcp_runtime_t *runtime,
     const maelys_mcp_authorize_context_t *request);
+/* Hook 3. Stops at the first substitution; out_result is filled only then. */
+maelys_mcp_call_disposition_t maelys_mcp_chain_call(
+    const maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_call_context_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error);
+/*
+ * Hook 4. `result` is the live result, replaced in place: the caller keeps
+ * owning whatever it holds afterwards and clears it exactly once, whether the
+ * chain replaced it or not.
+ */
+maelys_mcp_result_disposition_t maelys_mcp_chain_result(
+    const maelys_mcp_runtime_t *runtime,
+    maelys_mcp_result_context_t *request,
+    maelys_mcp_provider_result_t *result,
+    char **out_error);
 void maelys_mcp_chain_audit(
     const maelys_mcp_runtime_t *runtime,
     const maelys_mcp_audit_context_t *record);
+/*
+ * Hook 7. Advances `request` in place like hook 1. *out_entries is NULL when
+ * no middleware changed the catalog, and otherwise a new array the caller owns.
+ */
+maelys_mcp_result_t maelys_mcp_chain_list(
+    const maelys_mcp_runtime_t *runtime,
+    maelys_mcp_list_context_t *request,
+    json_t **out_entries);
+/*
+ * Hook 6's per-request state, built on the dispatching thread's stack and
+ * never shared: the sink each wrapper is exposed as, the wrapper it came
+ * from, and the middleware index that owns it, so `release` can be paired
+ * with the right context in reverse order.
+ *
+ * `guard` sits between the innermost wrapper and the real sink. It is what
+ * makes "complete is forwarded exactly once" checkable rather than merely
+ * asked for: it counts completions that actually reach the transport, refuses
+ * a second one, and lets the caller notice a wrapper that swallowed the first.
+ */
+typedef struct maelys_mcp_sink_link {
+    maelys_mcp_sink_wrapper_t *wrapper;
+    const maelys_mcp_response_sink_t *inner;
+} maelys_mcp_sink_link_t;
+
+typedef struct maelys_mcp_sink_chain {
+    size_t depth;
+    maelys_mcp_response_sink_t sinks[MAELYS_MCP_MAX_MIDDLEWARE];
+    maelys_mcp_sink_wrapper_t wrappers[MAELYS_MCP_MAX_MIDDLEWARE];
+    maelys_mcp_sink_link_t links[MAELYS_MCP_MAX_MIDDLEWARE];
+    size_t owners[MAELYS_MCP_MAX_MIDDLEWARE];
+    const maelys_mcp_runtime_t *runtime;
+    const maelys_mcp_response_sink_t *base;
+    maelys_mcp_response_sink_t guard;
+    size_t completions;
+} maelys_mcp_sink_chain_t;
+
+maelys_mcp_result_t maelys_mcp_chain_wrap_sink(
+    const maelys_mcp_runtime_t *runtime,
+    const maelys_mcp_wrap_sink_context_t *request,
+    const maelys_mcp_response_sink_t *base,
+    maelys_mcp_sink_chain_t *chain,
+    const maelys_mcp_response_sink_t **out_sink);
+/* Runs every wrapper's release, reverse wrapping order. Idempotent. */
+void maelys_mcp_chain_release_sink(maelys_mcp_sink_chain_t *chain);
+/* How many completions reached the transport. Zero after a dispatch that
+ * produced a response means a wrapper swallowed it. */
+size_t maelys_mcp_chain_sink_completions(const maelys_mcp_sink_chain_t *chain);
 /* Runs every middleware's destroy hook, reverse registration order. */
 void maelys_mcp_chain_destroy(maelys_mcp_runtime_t *runtime);
 void maelys_mcp_subscription_clear(maelys_mcp_subscription_t *subscription);

@@ -39,6 +39,55 @@
   issued it.
 - `on_audit` carries both the requested and the resolved identity, so a journal
   records what the client asked for rather than what a future transform injected.
+- **Tool renaming and argument injection** (`on_resolve`, hook ①). You can now
+  publish a tool under a different name, hide an argument from clients and supply
+  it yourself, or map a whole family of published names onto one real tool — the
+  client calls `edit_doc`, the runtime runs `hermes.content.apply` with an API key
+  the client never saw. The rename resolves *before* the policy decision, so
+  re-exposing an apply-effect tool under a gentler name is still an apply as far as
+  `on_authorize` is concerned. Arguments are validated against the real tool's
+  schema, so a transform that changes an argument's **type** must convert it here.
+- **Catalog transformation** (`on_list`, hook ⑦). You can now rewrite what
+  `tools/list`, `resources/list` and `resources/templates/list` return: rename
+  entries, rewrite their schemas or descriptions, filter them per principal, or add
+  synthetic entries no provider registered — the catalog half of a proxy or a
+  retrieval-first meta-tool. It runs after `on_authorize` has filtered, so a denied
+  entry cannot be transformed back into view, and a synthetic name still passes
+  `on_resolve` and `on_authorize` when it is called.
+- **Answering a call without reaching the provider** (`on_call`, hook ③). You can
+  now short-circuit a tool call from a middleware — a cache hit, a proxied
+  upstream, a canned refusal — and the provider is never invoked. Arguments are
+  read-only here by design: rewriting them is `on_resolve`'s job, because arguments
+  mutated at this point would be mutated after schema validation. A substituted
+  result is validated exactly like a provider's, output schema included.
+- **Result rewriting and redaction** (`on_result`, hook ④). You can now redact,
+  truncate or rewrite a tool result before it reaches the client. Several hooks
+  compose in registration order. The runtime validates the **provider's** result
+  against the real output schema before this hook runs; your replacement is
+  re-checked for structural and content-block validity but not against that schema,
+  because dropping a field the schema requires is what redaction is — keeping
+  `on_list`'s advertised `outputSchema` consistent with what you emit is yours to
+  do, and the schema is handed to the hook so you can.
+- **Decorating a request's outbound frames** (`wrap_sink`, hook ⑥). You can now
+  wrap the delivery path a single request's output travels — every
+  `notifications/progress` frame it emits and its final response — for progress
+  coalescing, stream redaction or per-request accounting. Every member of the
+  wrapper is optional and a NULL one forwards untouched. Progress is still
+  delivered strictly ahead of the response, and the runtime enforces the two ways a
+  wrapper could break a request: a swallowed response is detected and answered past
+  the chain with `-32603` rather than left to wedge the connection, and a second
+  completion for one id is refused.
+- `maelys_mcp_middleware_t` gains `on_resolve`, `on_call`, `on_result`, `wrap_sink`
+  and `on_list`, and its fields are now in hook order. This extends the ABI-3
+  descriptor introduced above before ABI 3 has been released, so there is no
+  further bump; every field is optional and existing designated initializers keep
+  compiling unchanged.
+- `maelys_mcp_response_sink_t` becomes a public **opaque** type, with
+  `maelys_mcp_sink_emit`, `maelys_mcp_sink_complete` and
+  `maelys_mcp_sink_cancelled` to forward through it. The layout stays private, so
+  decorating the delivery path is not a commitment to its shape.
+- The middleware suite now runs under `make tsan` as well as `make check`, because
+  `wrap_sink` sits on the path every request's output takes.
 
 ## 0.13.1 - 2026-08-20
 
