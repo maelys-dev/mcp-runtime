@@ -1,17 +1,32 @@
-"""Dependency-free SDK for persistent maelys-provider/3 processes."""
+"""Dependency-free SDK for persistent maelys-provider/5 processes."""
 from __future__ import annotations
 
 import json
 import os
 import sys
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, TextIO
 
-PROTOCOL = "maelys-provider/4"
+PROTOCOL = "maelys-provider/5"
 # The version every provider speaks, and the one the host opens with until
-# this SDK declares the newer one in a response.
+# this SDK declares a newer one in a frame of its own.
 PROTOCOL_FLOOR = "maelys-provider/3"
+# Every version between the floor and the current one, oldest first. The list
+# matters as much as its endpoints: the host addresses a provider at whatever
+# that provider last declared, and this SDK declares /5 only once it actually
+# nests (see PROTOCOL_DECLARED), so /4 is a version it must expect to be
+# spoken to at - a two-value "floor or newest" check would reject it.
+PROTOCOL_VERSIONS = (PROTOCOL_FLOOR, "maelys-provider/4", PROTOCOL)
+# The version stamped on outbound frames until a nested request is opened.
+# Announcing /5 up front would cost every provider built on this SDK its
+# compatibility with a host that predates /5, in exchange for a feature it may
+# never use. The host learns a version from any frame rather than only from
+# responses, precisely so that /5 can be announced late - on the frame that
+# opens the first nested request - which is what keeps a provider that never
+# nests emitting exactly the bytes it emitted before this version existed.
+PROTOCOL_DECLARED = "maelys-provider/4"
 TOOL_EFFECTS = ("read", "preview", "apply", "commit", "execute")
 SUPPORTED_SCHEMA_KEYS = {
     "$schema", "title", "description", "type", "properties", "required",
@@ -22,11 +37,94 @@ SCHEMA_TYPES = {"object", "array", "string", "number", "integer", "boolean", "nu
 
 JsonObject = dict[str, Any]
 _UNSET = object()
+
+
+class NestedRequestError(RuntimeError):
+    """A nested client request that came back as anything but a result.
+
+    `code` is the host's own code - `client_error`, `denied`, `timeout`,
+    `cancelled`, `unavailable` or `failed` - or one this SDK raises on its own
+    behalf when the wire, rather than the client, is what went wrong. `data`
+    carries the client's JSON-RPC error object for `client_error`, so a handler
+    can tell "the user declined" from "the request never got there".
+    """
+
+    def __init__(self, code: str, message: str, data: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.data = data
+
+
+class NestedRequestDenied(NestedRequestError):
+    """The host refused to forward the request; no byte reached the client."""
+
+
+class NestedRequestTimeout(NestedRequestError):
+    """The client did not answer within the host's nested deadline."""
+
+
+class NestedRequestCancelled(NestedRequestError):
+    """The outer call was cancelled, or the client connection went away."""
+
+
+class NestedRequestUnavailable(NestedRequestError):
+    """This call cannot nest: no transport, or no call in progress."""
+
+
+class NestedTransportError(NestedRequestError):
+    """The provider wire failed rather than the client: closed, or malformed.
+
+    Deliberately a NestedRequestError as well, so one except clause covers
+    every way a helper below can fail to produce an answer.
+    """
+
+
+_NESTED_ERRORS: dict[str, type[NestedRequestError]] = {
+    "denied": NestedRequestDenied,
+    "timeout": NestedRequestTimeout,
+    "cancelled": NestedRequestCancelled,
+    "unavailable": NestedRequestUnavailable,
+}
+
+
 @dataclass(frozen=True)
 class CallContext:
     input_responses: JsonObject | None = None
     request_state: str | None = None
     client_capabilities: JsonObject | None = None
+    # Bound by serve_provider for the duration of one handler call. Excluded
+    # from equality and repr so a context still compares by what it carries.
+    nested: Any = field(default=None, compare=False, repr=False)
+
+    def request_elicitation(self, params: JsonObject | None = None) -> JsonObject:
+        """Asks the client a question and blocks for the answer.
+
+        `params` is the MCP `elicitation/create` params object, passed through
+        verbatim - the host forwards it and this SDK does not second-guess the
+        client's schema, exactly as `input_required_result` does not.
+
+        The counterpart of `input_required_result`, not a replacement for it:
+        that one ends the call and lets the client retry, this one keeps the
+        call open. Raises NestedRequestError (see its subclasses) when the
+        answer is a refusal rather than a result, and must be called from the
+        thread handling the call.
+        """
+        return self._request("elicitation/create", params)
+
+    def request_sampling(self, params: JsonObject | None = None) -> JsonObject:
+        """Asks the client's model for a completion and blocks for it."""
+        return self._request("sampling/createMessage", params)
+
+    def request_roots(self, params: JsonObject | None = None) -> JsonObject:
+        """Asks the client for its roots and blocks for them."""
+        return self._request("roots/list", params)
+
+    def _request(self, method: str, params: JsonObject | None) -> JsonObject:
+        if self.nested is None:
+            raise NestedRequestUnavailable("unavailable",
+                "nested requests need a serve_provider transport")
+        return self.nested.request(method,
+            {} if params is None else _object(params, f"{method} params"))
 
 
 @dataclass(frozen=True)
@@ -144,8 +242,11 @@ class ProviderEvents:
             if not self._active or self._writer is None:
                 raise RuntimeError(
                     "provider events are unavailable before activation or after shutdown")
-            self._writer({"protocol": PROTOCOL, "method": method,
-                "params": params or {}})
+            # The writer stamps the version, rather than every caller repeating
+            # it: what this provider declares can change mid-session, and an
+            # event emitted from another thread must declare what the session
+            # declares now, not what it declared when this method was written.
+            self._writer({"method": method, "params": params or {}})
 
     def report_progress(
         self,
@@ -424,17 +525,247 @@ def create_provider(
         read_resource=read_resource, events=ProviderEvents())
 
 
-def handle_message(provider: Provider, message: Any) -> JsonObject:
+@dataclass(frozen=True)
+class _Frame:
+    """One line off the wire, parsed exactly once.
+
+    A frame set aside during a nested wait is handed to the dispatch loop
+    later, and a line that did not parse has to reach it as the same failure it
+    would have been inline - so the parse result travels with the frame rather
+    than being redone where it is used.
+    """
+
+    message: Any = None
+    error: Exception | None = None
+
+
+def _parse_frame(line: str) -> _Frame:
+    try:
+        return _Frame(message=json.loads(line, object_pairs_hook=_strict_object))
+    except Exception as error:  # reported as a provider error, like inline
+        return _Frame(error=error)
+
+
+class _NestedCall:
+    """The nested-request surface for exactly one call.
+
+    Scoped to the call rather than to the session for the same reason
+    ProviderEvents is gated on activation: the host fails the whole provider
+    transport for a nested request arriving while no call is being handled, so
+    a context a handler stashed and used afterwards has to fail here, on this
+    side of the wire, instead of killing the process.
+    """
+
+    def __init__(self, session: "_Session") -> None:
+        self._session = session
+
+    def request(self, method: str, params: JsonObject) -> JsonObject:
+        return self._session.request(self, method, params)
+
+
+class _Session:
+    """What one serve_provider loop shares with the handler inside a call.
+
+    Three things live here because both the outer dispatch and an in-call
+    nested wait need them and must not disagree: the single point where lines
+    are taken off the wire, the single point where frames are written, and the
+    version declared on them.
+
+    The intake is the reason this class exists. A handler blocked on a nested
+    reply has to keep reading, because the reply arrives on the same stream the
+    dispatch loop reads - but anything else that arrives meanwhile is not the
+    handler's to answer. Those frames are set aside in arrival order and handed
+    to the dispatch loop when the call returns, so an interleaved frame loses
+    its turn but never its place, and nothing is read twice or dropped.
+    """
+
+    def __init__(
+        self,
+        source: TextIO,
+        write_message: Callable[[JsonObject], None],
+    ) -> None:
+        self._source = source
+        self._write_message = write_message
+        self._lock = threading.Lock()
+        self._deferred: deque[_Frame] = deque()
+        self._protocol = PROTOCOL_DECLARED
+        self._counter = 0
+        self._call: _NestedCall | None = None
+        self._outstanding = False
+
+    @property
+    def protocol(self) -> str:
+        with self._lock:
+            return self._protocol
+
+    def write(self, message: JsonObject) -> None:
+        """Stamps the declared version and writes one frame.
+
+        Stamped here rather than by each caller because the declared version
+        can change mid-session; first, so the encoded key order is unchanged.
+        """
+        self._write_message({"protocol": self.protocol, **message})
+
+    def next_frame(self) -> _Frame | None:
+        """The next frame for the dispatch loop, or None at end of input.
+
+        Reading, and the deferred queue behind it, belong to the thread running
+        the dispatch loop - which is the same thread a handler blocks on, so
+        the two never race for a line.
+        """
+        if self._deferred:
+            return self._deferred.popleft()
+        line = self._source.readline()
+        return _parse_frame(line) if line else None
+
+    def open_call(self, call: _NestedCall) -> None:
+        with self._lock:
+            self._call = call
+
+    def close_call(self, call: _NestedCall) -> None:
+        with self._lock:
+            if self._call is call:
+                self._call = None
+
+    def request(
+        self,
+        call: _NestedCall,
+        method: str,
+        params: JsonObject,
+    ) -> JsonObject:
+        with self._lock:
+            if self._call is not call:
+                raise NestedRequestUnavailable("unavailable",
+                    "a nested request is only valid inside the call it belongs to")
+            if self._outstanding:
+                # The host fails the transport over two of these at once, so
+                # refusing the second here costs a handler an exception instead
+                # of costing the provider its connection.
+                raise NestedRequestUnavailable("unavailable",
+                    "this call already has a nested request outstanding")
+            self._outstanding = True
+            self._counter += 1
+            nested_id = f"n{self._counter}"
+            # Raised before the frame goes out, never lowered afterwards: the
+            # host learns a provider's version from any frame, and this is the
+            # frame that announces /5.
+            self._protocol = PROTOCOL
+        try:
+            self.write({"method": "provider/nestedRequest", "params": {
+                "nestedId": nested_id, "method": method, "params": params}})
+            return _nested_result(self._await_reply(nested_id))
+        finally:
+            with self._lock:
+                self._outstanding = False
+
+    def _await_reply(self, nested_id: str) -> JsonObject:
+        while True:
+            line = self._source.readline()
+            if not line:
+                raise NestedTransportError("closed",
+                    "the transport closed before the nested request was answered")
+            frame = _parse_frame(line)
+            params = _nested_reply_params(frame, nested_id)
+            if params is None:
+                self._deferred.append(frame)
+                continue
+            return params
+
+
+def _nested_reply_params(frame: _Frame, nested_id: str) -> JsonObject | None:
+    """The params of the host's reply to `nested_id`, or None when this frame
+    is something else the dispatch loop still has to see."""
+    message = frame.message
+    if frame.error is not None or not isinstance(message, dict):
+        return None
+    if message.get("method") != "provider/nestedReply":
+        return None
+    if message.get("protocol") not in PROTOCOL_VERSIONS:
+        raise NestedTransportError("malformed",
+            "nested reply declares an unsupported provider protocol")
+    params = message.get("params")
+    if not isinstance(params, dict):
+        raise NestedTransportError("malformed",
+            "nested reply params must be an object")
+    if params.get("nestedId") != nested_id:
+        # Not deferred: nestedId is echoed verbatim and only one request is
+        # ever outstanding, so a reply addressed at anything else means the two
+        # ends disagree about what is being answered.
+        raise NestedTransportError("malformed",
+            "nested reply does not correlate with the request")
+    return params
+
+
+def _nested_result(params: JsonObject) -> JsonObject:
+    result = params.get("result")
+    error = params.get("error")
+    if (result is None) == (error is None):
+        raise NestedTransportError("malformed",
+            "nested reply must carry exactly one result or error")
+    if error is not None:
+        if not isinstance(error, dict):
+            raise NestedTransportError("malformed",
+                "nested reply error must be an object")
+        code = error.get("code")
+        code = code if isinstance(code, str) and code else "failed"
+        text = error.get("message")
+        raise _NESTED_ERRORS.get(code, NestedRequestError)(code,
+            text if isinstance(text, str) and text else "the nested request failed",
+            error.get("data"))
+    if not isinstance(result, dict):
+        raise NestedTransportError("malformed",
+            "nested reply result must be an object")
+    return result
+
+
+def _call_context(params: JsonObject, label: str, nested: _NestedCall | None) -> CallContext:
+    input_responses = params.get("inputResponses")
+    request_state = params.get("requestState")
+    return CallContext(
+        input_responses=None if input_responses is None else
+            _object(input_responses, f"{label} inputResponses"),
+        request_state=None if request_state is None else
+            _string(request_state, f"{label} requestState"),
+        client_capabilities=None if params.get("clientCapabilities") is None else
+            _object(params["clientCapabilities"], f"{label} clientCapabilities"),
+        nested=nested,
+    )
+
+
+def _handle_call(
+    session: "_Session | None",
+    nested: _NestedCall | None,
+    handler: Callable[..., Any],
+    *arguments: Any,
+) -> Any:
+    """Runs one handler with its nested window open for exactly its duration."""
+    if session is None or nested is None:
+        return handler(*arguments)
+    session.open_call(nested)
+    try:
+        return handler(*arguments)
+    finally:
+        session.close_call(nested)
+
+
+def handle_message(
+    provider: Provider,
+    message: Any,
+    session: "_Session | None" = None,
+) -> JsonObject:
     request = _object(message, "provider request")
     request_id = request.get("id")
     if isinstance(request_id, bool) or not isinstance(request_id, int):
         raise TypeError("provider request id must be an integer")
-    # The host opens at the floor and only speaks the current version once we
-    # have declared it in a response, so both are valid inbound.
-    if request.get("protocol") not in (PROTOCOL, PROTOCOL_FLOOR):
+    # The host opens at the floor and raises to whatever this provider last
+    # declared, which is not necessarily the newest version the SDK speaks -
+    # /5 is announced late, on the first nested request - so every version in
+    # the range is valid inbound, not just the two endpoints.
+    if request.get("protocol") not in PROTOCOL_VERSIONS:
         raise TypeError("unsupported provider protocol")
     params = _object(request.get("params", {}), "provider request params")
     method = request.get("method")
+    nested = _NestedCall(session) if session is not None else None
     if method == "provider/describe":
         result: Any = provider.description()
     elif method == "provider/activate":
@@ -445,17 +776,8 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
         tool = next((candidate for candidate in provider.tools if candidate.name == name), None)
         if tool is None:
             raise ValueError(f"unknown provider tool: {name}")
-        input_responses = params.get("inputResponses")
-        request_state = params.get("requestState")
-        context = CallContext(
-            input_responses=None if input_responses is None else
-                _object(input_responses, "provider/call inputResponses"),
-            request_state=None if request_state is None else
-                _string(request_state, "provider/call requestState"),
-            client_capabilities=None if params.get("clientCapabilities") is None else
-                _object(params["clientCapabilities"], "provider/call clientCapabilities"),
-        )
-        provider_result = tool.handler(arguments, context)
+        context = _call_context(params, "provider/call", nested)
+        provider_result = _handle_call(session, nested, tool.handler, arguments, context)
         if not isinstance(provider_result, ProviderResult):
             raise TypeError("tool handler must return ProviderResult")
         result = provider_result.payload()
@@ -463,17 +785,8 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
         if provider.read_resource is None:
             raise ValueError("provider does not expose resources")
         uri = _string(params.get("uri"), "provider/readResource uri")
-        input_responses = params.get("inputResponses")
-        request_state = params.get("requestState")
-        context = CallContext(
-            input_responses=None if input_responses is None else
-                _object(input_responses, "provider/readResource inputResponses"),
-            request_state=None if request_state is None else
-                _string(request_state, "provider/readResource requestState"),
-            client_capabilities=None if params.get("clientCapabilities") is None else
-                _object(params["clientCapabilities"], "provider/readResource clientCapabilities"),
-        )
-        resource_result = provider.read_resource(uri, context)
+        context = _call_context(params, "provider/readResource", nested)
+        resource_result = _handle_call(session, nested, provider.read_resource, uri, context)
         if not isinstance(resource_result, ResourceResult):
             raise TypeError("resource handler must return ResourceResult")
         result = resource_result.payload()
@@ -481,7 +794,11 @@ def handle_message(provider: Provider, message: Any) -> JsonObject:
         result = {}
     else:
         raise ValueError(f"unknown provider method: {method}")
-    return {"protocol": PROTOCOL, "id": request_id, "result": result}
+    # Read after the handler rather than before it: a call that opened a nested
+    # request has already declared /5 by now, and its own response must not go
+    # back out claiming the older version.
+    return {"protocol": session.protocol if session is not None else PROTOCOL_DECLARED,
+        "id": request_id, "result": result}
 
 
 def _isolated_transport() -> TextIO:
@@ -508,18 +825,23 @@ def serve_provider(
             transport.write(encoded)
             transport.flush()
 
-    provider.events._bind(write_message)
+    session = _Session(source, write_message)
+    provider.events._bind(session.write)
     try:
-        for line in source:
-            message: Any = None
+        while True:
+            frame = session.next_frame()
+            if frame is None:
+                break
+            message: Any = frame.message
             try:
-                message = json.loads(line, object_pairs_hook=_strict_object)
-                response = handle_message(provider, message)
+                if frame.error is not None:
+                    raise frame.error
+                response = handle_message(provider, message, session)
             except Exception as error:
                 candidate = message.get("id") if isinstance(message, dict) else 0
                 request_id = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else 0
                 code = "not_found" if isinstance(error, ProviderNotFoundError) else "provider_error"
-                response = {"protocol": PROTOCOL, "id": request_id,
+                response = {"protocol": session.protocol, "id": request_id,
                     "error": {"code": code, "message": str(error) or type(error).__name__}}
             write_message(response)
             if (isinstance(message, dict) and
@@ -536,7 +858,10 @@ def serve_provider(
 
 
 __all__ = [
-    "PROTOCOL", "TOOL_EFFECTS", "CallContext", "Provider", "ProviderEvents", "ProviderNotFoundError", "ProviderResult", "ResourceResult",
+    "PROTOCOL", "PROTOCOL_DECLARED", "PROTOCOL_FLOOR", "PROTOCOL_VERSIONS",
+    "TOOL_EFFECTS", "CallContext", "NestedRequestCancelled", "NestedRequestDenied",
+    "NestedRequestError", "NestedRequestTimeout", "NestedRequestUnavailable",
+    "NestedTransportError", "Provider", "ProviderEvents", "ProviderNotFoundError", "ProviderResult", "ResourceResult",
     "Resource", "ResourceTemplate", "Tool", "complete_result", "create_provider", "handle_message",
     "input_required_result", "resource_input_required_result", "resource_result", "serve_provider",
     "validate_schema_definition",
