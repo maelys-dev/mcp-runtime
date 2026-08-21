@@ -46,9 +46,12 @@ fi
 
 # The seam's own conformance suite proves a provider lifecycle runs on a
 # launcher that starts no process at all. A fork in that file would mean it was
-# testing the POSIX path again by accident.
+# testing the POSIX path again by accident. socketpair is deliberately not in
+# this narrower pattern: the fake launcher's transport is one, and a socketpair
+# creates no process.
+process_creation='(^|[^[:alnum:]_])(fork|execve|execvp|posix_spawn|waitpid)[[:space:]]*\('
 if [ -f tests/test_process_launcher.c ] &&
-   search_c "$process_primitive" tests/test_process_launcher.c; then
+   search_c "$process_creation" tests/test_process_launcher.c; then
   echo "The launcher conformance suite must not create processes itself" >&2
   exit 1
 fi

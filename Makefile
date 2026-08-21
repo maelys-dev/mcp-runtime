@@ -129,6 +129,10 @@ $(BIN)/test-mcp-proxy: $(OBJ)/tests/test_mcp_proxy.o $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
+$(BIN)/test-process-launcher: $(OBJ)/tests/test_process_launcher.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
 # host/manifest.o is host-level, not part of libmaelys_mcp.a (see
 # docs/manifest.md: the public library surface does not grow for it), so the
 # test binary links the object directly - the same seam the host binary uses.
@@ -204,7 +208,7 @@ NESTED_FIXTURE_ARGS = $(abspath $(BIN)/nested-provider) \
 	$(abspath $(BIN)/legacy4-provider) \
 	$(abspath $(BIN)/sdk-nested-provider)
 
-TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
+TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
 
 # Compile everything `test` runs, without running any of it. The split exists
 # for scripts/mutate.py: a mutant that fails to compile is *stillborn*, not
@@ -234,6 +238,8 @@ test: test-build
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
 		$(abspath $(BIN)/environment-provider) $(abspath $(BIN)/slow-describe-provider) \
 		$(abspath $(BIN)/fd-check-provider) $(abspath $(BIN)/stubborn-provider)
+	$(BIN)/test-process-launcher $(abspath $(BIN)/example-provider) \
+		$(abspath $(BIN)/slow-describe-provider) $(abspath $(BIN)/stubborn-provider)
 	$(BIN)/test-mcp-proxy $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
 		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream) \
@@ -328,7 +334,7 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-middleware $(BIN)/test-process-provider $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
+tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-middleware $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
 		$(BIN)/test-nested-requests $(NESTED_FIXTURES) \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
@@ -354,6 +360,11 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 		$(abspath $(BIN)/bad-schema-provider) $(abspath $(BIN)/oversized-provider) \
 		$(abspath $(BIN)/environment-provider) $(abspath $(BIN)/slow-describe-provider) \
 		$(abspath $(BIN)/fd-check-provider) $(abspath $(BIN)/stubborn-provider)
+	# The seam suite is here because its fake launcher is the one place a
+	# provider's transport is served by a thread in this process: the runtime's
+	# reader, the fake child and the teardown ladder all touch one socketpair.
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-process-launcher $(abspath $(BIN)/example-provider) \
+		$(abspath $(BIN)/slow-describe-provider) $(abspath $(BIN)/stubborn-provider)
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-mcp-proxy $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider) \
 		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
 		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream) \
