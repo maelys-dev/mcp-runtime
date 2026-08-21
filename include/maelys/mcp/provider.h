@@ -250,6 +250,39 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     maelys_mcp_provider_t **out_provider,
     char **out_error);
 
+/*
+ * Like maelys_mcp_provider_spawn_with_options, but carries manifest v2's
+ * "args" and "executionProfile" (docs/manifest.md) through to the launch seam
+ * (docs/launch-contract-design.md).
+ *
+ * `args` is a NULL-terminated vector of EXTRA arguments only - never the
+ * complete vector. The runtime always compiles
+ * argv[0] = options->executable_path, argv[1] = "--provider", then
+ * args[0..], exactly as maelys_mcp_provider_spawn_with_options does with an
+ * implicit empty `args`. A manifest cannot write argv[1]: see "Two layers of
+ * argv" in the design document for why that invariant is native providers'
+ * alone to keep. NULL (or a vector whose first element is NULL) means no
+ * extra arguments and reproduces maelys_mcp_provider_spawn_with_options
+ * byte-identically.
+ *
+ * `execution_profile` is opaque pass-through to the launcher
+ * (maelys_mcp_process_spec_t.execution_profile); NULL means "the launcher's
+ * own default", matching maelys_mcp_provider_spawn_with_options.
+ *
+ * This is a new entry point rather than new fields on the released
+ * maelys_mcp_provider_process_options_t, per docs/abi-policy.md: adding
+ * fields to a released public structure is an ABI break, and a compatible
+ * extension is a new structure or a new entry point - the same idiom
+ * maelys_mcp_provider_spawn_with_launcher already used to add a launcher
+ * parameter without touching the options structure.
+ */
+maelys_mcp_result_t maelys_mcp_provider_spawn_with_args(
+    const maelys_mcp_provider_process_options_t *options,
+    char *const *args,
+    const char *execution_profile,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error);
+
 #define MAELYS_MCP_DEFAULT_PROXY_CONNECT_TIMEOUT_MS 10000u
 
 /*
@@ -317,6 +350,26 @@ typedef struct maelys_mcp_proxy_options {
  */
 maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     const maelys_mcp_proxy_options_t *options,
+    maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
+    char **out_error);
+
+/*
+ * Like maelys_mcp_provider_proxy_spawn, but carries manifest v2's
+ * "executionProfile" (docs/manifest.md) through to the launch seam. NULL
+ * means "the launcher's own default", matching maelys_mcp_provider_proxy_spawn.
+ * There is no proxy equivalent of maelys_mcp_provider_spawn_with_args'
+ * `args`: an mcp-proxy upstream already takes its whole argv through
+ * maelys_mcp_proxy_options_t.argv (see "The asymmetry with the proxy, and why
+ * it is right" in docs/launch-contract-design.md).
+ *
+ * A new entry point rather than a new field on the released
+ * maelys_mcp_proxy_options_t, for the same ABI reason as
+ * maelys_mcp_provider_spawn_with_args.
+ */
+maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_profile(
+    const maelys_mcp_proxy_options_t *options,
+    const char *execution_profile,
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
     char **out_error);

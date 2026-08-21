@@ -687,8 +687,14 @@ static void proxy_destroy(void *context) {
     free(proxy);
 }
 
+/*
+ * `execution_profile` is manifest v2's "executionProfile" (docs/manifest.md),
+ * opaque pass-through to the launcher; NULL for every caller that carries
+ * none, which reproduces this function's pre-v2 behaviour.
+ */
 static maelys_mcp_result_t spawn_upstream(
     const maelys_mcp_proxy_options_t *options,
+    const char *execution_profile,
     const maelys_mcp_process_launcher_t *launcher,
     proxy_context_t **out_proxy,
     char **out_error) {
@@ -704,7 +710,7 @@ static maelys_mcp_result_t spawn_upstream(
     maelys_mcp_process_spec_t spec = {
         .executable_path = options->executable_path,
         .argv = options->argv ? options->argv : fallback_argv,
-        .execution_profile = NULL,
+        .execution_profile = execution_profile,
         .max_message_bytes = options->max_message_bytes,
         /* One connect budget covers spawn, era negotiation and the single
          * tools/list, so the launch's share of it is the whole thing. */
@@ -996,8 +1002,15 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
         out_error);
 }
 
-maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
+/*
+ * The shared body behind every proxy spawn entry point. `execution_profile`
+ * is manifest v2's "executionProfile" (docs/manifest.md); the pre-v2 entry
+ * points pass NULL, which reproduces their exact pre-v2 behaviour through
+ * spawn_upstream.
+ */
+static maelys_mcp_result_t provider_proxy_spawn_with_launcher_and_profile(
     const maelys_mcp_proxy_options_t *options,
+    const char *execution_profile,
     const maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
@@ -1051,8 +1064,8 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
         return MAELYS_MCP_ERR_IO;
     }
     proxy_context_t *proxy = NULL;
-    maelys_mcp_result_t status = spawn_upstream(&normalized, launcher, &proxy,
-        out_error);
+    maelys_mcp_result_t status = spawn_upstream(&normalized, execution_profile,
+        launcher, &proxy, out_error);
     if (status != MAELYS_MCP_OK) return status;
     status = negotiate_era(proxy, deadline_ms, out_error);
     if (status != MAELYS_MCP_OK) {
@@ -1136,4 +1149,29 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
     if (out_skipped_tools) *out_skipped_tools = skipped_tools;
     else free(skipped_tools);
     return status;
+}
+
+maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
+    const maelys_mcp_proxy_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
+    char **out_error) {
+    /* No manifest v2 data: byte-identical to what this entry point always
+     * did. */
+    return provider_proxy_spawn_with_launcher_and_profile(options, NULL,
+        launcher, out_provider, out_skipped_tools, out_error);
+}
+
+maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_profile(
+    const maelys_mcp_proxy_options_t *options,
+    const char *execution_profile,
+    maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
+    char **out_error) {
+    /* Always the POSIX launcher, like maelys_mcp_provider_proxy_spawn: this
+     * entry point exists to carry manifest v2 data, not to name a launcher. */
+    return provider_proxy_spawn_with_launcher_and_profile(options,
+        execution_profile, maelys_mcp_posix_launcher(), out_provider,
+        out_skipped_tools, out_error);
 }

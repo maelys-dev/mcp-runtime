@@ -99,7 +99,7 @@ $(BIN)/adversarial-provider: $(OBJ)/tests/helpers/adversarial_provider.o
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream $(BIN)/nested-provider $(BIN)/nested-double-provider $(BIN)/nested-dying-provider $(BIN)/legacy4-provider: $(BIN)/adversarial-provider
+$(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/argv-echo-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream $(BIN)/nested-provider $(BIN)/nested-double-provider $(BIN)/nested-dying-provider $(BIN)/legacy4-provider: $(BIN)/adversarial-provider
 	ln -sf $(notdir $<) $@
 
 # Unlike the fixture above, this one is a real C SDK provider - it links
@@ -208,7 +208,7 @@ NESTED_FIXTURE_ARGS = $(abspath $(BIN)/nested-provider) \
 	$(abspath $(BIN)/legacy4-provider) \
 	$(abspath $(BIN)/sdk-nested-provider)
 
-TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
+TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/argv-echo-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
 
 # Compile everything `test` runs, without running any of it. The split exists
 # for scripts/mutate.py: a mutant that fails to compile is *stillborn*, not
@@ -244,7 +244,7 @@ test: test-build
 		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
 		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream) \
 		$(abspath $(BIN)/exotic-schema-mcp-upstream)
-	$(BIN)/test-manifest
+	$(BIN)/test-manifest $(abspath $(BIN)/argv-echo-provider)
 	scripts/test_stdio.sh $(abspath $(BIN)/maelys-mcp) $(abspath $(BIN)/example-provider)
 
 audit:
@@ -335,10 +335,12 @@ tsan:
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
 tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-middleware $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
+		$(BIN)/test-manifest \
 		$(BIN)/test-nested-requests $(NESTED_FIXTURES) \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
 		$(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider \
 		$(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider \
+		$(BIN)/argv-echo-provider \
 		$(BIN)/maelys-mcp $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream \
 		$(BIN)/exotic-schema-mcp-upstream
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
@@ -369,6 +371,10 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 		$(abspath $(BIN)/legacy-mcp-upstream) $(abspath $(BIN)/erroring-mcp-upstream) \
 		$(abspath $(BIN)/chatty-mcp-upstream) $(abspath $(BIN)/dying-mcp-upstream) \
 		$(abspath $(BIN)/exotic-schema-mcp-upstream)
+	# manifest v2's end-to-end proof spawns a real child (argv-echo-provider)
+	# through maelys_mcp_provider_spawn_with_args, so it belongs under tsan
+	# alongside the other suites that exercise a real reader thread.
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-manifest $(abspath $(BIN)/argv-echo-provider)
 
 FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 	-D_POSIX_C_SOURCE=200809L -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer
