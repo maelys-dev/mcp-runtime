@@ -1,5 +1,7 @@
 #include "maelys/mcp.h"
 #include "src/internal/internal.h"
+#include "host/http_auth.h"
+#include "host/http_server.h"
 #include "host/manifest.h"
 
 #include <errno.h>
@@ -42,12 +44,50 @@ static void usage(FILE *stream) {
         "                  [--provider-call-timeout-ms N]\n"
         "                  [--provider-shutdown-timeout-ms N]\n"
         "                  [--stdio-write-timeout-ms N]\n"
+        "                  [--http-listen ADDRESS:PORT] [--http-path /mcp]\n"
+        "                  [--http-allow-origin ORIGIN ...]\n"
+        "                  [--http-bearer-token TOKEN ...]\n"
         "\n"
         "At least one --provider or a --manifest with at least one provider is\n"
         "required. --manifest (docs/manifest.md) declares a whole provider set,\n"
         "including federated mcp-proxy providers that --provider alone cannot;\n"
         "its providers are added after --provider's, in the manifest's order.\n"
-        "Its \"allowEffects\" is OR-ed with --allow-effect rather than replacing it.\n");
+        "Its \"allowEffects\" is OR-ed with --allow-effect rather than replacing it.\n"
+        "\n"
+        "--http-listen starts the HTTP listener alongside stdio. It binds\n"
+        "127.0.0.1 unless told otherwise, and a non-loopback address refuses to\n"
+        "start unless --http-bearer-token supplies an authenticator other than\n"
+        "loopback trust. THE HTTP ENDPOINT DOES NOT SERVE MCP YET: it parses,\n"
+        "routes and authenticates, and answers 503 (see docs/protocol-support.md).\n");
+}
+
+/*
+ * ADDRESS:PORT, where ADDRESS may be an IPv6 literal in brackets. Split on the
+ * LAST colon so that "[::1]:8080" and "127.0.0.1:8080" both work and an
+ * unbracketed IPv6 literal - which has several colons and no unambiguous port -
+ * is refused by inet_pton rather than guessed at.
+ */
+static int parse_listen(const char *value, char *address, size_t capacity,
+    unsigned short *out_port) {
+    if (!value || !*value) return -1;
+    const char *colon = strrchr(value, ':');
+    if (!colon || colon == value) return -1;
+    size_t address_length = (size_t)(colon - value);
+    if (address_length >= capacity) return -1;
+    if (value[0] == '[') {
+        if (colon[-1] != ']' || address_length < 3u) return -1;
+        memcpy(address, value + 1u, address_length - 2u);
+        address[address_length - 2u] = '\0';
+    } else {
+        memcpy(address, value, address_length);
+        address[address_length] = '\0';
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long port = strtoul(colon + 1, &end, 10);
+    if (errno || !end || *end || port > 65535u) return -1;
+    *out_port = (unsigned short)port;
+    return 0;
 }
 
 static int parse_timeout(const char *value, unsigned int *out) {
@@ -60,10 +100,24 @@ static int parse_timeout(const char *value, unsigned int *out) {
     return 0;
 }
 
+/* Fixed caps rather than a second heap allocation on every early-return path.
+ * Both are far past any real configuration, and a configuration that needs
+ * more origins than this is one an allowlist is the wrong shape for. */
+#define MAX_HTTP_ORIGINS 64u
+#define MAX_HTTP_TOKENS 64u
+
 int main(int argc, char **argv) {
     const char **provider_paths = calloc((size_t)argc, sizeof(*provider_paths));
     if (!provider_paths) return 1;
     size_t provider_count = 0;
+    char http_address[64] = {0};
+    unsigned short http_port = 0;
+    int http_enabled = 0;
+    const char *http_path = NULL;
+    const char *http_origins[MAX_HTTP_ORIGINS];
+    size_t http_origin_count = 0;
+    const char *http_tokens[MAX_HTTP_TOKENS];
+    size_t http_token_count = 0;
     host_policy_t policy = {0};
     const char *manifest_path = NULL;
     unsigned int describe_timeout_ms = MAELYS_MCP_DEFAULT_PROVIDER_DESCRIBE_TIMEOUT_MS;
@@ -92,6 +146,19 @@ int main(int argc, char **argv) {
             index + 1 < argc && parse_timeout(argv[++index], &shutdown_timeout_ms) == 0) {
         } else if (strcmp(argv[index], "--stdio-write-timeout-ms") == 0 &&
             index + 1 < argc && parse_timeout(argv[++index], &stdio_write_timeout_ms) == 0) {
+        } else if (strcmp(argv[index], "--http-listen") == 0 && index + 1 < argc &&
+            parse_listen(argv[++index], http_address, sizeof(http_address),
+                &http_port) == 0) {
+            http_enabled = 1;
+        } else if (strcmp(argv[index], "--http-path") == 0 && index + 1 < argc &&
+            argv[index + 1][0] == '/') {
+            http_path = argv[++index];
+        } else if (strcmp(argv[index], "--http-allow-origin") == 0 && index + 1 < argc &&
+            http_origin_count < MAX_HTTP_ORIGINS) {
+            http_origins[http_origin_count++] = argv[++index];
+        } else if (strcmp(argv[index], "--http-bearer-token") == 0 && index + 1 < argc &&
+            http_token_count < MAX_HTTP_TOKENS) {
+            http_tokens[http_token_count++] = argv[++index];
         } else if (strcmp(argv[index], "--help") == 0) {
             usage(stdout);
             free(provider_paths);
@@ -288,11 +355,66 @@ int main(int argc, char **argv) {
         }
     }
     manifest_clear(&manifest);
+
+    /*
+     * The HTTP listener, when asked for. It runs alongside stdio and, in this
+     * phase, shares nothing with the runtime: the adapter behind it answers
+     * from a table and dispatches nothing, so there is no channel, no principal
+     * bound to one, and no MCP traffic on this endpoint yet.
+     */
+    maelys_mcp_authenticator_t authenticator = {0};
+    maelys_mcp_http_adapter_t *adapter = NULL;
+    maelys_http_server_t *http_server = NULL;
+    if (http_enabled) {
+        maelys_mcp_result_t http_status = http_token_count
+            ? maelys_http_auth_static_bearer_create(http_tokens, http_token_count,
+                &authenticator)
+            : maelys_http_auth_loopback_create(&authenticator);
+        if (http_status == MAELYS_MCP_OK) {
+            http_status = maelys_mcp_http_adapter_create(
+                MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &adapter);
+        }
+        if (http_status == MAELYS_MCP_OK) {
+            maelys_http_server_options_t http_options = {
+                .bind_address = http_address,
+                .port = http_port,
+                .endpoint_path = http_path,
+                .allowed_origins = http_origins,
+                .allowed_origin_count = http_origin_count,
+                .max_body_bytes = config.max_message_bytes,
+                .write_timeout_ms = stdio_write_timeout_ms,
+                .authenticator = &authenticator,
+                .adapter = adapter
+            };
+            http_status = maelys_http_server_start(&http_options, &http_server);
+        }
+        if (http_status != MAELYS_MCP_OK) {
+            fprintf(stderr, "Cannot start the HTTP listener on %s:%u: %s\n",
+                http_address, (unsigned int)http_port,
+                maelys_mcp_result_string(http_status));
+            if (adapter) maelys_mcp_http_adapter_destroy(adapter);
+            if (authenticator.destroy) authenticator.destroy(authenticator.context);
+            maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+            if (destroy_status != MAELYS_MCP_OK) {
+                fprintf(stderr, "Cannot destroy runtime: %s\n",
+                    maelys_mcp_result_string(destroy_status));
+            }
+            close(transport_fd);
+            return 1;
+        }
+    }
+
     maelys_mcp_stdio_options_t stdio_options = {
         .write_timeout_ms = stdio_write_timeout_ms
     };
     status = maelys_mcp_runtime_serve_stdio_with_options(
         runtime, STDIN_FILENO, transport_fd, &stdio_options);
+    /* Stop accepting and join every connection before the runtime goes away,
+     * which is the ordering that stays correct once H3 gives those connections
+     * channels to hold. */
+    if (http_server) (void)maelys_http_server_stop(http_server);
+    if (adapter) maelys_mcp_http_adapter_destroy(adapter);
+    if (authenticator.destroy) authenticator.destroy(authenticator.context);
     maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
     if (status == MAELYS_MCP_OK) status = destroy_status;
     close(transport_fd);
