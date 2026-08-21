@@ -54,11 +54,22 @@ typedef struct maelys_mcp_provider_sdk_config {
 
 typedef struct maelys_mcp_provider_sdk_options {
     size_t max_message_bytes;
+    /*
+     * <= 0 defers to MAELYS_PROVIDER_FD when it is set and usable (the
+     * MAELYS_MCP_PROCESS_FD_ISOLATED launch layout - see
+     * docs/launch-contract-design.md), and to STDIN_FILENO/STDOUT_FILENO or
+     * the isolated stdout fd otherwise. A positive value here always wins
+     * over the environment: it is a more deliberate statement than an
+     * inherited variable.
+     */
     int input_fd;       /* <= 0 means STDIN_FILENO. */
     int output_fd;      /* <= 0 means STDOUT_FILENO, or the isolated stdout fd. */
     /* Non-zero leaves stdout untouched when output_fd uses STDOUT_FILENO.
      * Zero is the safe default: protocol writes use a duplicated stdout fd and
-     * application stdout is redirected to stderr. */
+     * application stdout is redirected to stderr. Never consulted when
+     * MAELYS_PROVIDER_FD supplies the descriptor instead - the host has
+     * already isolated fd 1 at the kernel level in that layout, so there is
+     * nothing left in this process's own stdout to protect. */
     int disable_stdout_isolation;
 } maelys_mcp_provider_sdk_options_t;
 

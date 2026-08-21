@@ -2,6 +2,8 @@
 #include "maelys/mcp/uri.h"
 #include "src/internal/internal.h"
 
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -831,14 +833,71 @@ done:
     return status;
 }
 
+/*
+ * MAELYS_PROVIDER_FD (docs/launch-contract-design.md, "The child's
+ * descriptors") is how the launcher declares MAELYS_MCP_PROCESS_FD_ISOLATED
+ * to the child: the protocol duplex lives on this descriptor instead of
+ * stdin/stdout, and fd 1 has already been wired to stderr before this process
+ * ever ran. Absent, empty, or not a clean positive integer all mean the same
+ * thing - "the launcher used the STDIO layout, or this binary is not running
+ * under this runtime's launcher at all" - never a fatal error: an unparsable
+ * value is treated exactly like an absent one, not like a request this SDK
+ * refused.
+ */
+static int provider_fd_from_environment(void) {
+    const char *text = getenv("MAELYS_PROVIDER_FD");
+    if (!text || !*text) return -1;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (!end || *end != '\0' || value <= 0 || value > INT_MAX) return -1;
+    return (int)value;
+}
+
+/*
+ * The launcher clears FD_CLOEXEC on this descriptor so it survives execve,
+ * which also makes it inheritable by anything this provider spawns of its
+ * own. A grandchild holding a live copy would defeat the runtime's only
+ * liveness signal - EOF on the fd when the provider itself dies - so the SDK
+ * re-arms close-on-exec the moment it adopts the descriptor
+ * (docs/launch-contract-design.md, "The SDK must re-set FD_CLOEXEC on the
+ * protocol fd at startup"). Mirrors the Python SDK's
+ * os.set_inheritable(fd, False) on its own isolated transport.
+ */
+static int set_close_on_exec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
 maelys_mcp_result_t maelys_mcp_provider_sdk_serve(
     const maelys_mcp_provider_sdk_config_t *config,
     const maelys_mcp_provider_sdk_options_t *options) {
     if (!provider_config_valid(config)) return MAELYS_MCP_ERR_ARGUMENT;
-    int input_fd = options && options->input_fd > 0 ? options->input_fd : STDIN_FILENO;
-    int output_fd = options && options->output_fd > 0 ? options->output_fd : STDOUT_FILENO;
+    /*
+     * An explicit input_fd/output_fd from the caller is a stronger, more
+     * deliberate statement than an inherited environment variable and always
+     * wins. Otherwise, MAELYS_PROVIDER_FD - when present and usable - becomes
+     * both the input and the output fd: ISOLATED's protocol channel is one
+     * duplex descriptor, not a pair. Absent, this is byte-identical to before
+     * MAELYS_PROVIDER_FD existed.
+     */
+    int provider_fd = -1;
+    if (!options || (options->input_fd <= 0 && options->output_fd <= 0)) {
+        provider_fd = provider_fd_from_environment();
+        if (provider_fd >= 0 && !set_close_on_exec(provider_fd)) provider_fd = -1;
+    }
+    int input_fd = options && options->input_fd > 0 ? options->input_fd :
+        (provider_fd >= 0 ? provider_fd : STDIN_FILENO);
+    int output_fd = options && options->output_fd > 0 ? options->output_fd :
+        (provider_fd >= 0 ? provider_fd : STDOUT_FILENO);
     int close_output = 0;
-    if ((!options || !options->disable_stdout_isolation) &&
+    /*
+     * No stdout isolation under ISOLATED: the host already wired this
+     * process's fd 1 to stderr, at the kernel level, before exec. There is
+     * nothing left in this process's own stdout for the SDK to protect, and
+     * duplicating it again would be redundant work on a descriptor that is
+     * not the protocol either way.
+     */
+    if (provider_fd < 0 && (!options || !options->disable_stdout_isolation) &&
         (!options || options->output_fd <= 0)) {
         int isolated = -1;
         maelys_mcp_result_t isolated_status = maelys_mcp_isolate_stdout(&isolated);
