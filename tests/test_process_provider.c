@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #define ASSERT_TRUE(condition) do { \
     if (!(condition)) { \
@@ -72,6 +74,34 @@ int main(int argc, char **argv) {
     error = NULL;
     maelys_mcp_provider_destroy(provider);
     provider = NULL;
+    /*
+     * A spawn must survive socketpair landing on the standard descriptors.
+     * Both socket ends are marked close-on-exec before the fork; with fds 0
+     * and 1 both free, socketpair returns {0, 1}, and the child's
+     * dup2(1, STDOUT_FILENO) is a POSIX no-op that does NOT clear the flag -
+     * so execve used to close the child's protocol end and the provider died
+     * before describe. Forked so closing stdin/stdout cannot disturb the
+     * rest of this suite (the fork's own diagnostics go to stderr).
+     */
+    {
+        pid_t child = fork();
+        ASSERT_TRUE(child >= 0);
+        if (child == 0) {
+            close(STDIN_FILENO);
+            close(STDOUT_FILENO);
+            maelys_mcp_provider_t *low_fd_provider = NULL;
+            char *spawn_error = NULL;
+            if (spawn_fixture(argv[1], 65536u, &low_fd_provider,
+                    &spawn_error) != MAELYS_MCP_OK) {
+                _exit(1);
+            }
+            maelys_mcp_provider_destroy(low_fd_provider);
+            _exit(0);
+        }
+        int child_status = 0;
+        ASSERT_TRUE(waitpid(child, &child_status, 0) == child);
+        ASSERT_TRUE(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0);
+    }
     ASSERT_TRUE(spawn_fixture(argv[1], 65536u, &provider, &error) == MAELYS_MCP_OK);
     maelys_mcp_provider_t *fd_check = NULL;
     ASSERT_TRUE(spawn_fixture(argv[8], 65536u, &fd_check, &error) == MAELYS_MCP_OK);
