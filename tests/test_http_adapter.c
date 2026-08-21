@@ -458,6 +458,14 @@ static const char *const H_CALL_NAME_ALPHABET[] =
  * apart. A correct decoder refuses this; the mutant accepts it.
  */
 static const char *const H_CALL_NAME_ZERO_INDEX[] = CALL_HEADERS("=?base64?YWF*?=");
+/*
+ * "YWI=" is Base64 for "ab", and it is the only ONE-padding-byte payload in
+ * this matrix that is supposed to be ACCEPTED. Without it, deleting the
+ * `last && padding == 1u` branch is invisible: the decoder would fall through
+ * to read '=' as a data byte, reject every one-pad sentinel there is, and no
+ * test would be looking at a one-pad sentinel that should have worked.
+ */
+static const char *const H_CALL_NAME_ONE_PAD[] = CALL_HEADERS("=?base64?YWI=?=");
 
 /* Prefix without suffix: not a sentinel, so it is compared literally. */
 static const char *const H_CALL_NAME_PREFIX_ONLY[] = CALL_HEADERS("=?base64?c2VhcmNo");
@@ -577,26 +585,33 @@ static const matrix_case_t MATRIX[] = {
      REQ("tools/call", "\"name\":\"s\\u00e9curit\\u00e9\"," META), 503, 0, 0, NULL},
     {"non-alphabet characters are a rejection",
      "sentinel with a non-alphabet byte", H_CALL_NAME_BAD_ALPHABET,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"there is no URL-safe alphabet",
      "sentinel using - and _", H_CALL_NAME_URLSAFE,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"wrong padding length is a rejection",
      "sentinel payload not a multiple of four", H_CALL_NAME_BAD_LENGTH,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"wrong padding length is a rejection, at the length where dropping the "
      "check overflows the decode buffer rather than just answering wrongly",
      "sentinel payload two short of a group", H_CALL_NAME_BAD_LENGTH_2MOD4,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"non-zero bits in the padding are a rejection",
      "sentinel with non-zero bits under two pad bytes", H_CALL_NAME_BAD_PADBITS,
-     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"non-zero bits in the padding are a rejection",
      "sentinel with non-zero bits under one pad byte", H_CALL_NAME_BAD_PADBITS_ONE,
-     REQ("tools/call", "\"name\":\"ab\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"ab\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"padding appears only at the tail",
      "sentinel with padding in the middle", H_CALL_NAME_INNER_PAD,
-     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     /*
      * The next two, and the UTF-8 rules generally, are DEFENCE IN DEPTH and
      * cannot be killed by a behavioural test - a mutation that deletes any of
@@ -612,10 +627,12 @@ static const matrix_case_t MATRIX[] = {
      */
     {"the decoded bytes must be valid UTF-8",
      "sentinel decoding to invalid UTF-8", H_CALL_NAME_INVALID_UTF8,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"the decoded bytes must contain no NUL",
      "sentinel decoding to an embedded NUL", H_CALL_NAME_EMBEDDED_NUL,
-     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"prefix and suffix must not overlap: below 11 bytes the value is literal",
      "the 10-byte pattern is taken literally", H_CALL_NAME_SHORT_PATTERN,
      REQ("tools/call", "\"name\":\"=?base64?=\"," META), 503, 0, 0, NULL},
@@ -664,11 +681,13 @@ static const matrix_case_t MATRIX[] = {
      REQ("tools/call", "\"name\":\"=?base64?c2VhcmNo\"," META), 503, 0, 0, NULL},
     {"a malformed sentinel is a rejection, never a fallback to a literal compare",
      "malformed payload is not retried as a literal", H_CALL_NAME_BAD_ALPHABET,
-     REQ("tools/call", "\"name\":\"=?base64?c2Vh*mNo?=\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"=?base64?c2Vh*mNo?=\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
     {"there is no URL-safe alphabet",
      "URL-safe spelling that would otherwise decode to the body's name",
      H_CALL_NAME_URLSAFE_DECODABLE,
-     REQ("tools/call", "\"name\":\"~~~\"," META), 400, -32020, 1, NULL},
+     REQ("tools/call", "\"name\":\"~~~\"," META), 400, -32020, 1,
+     "malformed Base64 sentinel"},
 
     {"every boundary of the Base64 alphabet decodes to the byte it names",
      "payload using A, Z, a, z, 0, 9, + and /", H_CALL_NAME_ALPHABET,
@@ -680,6 +699,10 @@ static const matrix_case_t MATRIX[] = {
     {"a non-alphabet byte is REJECTED, not folded to alphabet index 0",
      "payload whose bad byte would decode to the body's name", H_CALL_NAME_ZERO_INDEX,
      REQ("tools/call", "\"name\":\"aa@\"," META), 400, -32020, 1, NULL},
+
+    {"a one-padding-byte payload decodes and is accepted",
+     "sentinel with a single pad byte", H_CALL_NAME_ONE_PAD,
+     REQ("tools/call", "\"name\":\"ab\"," META), 503, 0, 0, NULL},
 
     /* --- the happy path --- */
     {"a request that satisfies every rule reaches the placeholder",
