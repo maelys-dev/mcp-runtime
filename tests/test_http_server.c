@@ -91,6 +91,80 @@ static int fixture_start(
     return 0;
 }
 
+/*
+ * A counting authenticator, so that "authenticate runs once per POST" can be
+ * asserted as a NUMBER rather than inferred from two requests both being
+ * answered. It delegates to loopback-trust rather than reimplementing a
+ * principal, because what is under test is how often the server layer calls
+ * it, not what it decides.
+ */
+typedef struct counting_auth {
+    maelys_mcp_authenticator_t inner;
+    int calls;
+} counting_auth_t;
+
+static maelys_mcp_result_t counting_authenticate(
+    void *context,
+    const maelys_mcp_transport_credentials_t *credentials,
+    maelys_mcp_principal_t **out_principal) {
+    counting_auth_t *counter = context;
+    ++counter->calls;
+    return counter->inner.authenticate(
+        counter->inner.context, credentials, out_principal);
+}
+
+static void counting_retain(void *context, maelys_mcp_principal_t *principal) {
+    counting_auth_t *counter = context;
+    counter->inner.retain(counter->inner.context, principal);
+}
+
+static void counting_release(void *context, maelys_mcp_principal_t *principal) {
+    counting_auth_t *counter = context;
+    counter->inner.release(counter->inner.context, principal);
+}
+
+static void counting_destroy(void *context) {
+    counting_auth_t *counter = context;
+    counter->inner.destroy(counter->inner.context);
+}
+
+static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) {
+    memset(fixture, 0, sizeof(*fixture));
+    memset(counter, 0, sizeof(*counter));
+    if (maelys_http_auth_loopback_create(&counter->inner) != MAELYS_MCP_OK) return -1;
+    fixture->authenticator.name = "counting";
+    fixture->authenticator.context = counter;
+    fixture->authenticator.authenticate = counting_authenticate;
+    fixture->authenticator.retain = counting_retain;
+    fixture->authenticator.release = counting_release;
+    fixture->authenticator.destroy = counting_destroy;
+    if (maelys_mcp_http_adapter_create(
+        MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &fixture->adapter) != MAELYS_MCP_OK) {
+        fixture->authenticator.destroy(fixture->authenticator.context);
+        return -1;
+    }
+    maelys_http_server_options_t options = {
+        .bind_address = "127.0.0.1",
+        .port = 0,
+        .allowed_origins = NULL,
+        .allowed_origin_count = 0,
+        .max_body_bytes = 1024u,
+        .header_timeout_ms = 2000u,
+        .body_timeout_ms = 2000u,
+        .idle_timeout_ms = 2000u,
+        .write_timeout_ms = 2000u,
+        .authenticator = &fixture->authenticator,
+        .adapter = fixture->adapter
+    };
+    if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
+        maelys_mcp_http_adapter_destroy(fixture->adapter);
+        fixture->authenticator.destroy(fixture->authenticator.context);
+        return -1;
+    }
+    fixture->port = maelys_http_server_port(fixture->server);
+    return 0;
+}
+
 static void fixture_stop(fixture_t *fixture) {
     if (fixture->server) maelys_http_server_stop(fixture->server);
     if (fixture->adapter) maelys_mcp_http_adapter_destroy(fixture->adapter);
@@ -396,6 +470,41 @@ static int a_kept_alive_connection_serves_a_second_request(void) {
         ASSERT_TRUE(strstr(response, "Connection: keep-alive") != NULL);
     }
     close(fd);
+    fixture_stop(&fixture);
+    return 0;
+}
+
+/*
+ * Authentication is repeated for every POST, so two requests on one kept-alive
+ * connection are two independent authentications and a revoked credential stops
+ * working on the next request rather than on the next connection. Asserted as a
+ * count, because "both were answered" is also what a cached verdict looks like.
+ */
+static int authenticate_runs_once_per_post(void) {
+    fixture_t fixture;
+    counting_auth_t counter;
+    ASSERT_TRUE(fixture_start_counting(&fixture, &counter) == 0);
+    const char *request =
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
+    char response[4096];
+
+    /* One connection, one POST: exactly one authentication. */
+    ASSERT_TRUE(exchange(fixture.port, request, strlen(request),
+        response, sizeof(response)) == 503);
+    ASSERT_TRUE(counter.calls == 1);
+
+    /* One connection, two POSTs: exactly two more. */
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    for (int round = 0; round < 2; ++round) {
+        ASSERT_TRUE(send_all(fd, request, strlen(request)) == 0);
+        ssize_t got = read_one_message(fd, response, sizeof(response), 3000);
+        ASSERT_TRUE(got > 0);
+        ASSERT_TRUE(status_of(response) == 503);
+    }
+    close(fd);
+    ASSERT_TRUE(counter.calls == 3);
     fixture_stop(&fixture);
     return 0;
 }
@@ -755,7 +864,9 @@ int main(void) {
             peek_tells_a_fin_from_a_pipelined_byte},
         {"loopback-trust takes no material", loopback_trust_takes_no_material},
         {"static-bearer outcomes", static_bearer_outcomes},
-        {"principal refcounting", principal_refcounting}
+        {"principal refcounting", principal_refcounting},
+        {"authenticate runs once per POST, twice on a reused connection",
+            authenticate_runs_once_per_post}
     };
     return maelys_run_tests(cases, sizeof(cases) / sizeof(*cases));
 }
