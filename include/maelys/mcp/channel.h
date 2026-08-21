@@ -32,6 +32,23 @@ typedef struct maelys_mcp_channel_config {
 } maelys_mcp_channel_config_t;
 
 /*
+ * The protocol eras a channel serves and announces. Version policy is a
+ * property of the channel, not of the transport and not of the runtime: one
+ * runtime can serve a stdio channel that speaks both eras and a channel that
+ * speaks only 2026-07-28 at the same time, and no transport ever rewrites a
+ * dispatch result to make that true.
+ */
+typedef enum maelys_mcp_protocol_era {
+    /* 2024-11-05 ... 2025-11-25, negotiated by the `initialize` handshake. */
+    MAELYS_MCP_ERA_LEGACY = 1u << 0,
+    /* 2026-07-28, negotiated per request through `_meta`. */
+    MAELYS_MCP_ERA_MODERN = 1u << 1
+} maelys_mcp_protocol_era_t;
+
+#define MAELYS_MCP_ERA_ALL \
+    ((unsigned int)MAELYS_MCP_ERA_LEGACY | (unsigned int)MAELYS_MCP_ERA_MODERN)
+
+/*
  * Creates and publishes a channel owned by runtime. Provider activation occurs
  * once, on the first channel creation. A published channel keeps runtime alive
  * until maelys_mcp_channel_destroy succeeds.
@@ -40,6 +57,43 @@ maelys_mcp_result_t maelys_mcp_channel_create(
     maelys_mcp_runtime_t *runtime,
     const maelys_mcp_channel_config_t *config,
     maelys_mcp_channel_t **out_channel);
+
+/*
+ * Restricts the eras this channel serves. `eras` is a non-empty subset of
+ * MAELYS_MCP_ERA_ALL; anything else is MAELYS_MCP_ERR_ARGUMENT, because a
+ * channel that serves no era can answer nothing and silently reinterpreting
+ * that as "all of them" would hide the caller's mistake.
+ *
+ * Every channel starts at MAELYS_MCP_ERA_ALL, so a caller that never makes
+ * this call observes exactly the behaviour it always did. Three things change
+ * when an era is cleared:
+ *
+ *   - `server/discover` announces only the eras still set in
+ *     `result.supportedVersions`;
+ *   - `initialize` is refused with -32600 once MAELYS_MCP_ERA_LEGACY is clear;
+ *   - a request carrying modern `_meta` negotiation is refused with -32022
+ *     once MAELYS_MCP_ERA_MODERN is clear, and the error's `data.supported`
+ *     lists what this channel does serve.
+ *
+ * Callable on an active channel, normally immediately after creation and
+ * before any traffic. Returns MAELYS_MCP_ERR_STATE for a channel that is
+ * closing or faulted, and for an attempt to withdraw MAELYS_MCP_ERA_LEGACY
+ * from a channel that has already accepted an `initialize`: a negotiated era
+ * cannot be taken back from a client that is already using it.
+ *
+ * This is a setter rather than a `maelys_mcp_channel_config_t` field or a new
+ * constructor on purpose. Widening that released public structure would be an
+ * ABI break (docs/abi-policy.md), and which permanent public shape the
+ * capability should eventually take - a field behind an ABI 4 bump, or a
+ * size-prefixed options struct behind a `_ex` constructor - is an open
+ * question for the repository owner. A new entry point is the additive idiom
+ * docs/abi-policy.md names as this project's preferred one, keeps
+ * MAELYS_MCP_ABI_VERSION at 3, and leaves that choice open rather than
+ * pre-empting it.
+ */
+maelys_mcp_result_t maelys_mcp_channel_set_protocol_eras(
+    maelys_mcp_channel_t *channel,
+    unsigned int eras);
 
 /* Dispatches request and admits every response through this channel's outbox. */
 maelys_mcp_result_t maelys_mcp_channel_handle(
@@ -76,6 +130,39 @@ maelys_mcp_result_t maelys_mcp_channel_close(
  * used or destroyed again after this call returns.
  */
 maelys_mcp_result_t maelys_mcp_channel_destroy(
+    maelys_mcp_channel_t *channel);
+
+/*
+ * As maelys_mcp_channel_destroy, except that it never waits without a bound.
+ *
+ * maelys_mcp_channel_destroy answers a bounded close that missed its deadline
+ * by waiting for the channel to drain however long that takes, because the
+ * alternative - freeing at the deadline, while workers still hold the
+ * channel's mutex and outbox - is a use-after-free. That is the right trade
+ * for a transport that destroys one channel at process exit. It is the wrong
+ * trade for a transport that destroys a channel per request, where one wedged
+ * in-process provider would park the calling thread, and whatever the caller
+ * was holding for it, for as long as the provider takes.
+ *
+ * This entry point makes the same guarantee without the wait. When the
+ * bounded close misses its deadline the channel is aborted, taken out of the
+ * runtime immediately, and marked detached; this call then returns
+ * MAELYS_MCP_ERR_TIMEOUT, and whichever in-flight operation finishes last
+ * performs the real free on its own thread. The handle is consumed either
+ * way, exactly as with maelys_mcp_channel_destroy, and must never be used or
+ * destroyed again.
+ *
+ * The channel's context (maelys_mcp_channel_config_t::context) may therefore
+ * outlive this call. An embedder that frees what it designates must do so from
+ * the runtime it detached the channel into, after
+ * maelys_mcp_runtime_destroy - which waits for every detached channel - and
+ * not on the return from this call.
+ *
+ * MAELYS_MCP_OK means the channel closed cleanly and was freed before this
+ * returned; there is nothing outstanding. Any other status is the bounded
+ * close's, and the free may still be pending.
+ */
+maelys_mcp_result_t maelys_mcp_channel_destroy_detached(
     maelys_mcp_channel_t *channel);
 
 #ifdef __cplusplus

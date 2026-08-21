@@ -25,6 +25,7 @@ static maelys_mcp_result_t initialize_channel(
         channel->config.admission_timeout_ms = 5000u;
     }
     if (!channel->config.close_timeout_ms) channel->config.close_timeout_ms = 5000u;
+    channel->protocol_eras = MAELYS_MCP_ERA_ALL;
     channel->subscriptions = calloc(runtime->max_subscriptions,
         sizeof(*channel->subscriptions));
     if (!channel->subscriptions) goto failed;
@@ -209,12 +210,89 @@ static maelys_mcp_result_t begin_operation(maelys_mcp_channel_t *channel) {
     return MAELYS_MCP_OK;
 }
 
+/*
+ * Everything the channel object owns, released. Split out because a detached
+ * channel is freed from somewhere else entirely - whichever operation finishes
+ * last, on whatever thread that turns out to be - and two copies of this list
+ * would drift.
+ *
+ * It is also the single point at which a channel's context stops being
+ * reachable, and therefore the one place a context lifecycle callback belongs
+ * when the channel grows one. An authenticated transport principal is the case
+ * that needs it: the reaper carries a reference across the detach and releases
+ * it at the real free, which is here and is emphatically not the return from
+ * destroy. Keeping the free in one function is what makes that a one-line
+ * addition instead of two that can disagree.
+ */
+static void free_channel_storage(maelys_mcp_channel_t *channel) {
+    for (size_t index = 0; index < channel->subscription_count; ++index) {
+        maelys_mcp_subscription_clear(&channel->subscriptions[index]);
+    }
+    free(channel->subscriptions);
+    maelys_mcp_channel_nested_clear(channel);
+    free(channel->workers);
+    if (channel->legacy_capabilities) json_decref(channel->legacy_capabilities);
+    pthread_cond_destroy(&channel->nested_ready);
+    pthread_cond_destroy(&channel->idle);
+    pthread_mutex_destroy(&channel->mutex);
+    free(channel);
+}
+
+/*
+ * The real free for a channel whose handle was surrendered while an operation
+ * was still running. Runs with no channel lock held and nothing else able to
+ * reach the channel: it left runtime->channels when it was detached, and
+ * fault_channel had already cleared `targetable`, so no snapshot can have
+ * taken a reference in between.
+ *
+ * The outbox destroy cannot fail here. Abort closed it and discarded its
+ * queue, so both states it refuses - still accepting, still holding messages -
+ * are impossible, and the only wait left is for a reader to leave, which abort
+ * already woke. If it somehow did fail, leaking one outbox is still the right
+ * answer: skipping the retirement below would leave maelys_mcp_runtime_destroy
+ * waiting forever for a channel nobody will ever count down.
+ *
+ * The retirement is last, and after free(), because it is what releases
+ * maelys_mcp_runtime_destroy - which must not be let go one instruction before
+ * the memory it is waiting on is actually gone.
+ */
+static void free_detached_channel(maelys_mcp_channel_t *channel) {
+    maelys_mcp_runtime_t *runtime = channel->runtime;
+    (void)maelys_mcp_outbox_destroy(channel->outbox);
+    free_channel_storage(channel);
+    pthread_mutex_lock(&runtime->channels_mutex);
+    assert(runtime->detached_channel_count != 0u);
+    runtime->detached_channel_count--;
+    if (runtime->detached_channel_count == 0u) {
+        pthread_cond_broadcast(&runtime->detached_channels_drained);
+    }
+    pthread_mutex_unlock(&runtime->channels_mutex);
+}
+
+/*
+ * Drops one operation reference. The caller holds channel->mutex, and keeps
+ * whatever broadcast it already made. Returns non-zero when this release was
+ * the one that left a detached channel with nothing able to reach it, in which
+ * case the caller must call free_detached_channel *after* it unlocks: the
+ * mutex it is holding is one of the things about to be destroyed.
+ *
+ * "The release that left it empty", not "it is empty now". A release that
+ * finds the count already zero has made nothing true, and freeing on it would
+ * be a second thread claiming a job that already belongs to someone else.
+ */
+static int release_operation_locked(maelys_mcp_channel_t *channel) {
+    if (!channel->operations_inflight) return 0;
+    channel->operations_inflight--;
+    return channel->operations_inflight == 0u && channel->detached;
+}
+
 void maelys_mcp_channel_release_operation(maelys_mcp_channel_t *channel) {
     if (!channel) return;
     pthread_mutex_lock(&channel->mutex);
-    if (channel->operations_inflight) channel->operations_inflight--;
+    int free_now = release_operation_locked(channel);
     if (!channel->operations_inflight) pthread_cond_broadcast(&channel->idle);
     pthread_mutex_unlock(&channel->mutex);
+    if (free_now) free_detached_channel(channel);
 }
 
 static void fault_channel(maelys_mcp_channel_t *channel) {
@@ -499,11 +577,30 @@ static void *channel_worker_main(void *opaque) {
      */
     if (status != MAELYS_MCP_OK) maelys_mcp_channel_abort(channel);
     pthread_mutex_lock(&channel->mutex);
-    if (channel->operations_inflight) channel->operations_inflight--;
+    /*
+     * Nobody will ever join a detached channel's worker: the thread that would
+     * have joined it returned to its caller at the deadline, and the real free
+     * may happen on this very stack three lines below - which is the one place
+     * pthread_join is not merely late but impossible, because a thread cannot
+     * join itself. So this thread disposes of its own handle, which is the
+     * only handle it can read without racing the pthread_create that produced
+     * it, and clears its slot so nothing disposes of it twice.
+     *
+     * `active` is the handshake with the detacher. Under this same mutex the
+     * detacher takes every slot that already read as finished and joins those
+     * itself; a slot it took reads inactive here and this thread leaves it
+     * alone. A slot it did not take is still this thread's, and is detached.
+     */
+    if (channel->detached && worker->active) {
+        (void)pthread_detach(pthread_self());
+        memset(worker, 0, sizeof(*worker));
+    }
+    int free_now = release_operation_locked(channel);
     /* Wakes both a close waiting for the channel to drain and an accept
      * waiting for a free slot. */
     pthread_cond_broadcast(&channel->idle);
     pthread_mutex_unlock(&channel->mutex);
+    if (free_now) free_detached_channel(channel);
     return NULL;
 }
 
@@ -588,9 +685,10 @@ static void release_worker(maelys_mcp_channel_t *channel,
     pthread_mutex_lock(&channel->mutex);
     if (worker->request) json_decref(worker->request);
     memset(worker, 0, sizeof(*worker));
-    if (channel->operations_inflight) channel->operations_inflight--;
+    int free_now = release_operation_locked(channel);
     pthread_cond_broadcast(&channel->idle);
     pthread_mutex_unlock(&channel->mutex);
+    if (free_now) free_detached_channel(channel);
 }
 
 /* Answers a request the runtime could not admit, without dispatching it. */
@@ -649,20 +747,63 @@ maelys_mcp_result_t maelys_mcp_channel_accept(
      * alone, which is a cheaper property to reason about than a shared,
      * nominally-immutable one.
      */
+    /*
+     * Both failure paths refuse first and release second, because the slot's
+     * operation reference is what keeps this channel alive across the refusal.
+     * The reverse order was safe only while every destroy waited for the count
+     * to reach zero; now that releasing the last reference on a detached
+     * channel *is* the free, a refusal after the release would be reaching into
+     * memory this thread had just handed over. Same rule the worker's own tail
+     * states: hold your reference until you have finished touching the object.
+     */
     worker->request = json_deep_copy(message);
     if (!worker->request) {
+        maelys_mcp_result_t status = refuse_request(channel, message,
+            "Cannot dispatch the request");
         release_worker(channel, worker);
-        return refuse_request(channel, message, "Cannot dispatch the request");
+        return status;
     }
     if (pthread_create(&worker->thread, NULL, channel_worker_main, worker) != 0) {
+        maelys_mcp_result_t refused = refuse_request(channel, message,
+            "Cannot dispatch the request");
         release_worker(channel, worker);
-        return refuse_request(channel, message, "Cannot dispatch the request");
+        return refused;
     }
     return MAELYS_MCP_OK;
 }
 
 void *maelys_mcp_channel_context(const maelys_mcp_channel_t *channel) {
     return channel ? channel->config.context : NULL;
+}
+
+maelys_mcp_result_t maelys_mcp_channel_set_protocol_eras(
+    maelys_mcp_channel_t *channel,
+    unsigned int eras) {
+    if (!channel || !eras || (eras & ~(unsigned int)MAELYS_MCP_ERA_ALL)) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    pthread_mutex_lock(&channel->mutex);
+    if (channel->state != MAELYS_MCP_CHANNEL_ACTIVE) {
+        maelys_mcp_result_t status = channel->state == MAELYS_MCP_CHANNEL_CLOSED ?
+            MAELYS_MCP_ERR_CLOSED : MAELYS_MCP_ERR_STATE;
+        pthread_mutex_unlock(&channel->mutex);
+        return status;
+    }
+    /*
+     * A legacy session that has already been negotiated cannot be withdrawn
+     * underneath the client that negotiated it: every request it sends from
+     * here on is legal under a revision this channel agreed to serve, and
+     * answering them with -32002 afterwards would be the runtime breaking its
+     * own handshake. Narrowing before the first frame is the supported use.
+     */
+    if (channel->legacy_initialize_received &&
+        !(eras & (unsigned int)MAELYS_MCP_ERA_LEGACY)) {
+        pthread_mutex_unlock(&channel->mutex);
+        return MAELYS_MCP_ERR_STATE;
+    }
+    channel->protocol_eras = eras;
+    pthread_mutex_unlock(&channel->mutex);
+    return MAELYS_MCP_OK;
 }
 
 maelys_mcp_result_t maelys_mcp_channel_next(
@@ -788,7 +929,68 @@ maelys_mcp_result_t maelys_mcp_channel_close(
     return MAELYS_MCP_OK;
 }
 
-maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
+/*
+ * Hands an aborted channel to whichever operation finishes last, and returns.
+ *
+ * The unlink and the detached mark happen in one critical section holding both
+ * channels_mutex and channel->mutex - in the hierarchy's own order - because
+ * they have to become true atomically with respect to a worker deciding
+ * whether it is the last one out. Unlinking now rather than at the free is
+ * what stops a new runtime_snapshot_channels picking the channel up; holders
+ * that already retained a reference are unaffected and finish normally, and
+ * the window between abort and unlink is already closed to new targeting
+ * because fault_channel cleared `targetable` and the snapshot requires it.
+ *
+ * Workers that have already finished are collected in that same critical
+ * section and joined here, on this thread - bounded, because a finished worker
+ * is a thread on its way out. Collecting them under the same lock that sets
+ * `detached` is what makes the choice exclusive: a worker this call took never
+ * detaches itself, and a worker it did not take always does.
+ *
+ * Only the already-finished slots are read, never every slot, because
+ * `worker->thread` is written by pthread_create after the slot is published -
+ * so a slot that has not run yet has no handle worth reading, while a slot
+ * that set `finished` under this mutex demonstrably has one.
+ */
+static void detach_channel(maelys_mcp_channel_t *channel) {
+    maelys_mcp_runtime_t *runtime = channel->runtime;
+    pthread_t *threads = channel->worker_capacity ?
+        calloc(channel->worker_capacity, sizeof(*threads)) : NULL;
+    size_t joinable = 0u;
+
+    pthread_mutex_lock(&runtime->channels_mutex);
+    maelys_mcp_channel_t **cursor = &runtime->channels;
+    while (*cursor && *cursor != channel) cursor = &(*cursor)->next;
+    if (*cursor == channel) {
+        *cursor = channel->next;
+        runtime->live_channel_count--;
+    }
+    /* Unconditional, so the retirement in free_detached_channel pairs with it
+     * whatever the registry looked like. */
+    runtime->detached_channel_count++;
+    pthread_mutex_lock(&channel->mutex);
+    if (threads) joinable = collect_finished_workers_locked(channel, threads);
+    channel->detached = 1;
+    /*
+     * Nobody left to hand it to means this thread is itself the last
+     * reference, and the free happens before this call returns - which is the
+     * ordinary outcome for a close that timed out on an undrained outbox
+     * rather than on a running provider.
+     */
+    int free_now = channel->operations_inflight == 0u;
+    pthread_mutex_unlock(&channel->mutex);
+    pthread_mutex_unlock(&runtime->channels_mutex);
+
+    for (size_t index = 0; index < joinable; ++index) {
+        (void)pthread_join(threads[index], NULL);
+    }
+    free(threads);
+    if (free_now) free_detached_channel(channel);
+}
+
+static maelys_mcp_result_t destroy_channel(
+    maelys_mcp_channel_t *channel,
+    int detach_on_timeout) {
     if (!channel) return MAELYS_MCP_ERR_ARGUMENT;
     maelys_mcp_result_t status = maelys_mcp_channel_close(
         channel, channel->config.close_timeout_ms);
@@ -799,6 +1001,10 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
          * all operations that already retained it have released their borrow.
          */
         maelys_mcp_channel_abort(channel);
+        if (detach_on_timeout) {
+            detach_channel(channel);
+            return status;
+        }
         pthread_mutex_lock(&channel->mutex);
         while (channel->operations_inflight != 0u) {
             pthread_cond_wait(&channel->idle, &channel->mutex);
@@ -825,16 +1031,15 @@ maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
     *cursor = channel->next;
     runtime->live_channel_count--;
     pthread_mutex_unlock(&runtime->channels_mutex);
-    for (size_t index = 0; index < channel->subscription_count; ++index) {
-        maelys_mcp_subscription_clear(&channel->subscriptions[index]);
-    }
-    free(channel->subscriptions);
-    maelys_mcp_channel_nested_clear(channel);
-    free(channel->workers);
-    if (channel->legacy_capabilities) json_decref(channel->legacy_capabilities);
-    pthread_cond_destroy(&channel->nested_ready);
-    pthread_cond_destroy(&channel->idle);
-    pthread_mutex_destroy(&channel->mutex);
-    free(channel);
+    free_channel_storage(channel);
     return status;
+}
+
+maelys_mcp_result_t maelys_mcp_channel_destroy(maelys_mcp_channel_t *channel) {
+    return destroy_channel(channel, 0);
+}
+
+maelys_mcp_result_t maelys_mcp_channel_destroy_detached(
+    maelys_mcp_channel_t *channel) {
+    return destroy_channel(channel, 1);
 }

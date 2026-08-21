@@ -343,8 +343,178 @@ static int test_output_schema_failure_is_fail_closed(void) {
     return 0;
 }
 
+/* The `supportedVersions` array server/discover announced, as a sorted-by-
+ * appearance list of strings, or NULL if the response was not a result. */
+static json_t *announced_versions(maelys_mcp_channel_t *channel) {
+    json_t *response = dispatch(channel,
+        request(json_integer(1), "server/discover", modern_params()));
+    if (!response) return NULL;
+    json_t *versions = json_incref(json_object_get(
+        json_object_get(response, "result"), "supportedVersions"));
+    json_decref(response);
+    return versions;
+}
+
+static int array_holds(json_t *array, const char *value) {
+    size_t index = 0;
+    json_t *entry = NULL;
+    json_array_foreach(array, index, entry) {
+        if (json_is_string(entry) && strcmp(json_string_value(entry), value) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The default has to be proven, not assumed: it is the whole reason this is an
+ * additive setter rather than a behaviour change. */
+static int test_default_channel_announces_both_eras(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    json_t *versions = announced_versions(channel);
+    ASSERT_TRUE(json_array_size(versions) == 2);
+    ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_MODERN));
+    ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_LEGACY));
+    json_decref(versions);
+    /* And the legacy handshake still works on it. */
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "codex", "version", "1");
+    json_t *response = dispatch(channel, request(json_integer(2), "initialize", init));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
+static int test_modern_only_channel_announces_and_refuses(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
+        MAELYS_MCP_ERA_MODERN) == MAELYS_MCP_OK);
+    json_t *versions = announced_versions(channel);
+    ASSERT_TRUE(json_array_size(versions) == 1);
+    ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_MODERN));
+    json_decref(versions);
+
+    /* initialize is refused as an invalid request, not as bad params: the
+     * params are fine, the handshake simply does not exist here. */
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "codex", "version", "1");
+    json_t *response = dispatch(channel,
+        request(json_integer(2), "initialize", init));
+    ASSERT_TRUE(error_code(response) == -32600);
+    json_decref(response);
+
+    /* And nothing was recorded by that refusal, so an ordinary uninitialized
+     * request still gets the not-initialized answer rather than a result. */
+    response = dispatch(channel, request(json_integer(3), "tools/list", NULL));
+    ASSERT_TRUE(error_code(response) == -32002);
+    json_decref(response);
+
+    /* Modern negotiation is untouched. */
+    response = dispatch(channel,
+        request(json_integer(4), "tools/list", modern_params()));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
+static int test_legacy_only_channel_refuses_modern_negotiation(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
+        MAELYS_MCP_ERA_LEGACY) == MAELYS_MCP_OK);
+
+    /* server/discover is a modern entry point, so it is refused with the
+     * version error and the error names what this channel does serve. */
+    json_t *response = dispatch(channel,
+        request(json_integer(1), "server/discover", modern_params()));
+    ASSERT_TRUE(error_code(response) == -32022);
+    json_t *supported = json_object_get(
+        json_object_get(json_object_get(response, "error"), "data"), "supported");
+    ASSERT_TRUE(json_array_size(supported) == 1);
+    ASSERT_TRUE(array_holds(supported, MAELYS_MCP_PROTOCOL_LEGACY));
+    json_decref(response);
+
+    /* The legacy handshake still works, and a legacy request after it works. */
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "codex", "version", "1");
+    response = dispatch(channel, request(json_integer(2), "initialize", init));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = request(NULL, "notifications/initialized", json_object());
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+    response = dispatch(channel, request(json_integer(3), "tools/list", NULL));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+
+    /* But an attempt to renegotiate into the modern era is refused. */
+    response = dispatch(channel,
+        request(json_integer(4), "tools/list", modern_params()));
+    ASSERT_TRUE(error_code(response) == -32022);
+    json_decref(response);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
+static int test_protocol_era_setter_rejects_impossible_masks(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(NULL,
+        MAELYS_MCP_ERA_ALL) == MAELYS_MCP_ERR_ARGUMENT);
+    /* Zero is not "every era": a channel serving none can answer nothing. */
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel, 0u) ==
+        MAELYS_MCP_ERR_ARGUMENT);
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
+        MAELYS_MCP_ERA_ALL | 1u << 7) == MAELYS_MCP_ERR_ARGUMENT);
+    /* A rejected call changes nothing. */
+    json_t *versions = announced_versions(channel);
+    ASSERT_TRUE(json_array_size(versions) == 2);
+    json_decref(versions);
+
+    /* An era that a client has already negotiated cannot be withdrawn. */
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "codex", "version", "1");
+    json_t *response = dispatch(channel, request(json_integer(2), "initialize", init));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
+        MAELYS_MCP_ERA_MODERN) == MAELYS_MCP_ERR_STATE);
+    /* Re-asserting a superset of what is negotiated is still fine. */
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
+        MAELYS_MCP_ERA_ALL) == MAELYS_MCP_OK);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
+static int test_protocol_era_setter_refuses_a_closed_channel(void) {
+    maelys_mcp_channel_t *channel = NULL;
+    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    ASSERT_TRUE(runtime != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
+        MAELYS_MCP_ERA_MODERN) == MAELYS_MCP_ERR_CLOSED);
+    ASSERT_TRUE(cleanup(runtime, channel));
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
+        {"default channel announces both eras", test_default_channel_announces_both_eras},
+        {"modern-only channel announces one era and refuses initialize", test_modern_only_channel_announces_and_refuses},
+        {"legacy-only channel refuses modern negotiation", test_legacy_only_channel_refuses_modern_negotiation},
+        {"protocol era setter rejects impossible masks", test_protocol_era_setter_rejects_impossible_masks},
+        {"protocol era setter refuses a closed channel", test_protocol_era_setter_refuses_a_closed_channel},
         {"invalid JSON-RPC envelopes and id types", test_invalid_envelopes_and_ids},
         {"notifications do not produce responses", test_notifications_have_no_response_or_side_effect},
         {"modern metadata and version contract", test_modern_metadata_contract},

@@ -52,8 +52,16 @@
 - Stdio output writes have a bounded per-message deadline; a non-draining client closes
   the output bus and wakes blocked producers instead of freezing the runtime.
 - Every client channel has an independent bounded queue, subscription registry,
-  cancellation scope and legacy state. Identical JSON-RPC ids on different channels
-  cannot collide or receive each other's events.
+  cancellation scope, protocol-era policy and legacy state. Identical JSON-RPC ids on
+  different channels cannot collide or receive each other's events, and a channel
+  narrowed to one protocol era refuses the other one in the dispatcher rather than
+  relying on a transport to filter it out first.
+- A channel whose bounded close cannot finish is never freed at its deadline. It is
+  aborted, made untargetable and unlinked, and freed only once every operation that
+  had already retained it has finished, whether the caller waits for that
+  (`maelys_mcp_channel_destroy`) or hands it to the runtime and returns
+  (`maelys_mcp_channel_destroy_detached`). `maelys_mcp_runtime_destroy` refuses to
+  free a runtime that any such channel still points at.
 - Provider event fan-out retains each target channel while delivering outside the
   runtime registry lock. A slow or faulted channel cannot suspend or invalidate its
   peers.

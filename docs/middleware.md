@@ -348,8 +348,11 @@ coordinating with any other request.
 The descriptor itself is copied, so it may live on the caller's stack. If
 `destroy` is set it is called once, with that context, from
 `maelys_mcp_runtime_destroy` — after the last channel is gone and provider
-events have stopped, so no hook can still be running. Registration never takes
-ownership on failure.
+events have stopped, so no hook can still be running. "The last channel is
+gone" includes channels handed to `maelys_mcp_channel_destroy_detached` whose
+free is still pending: `maelys_mcp_runtime_destroy` waits for those too, so a
+`wrap_sink` wrapper still decorating a wedged request cannot outlive the
+middleware state it reads. Registration never takes ownership on failure.
 
 ## Migrating from `authorize`/`audit`
 

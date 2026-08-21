@@ -99,6 +99,13 @@ typedef enum maelys_mcp_channel_state {
  * It admits creators before allocation, then runtime destruction closes and
  * drains it before acquiring lifecycle_mutex.
  *
+ * A detached channel's real free runs on whichever thread released the last
+ * operation reference, and takes channels_mutex to retire the channel from
+ * detached_channel_count. It takes it *after* releasing channel->mutex, never
+ * while holding it, so the freeing thread walks the same lifecycle_mutex ->
+ * channels_mutex -> channel->mutex order downwards as everybody else rather
+ * than closing a cycle back up it.
+ *
  * One further edge exists, and only in one direction: a process provider's
  * state_mutex may precede a channel->mutex. It is taken when a provider
  * failure has to cancel the nested client request a worker is blocked on, so
@@ -195,6 +202,20 @@ struct maelys_mcp_runtime {
     int channels_mutex_initialized;
     struct maelys_mcp_channel *channels;
     size_t live_channel_count;
+    /*
+     * Channels that maelys_mcp_channel_destroy_detached has taken out of
+     * `channels` but whose storage has not been released yet, because an
+     * operation was still in flight when the caller gave up its handle.
+     *
+     * It exists because detaching *decrements* live_channel_count, so the
+     * refusal at src/core/runtime.c would see zero and let the runtime be
+     * freed while a detached channel still held a pointer into it. Drained by
+     * maelys_mcp_runtime_destroy the way the channel-create gate is drained.
+     * Guarded by channels_mutex.
+     */
+    size_t detached_channel_count;
+    pthread_cond_t detached_channels_drained;
+    int detached_channels_drained_initialized;
     pthread_mutex_t provider_events_mutex;
     pthread_cond_t provider_events_idle;
     int provider_events_mutex_initialized;
@@ -247,6 +268,24 @@ struct maelys_mcp_channel {
     maelys_mcp_channel_state_t state;
     int targetable;
     size_t operations_inflight;
+    /*
+     * Set by maelys_mcp_channel_destroy_detached when the bounded close missed
+     * its deadline: the embedder's handle is gone, the channel is already out
+     * of the runtime's registry, and whichever operation reference is released
+     * last performs the real free. Read and written under channel->mutex,
+     * which is what makes "released last" a decidable question rather than a
+     * race between the releaser and the detacher.
+     */
+    int detached;
+    /*
+     * Which protocol eras this channel serves and announces. Opens at
+     * MAELYS_MCP_ERA_ALL so an untouched channel behaves exactly as it always
+     * did, and is narrowed by maelys_mcp_channel_set_protocol_eras. Written
+     * and read under channel->mutex, because a dispatch on a worker thread
+     * reads it while the transport that created the channel may still be
+     * setting it up.
+     */
+    unsigned int protocol_eras;
     int legacy_initialize_received;
     int legacy_initialized;
     char legacy_client_name[128];
