@@ -65,10 +65,19 @@ LIB_SOURCES := \
 	src/provider/process_provider.c \
 	src/provider/mcp_proxy.c \
 	src/provider/provider_sdk.c \
+	src/transport/http_adapter.c \
 	src/transport/stdio.c \
 	src/transport/stdio_isolation.c
 LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJ)/%.o)
-DEPENDENCY_SOURCES := $(LIB_SOURCES) host/main.c host/manifest.c providers/example/main.c \
+# The server layer is host-level, not part of libmaelys_mcp.a: the library
+# keeps mechanism and the host keeps listen(2), and scripts/audit_boundaries.sh
+# enforces that rather than trusting it. The tests and the fuzz targets link
+# these objects directly, which is the same seam test-manifest already uses for
+# host/manifest.o.
+HTTP_HOST_SOURCES := host/http_parser.c host/http_auth.c host/http_server.c
+HTTP_HOST_OBJECTS := $(HTTP_HOST_SOURCES:%.c=$(OBJ)/%.o)
+DEPENDENCY_SOURCES := $(LIB_SOURCES) $(HTTP_HOST_SOURCES) host/main.c host/manifest.c \
+	providers/example/main.c \
 	$(wildcard tests/*.c) tests/helpers/adversarial_provider.c tests/helpers/sdk_nested_provider.c
 DEPENDENCY_FILES := $(DEPENDENCY_SOURCES:%.c=$(OBJ)/%.d)
 
@@ -87,7 +96,7 @@ $(LIB)/libmaelys_mcp.a: $(LIB_OBJECTS)
 	@mkdir -p $(@D)
 	$(AR) rcs $@ $^
 
-$(BIN)/maelys-mcp: $(OBJ)/host/main.o $(OBJ)/host/manifest.o $(LIB)/libmaelys_mcp.a
+$(BIN)/maelys-mcp: $(OBJ)/host/main.o $(OBJ)/host/manifest.o $(HTTP_HOST_OBJECTS) $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -137,6 +146,21 @@ $(BIN)/test-process-launcher: $(OBJ)/tests/test_process_launcher.o $(LIB)/libmae
 # docs/manifest.md: the public library surface does not grow for it), so the
 # test binary links the object directly - the same seam the host binary uses.
 $(BIN)/test-manifest: $(OBJ)/tests/test_manifest.o $(OBJ)/host/manifest.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+# Deliberately linked against the parser alone - no listener, no library, no
+# runtime. The parser needing nothing else is the same property that lets the
+# fuzz targets drive it, and a link line is the cheapest place to keep it true.
+$(BIN)/test-http-parser: $(OBJ)/tests/test_http_parser.o $(OBJ)/host/http_parser.o
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(BIN)/test-http-adapter: $(OBJ)/tests/test_http_adapter.o $(LIB)/libmaelys_mcp.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+$(BIN)/test-http-server: $(OBJ)/tests/test_http_server.o $(HTTP_HOST_OBJECTS) $(LIB)/libmaelys_mcp.a
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
@@ -208,7 +232,7 @@ NESTED_FIXTURE_ARGS = $(abspath $(BIN)/nested-provider) \
 	$(abspath $(BIN)/legacy4-provider) \
 	$(abspath $(BIN)/sdk-nested-provider)
 
-TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/argv-echo-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
+TEST_ARTIFACTS := $(BIN)/test-nested-requests $(NESTED_FIXTURES) $(BIN)/test-middleware $(BIN)/test-runtime $(BIN)/test-runtime-protocol $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk $(BIN)/test-jsonrpc-core $(BIN)/test-http-parser $(BIN)/test-http-adapter $(BIN)/test-http-server $(BIN)/test-schema $(BIN)/test-stdio-isolation $(BIN)/test-modules-content-mrtr $(BIN)/test-resources $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-provider-perf $(BIN)/test-manifest $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider $(BIN)/bad-schema-provider $(BIN)/oversized-provider $(BIN)/environment-provider $(BIN)/slow-describe-provider $(BIN)/fd-check-provider $(BIN)/stubborn-provider $(BIN)/argv-echo-provider $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream $(BIN)/exotic-schema-mcp-upstream
 
 # Compile everything `test` runs, without running any of it. The split exists
 # for scripts/mutate.py: a mutant that fails to compile is *stillborn*, not
@@ -219,6 +243,9 @@ test-build: all $(TEST_ARTIFACTS)
 
 test: test-build
 	$(BIN)/test-jsonrpc-core
+	$(BIN)/test-http-parser
+	$(BIN)/test-http-adapter
+	$(BIN)/test-http-server
 	$(BIN)/test-schema
 	$(BIN)/test-stdio-isolation
 	$(BIN)/test-modules-content-mrtr
@@ -251,7 +278,7 @@ audit:
 	scripts/audit_boundaries.sh
 
 analyze:
-	@set -e; for source in $(LIB_SOURCES) host/main.c providers/example/main.c; do \
+	@set -e; for source in $(LIB_SOURCES) $(HTTP_HOST_SOURCES) host/main.c providers/example/main.c; do \
 		echo "analyze $$source"; \
 		$(ANALYZER) --analyze -o /dev/null $(CPPFLAGS) $(CFLAGS) $$source; \
 	done
@@ -334,7 +361,7 @@ tsan:
 	TSAN_OPTIONS=halt_on_error=1 \
 	$(MAKE) BUILD_PROFILE=tsan tsan-run CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror -D_POSIX_C_SOURCE=200809L -pthread -fsanitize=thread -fno-omit-frame-pointer" LDLIBS="$(shell $(PKG_CONFIG) --libs jansson liburiparser) -pthread -fsanitize=thread"
 
-tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-middleware $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
+tsan-run: $(BIN)/test-http-server $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BIN)/test-channel-perf $(BIN)/test-middleware $(BIN)/test-process-provider $(BIN)/test-process-launcher $(BIN)/test-mcp-proxy $(BIN)/test-provider-sdk \
 		$(BIN)/test-manifest \
 		$(BIN)/test-nested-requests $(NESTED_FIXTURES) \
 		$(BIN)/example-provider $(BIN)/bad-json-provider $(BIN)/bad-envelope-provider \
@@ -343,6 +370,10 @@ tsan-run: $(BIN)/test-outbox $(BIN)/test-subscriptions $(BIN)/test-channels $(BI
 		$(BIN)/argv-echo-provider \
 		$(BIN)/maelys-mcp $(BIN)/legacy-mcp-upstream $(BIN)/erroring-mcp-upstream $(BIN)/chatty-mcp-upstream $(BIN)/dying-mcp-upstream \
 		$(BIN)/exotic-schema-mcp-upstream
+	# The HTTP suite is here because the listener is the one place in this tree
+	# where an acceptor thread, a connection thread per connection and a stopping
+	# thread all touch one descriptor list and one connection count.
+	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-http-server
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-outbox
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-subscriptions
 	TSAN_OPTIONS=halt_on_error=1 $(BIN)/test-channels
@@ -381,7 +412,8 @@ FUZZ_CFLAGS := -O1 -g -std=c11 -Wall -Wextra -Wpedantic -Werror \
 FUZZ_BUILD := $(BUILD_ROOT)/fuzz
 FUZZ_BIN := $(FUZZ_BUILD)/bin
 FUZZ_CORPUS := $(FUZZ_BUILD)/corpus
-FUZZ_BINARIES := $(FUZZ_BIN)/json-lines $(FUZZ_BIN)/content-length $(FUZZ_BIN)/schema $(FUZZ_BIN)/content $(FUZZ_BIN)/uri
+FUZZ_BINARIES := $(FUZZ_BIN)/json-lines $(FUZZ_BIN)/content-length $(FUZZ_BIN)/schema $(FUZZ_BIN)/content $(FUZZ_BIN)/uri \
+	$(FUZZ_BIN)/http-request $(FUZZ_BIN)/http-smuggling $(FUZZ_BIN)/http-origin
 
 $(FUZZ_BIN)/json-lines: fuzz/fuzz_json_lines.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
@@ -403,21 +435,43 @@ $(FUZZ_BIN)/uri: fuzz/fuzz_uri.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
 
+# The HTTP targets need host/http_parser.c, which is deliberately not in
+# LIB_SOURCES - the parser is host-level. They link it directly rather than the
+# whole listener, so an iteration costs no socket and no thread.
+$(FUZZ_BIN)/http-request: fuzz/fuzz_http_request.c host/http_parser.c
+	@mkdir -p $(@D)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ -o $@
+
+$(FUZZ_BIN)/http-smuggling: fuzz/fuzz_http_smuggling.c host/http_parser.c
+	@mkdir -p $(@D)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ -o $@
+
+$(FUZZ_BIN)/http-origin: fuzz/fuzz_http_origin.c host/http_parser.c
+	@mkdir -p $(@D)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ -o $@
+
 fuzz-build: $(FUZZ_BINARIES)
 
 fuzz-smoke: fuzz-build
 	rm -rf $(FUZZ_CORPUS)
-	mkdir -p $(FUZZ_CORPUS)/json-lines $(FUZZ_CORPUS)/content-length $(FUZZ_CORPUS)/schema $(FUZZ_CORPUS)/content $(FUZZ_CORPUS)/uri
+	mkdir -p $(FUZZ_CORPUS)/json-lines $(FUZZ_CORPUS)/content-length $(FUZZ_CORPUS)/schema $(FUZZ_CORPUS)/content $(FUZZ_CORPUS)/uri \
+		$(FUZZ_CORPUS)/http-request $(FUZZ_CORPUS)/http-smuggling $(FUZZ_CORPUS)/http-origin
 	cp fuzz/seeds/json-lines/* $(FUZZ_CORPUS)/json-lines/
 	printf 'Content-Length: 2\r\n\r\n{}' >$(FUZZ_CORPUS)/content-length/frame
 	cp fuzz/seeds/schema/* $(FUZZ_CORPUS)/schema/
 	cp fuzz/seeds/content/* $(FUZZ_CORPUS)/content/
 	cp fuzz/seeds/uri/* $(FUZZ_CORPUS)/uri/
+	cp fuzz/seeds/http-request/* $(FUZZ_CORPUS)/http-request/
+	cp fuzz/seeds/http-smuggling/* $(FUZZ_CORPUS)/http-smuggling/
+	cp fuzz/seeds/http-origin/* $(FUZZ_CORPUS)/http-origin/
 	$(FUZZ_BIN)/json-lines -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/json-lines
 	$(FUZZ_BIN)/content-length -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/content-length
 	$(FUZZ_BIN)/schema -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/schema
 	$(FUZZ_BIN)/content -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/content
 	$(FUZZ_BIN)/uri -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/uri
+	$(FUZZ_BIN)/http-request -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-request
+	$(FUZZ_BIN)/http-smuggling -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-smuggling
+	$(FUZZ_BIN)/http-origin -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-origin
 
 asan-linux-image:
 	$(DOCKER) build --platform $(DOCKER_PLATFORM) \

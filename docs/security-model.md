@@ -76,6 +76,51 @@
 - Resource contents require exactly one of text/blob, valid bounded base64, and a
   canonical URI. Parsing never grants filesystem or network access by itself.
 - Provider descriptors are close-on-exec and provider termination is bounded.
+- The HTTP listener binds `127.0.0.1` by default and is off unless `--http-listen`
+  asks for it. Binding any other address refuses to start without an authenticator
+  other than loopback trust, and refuses before the socket exists rather than after.
+  It does not serve MCP yet (`docs/protocol-support.md`): it parses, routes and
+  authenticates, and answers `503`.
+- `Origin` is validated on every request, before the body is read, before
+  authentication, and before anything else. The allowlist is empty by default and a
+  request with no `Origin` is accepted only on a loopback bind. This is the
+  DNS-rebinding control and it is the check that runs earliest.
+- `Host` must be present exactly once and syntactically valid, and on a loopback bind
+  must be a loopback authority. An absolute-form request target whose authority
+  disagrees with `Host` is refused rather than resolved in favour of either.
+- Request framing is unambiguous by refusal rather than by resolution. Any
+  `Transfer-Encoding` is rejected outright; a `Transfer-Encoding` together with a
+  `Content-Length` is rejected and logged as a smuggling attempt; a repeated or
+  non-`1*DIGIT` `Content-Length` is rejected even when duplicates agree; `obs-fold`
+  continuations and bare-LF line endings are rejected. Every framing rejection closes
+  the connection, and the parser never resynchronizes to look for a following request.
+- Any header value containing NUL, CR or LF is refused before it is interpreted, and
+  a repeated protocol header is refused rather than merged.
+- Request line, header block, header count and declared body length are independently
+  bounded, and the body bound is the same `max_message_bytes` the stdio reader and the
+  channel output budget derive from. Header reads and body reads have their own
+  deadlines.
+- Request pipelining is refused: any inbound byte arriving between a request and the
+  completion of its response terminates the connection. Connection reuse is permitted
+  for `application/json` replies and refused for event streams.
+- The credential is checked as soon as the request headers are complete and before any
+  request body is read, so an unauthenticated caller can neither hold a server thread
+  for the body deadline nor cause a body-sized allocation. A rejected request is
+  answered and closed after discarding at most 8 KiB of unread body under a short
+  deadline, which is what makes the answer reach the caller instead of being lost to a
+  reset. Authentication is repeated for every POST, so two requests on one kept-alive
+  connection are two independent authentications.
+- An absent or invalid credential is answered `401` with `WWW-Authenticate: Bearer`,
+  never `403`. An authenticator that cannot reach a verdict fails the request with
+  `503`; it is never read as anonymous and never read as a denial.
+- The transport principal is established from a credential the transport itself
+  authenticated and is never derived from payload metadata. `clientInfo.name`, `_meta`
+  and the client-written `Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` routing headers are
+  advisory and carry no authority. See `docs/authenticated-principal-design.md`.
+- `static-bearer` is a test and single-tenant mechanism. A runtime whose only network
+  credential is a shared secret in a config file is not a multi-tenant server, and
+  multi-tenant MRTR continuations are not supported: only `loopback-trust` and a
+  genuinely mono-tenant single-token configuration may be described as safe.
 - Process-provider output has one dedicated reader. Event envelopes require protocol
   v3, no id, a known method and strictly typed parameters; response ids must match the
   single outstanding exchange.
@@ -126,11 +171,17 @@ the protocol on a non-standard descriptor with its stdout wired to stderr; an
 specification. Confinement covers both kinds; descriptor isolation covers only the
 kind whose protocol this project defines.
 
-The runtime remains a local stdio host. It does not expose HTTP, authenticate a
-network principal or apply per-principal effect policy. Those controls are mandatory
-before a network transport can safely expose providers that run with host privileges;
-the middleware chain's per-channel context and resolved-identity policy decisions
-are the foundation a transport-established principal will bind to.
+The runtime serves MCP over stdio only. It can now open an HTTP listener, and that
+listener authenticates a network principal — but it does not dispatch, so no MCP
+request has yet reached a provider over HTTP and the effect policy is still
+runtime-wide rather than per-principal. Both remaining controls are mandatory before
+a network transport can safely expose providers that run with host privileges: the
+listener must serve MCP (`docs/http-transport-design.md`, phases H2 and H3) and the
+policy must decide on the principal rather than on the process. The mechanism for
+the second exists — the middleware chain's per-channel context is where a
+transport-established principal binds, and ABI 4's `context_release` is what lets a
+per-request transport own one safely — and no middleware in this repository reads it
+yet.
 
 ## Required provider practices
 

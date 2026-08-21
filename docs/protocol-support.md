@@ -56,6 +56,17 @@ Prompts, Tasks, Streamable HTTP,
 HTTP header routing, and authorization transports are not implemented. Resource *content blocks* returned
 by a tool remain distinct from the independently enabled MCP Resources capability.
 
+**Streamable HTTP is still not implemented, and the HTTP listener that now
+exists does not change that.** `--http-listen` starts an HTTP/1.1 server that
+parses requests strictly, validates `Host` and `Origin`, routes `/mcp`, and
+authenticates the caller — and then answers `503` with a JSON-RPC `-32600`,
+because there is no MCP dispatch behind it. It creates no channel and reaches
+no provider. `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` are parsed as
+headers like any others and are not yet validated against the body. This is
+phase H1 of `docs/http-transport-design.md`; the endpoint begins serving MCP at
+H3, and "Streamable HTTP" is not claimed anywhere until the official
+conformance suite passes against the real binary at H4.
+
 The upstream conformance runner currently requires an HTTP server and its complete
 2026-07-28 requirement set covers capabilities beyond this milestone. Its current
 HTTP request/response adapter cannot model a long-lived subscription stream. The repository
