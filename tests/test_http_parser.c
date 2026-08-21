@@ -637,6 +637,27 @@ static int target_normalization(void) {
     return failures;
 }
 
+/*
+ * Nothing this parser compares is a C string. A Host value is a slice of the
+ * read buffer with the next header directly behind it, so a comparison that
+ * reached for strlen on it would read past the value - and would then mismatch
+ * on a request that should have been routed, because the trailing bytes differ.
+ * Every other case in this file happens to pass a NUL-terminated literal, which
+ * is exactly why this one does not.
+ */
+static int absolute_form_compares_a_non_terminated_host(void) {
+    static const char buffer[] = "127.0.0.1:8080\r\nAccept: */*";
+    char path[64];
+    ASSERT_TRUE(maelys_http_target_normalize("http://127.0.0.1:8080/mcp", 25u,
+        buffer, 14u, path, sizeof(path)) == 1);
+    ASSERT_TRUE(strcmp(path, "/mcp") == 0);
+    /* And a Host whose first 14 bytes differ is still refused. */
+    static const char other[] = "127.0.0.1:9090\r\nAccept: */*";
+    ASSERT_TRUE(maelys_http_target_normalize("http://127.0.0.1:8080/mcp", 25u,
+        other, 14u, path, sizeof(path)) == 0);
+    return 0;
+}
+
 typedef struct media_case {
     const char *rule;
     const char *value;
@@ -714,6 +735,8 @@ int main(void) {
         {"Host validation", host_validation},
         {"Origin validation", origin_validation},
         {"request-target normalization", target_normalization},
+        {"absolute form compares a non-terminated Host",
+            absolute_form_compares_a_non_terminated_host},
         {"Content-Type and Accept validation", media_validation}
     };
     return maelys_run_tests(cases, sizeof(cases) / sizeof(*cases));
