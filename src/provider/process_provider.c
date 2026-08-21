@@ -1008,9 +1008,19 @@ static maelys_mcp_result_t spawn_process(
         .spawn_timeout_ms = options->describe_timeout_ms,
         .grace_timeout_ms = options->shutdown_timeout_ms,
         .force_timeout_ms = options->shutdown_timeout_ms,
-        /* Derived from the child's protocol type, never configured. Native
-         * children run a first-party SDK, so the isolated layout is available
-         * to this kind when it lands; today both kinds are stdio. */
+        /*
+         * Derived from the child's protocol type, never configured. Native
+         * children run a first-party SDK, so MAELYS_MCP_PROCESS_FD_ISOLATED
+         * is implemented and available to this kind - unlike mcp-proxy
+         * upstreams, which stay STDIO structurally. But this call site does
+         * not select it yet: the transition plan's first step keeps STDIO the
+         * native default through M4, until both first-party SDKs have shipped
+         * MAELYS_PROVIDER_FD support and a deprecation window has passed
+         * (docs/launch-contract-design.md, "The layout is a function of the
+         * child's protocol type"). Selection this release is via the public
+         * spec only - an embedder driving the launcher directly, as the
+         * conformance suite does, may opt in today.
+         */
         .fd_layout = MAELYS_MCP_PROCESS_FD_STDIO
     };
     maelys_mcp_process_instance_t instance = {.protocol_fd = -1};

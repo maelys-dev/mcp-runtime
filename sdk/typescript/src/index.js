@@ -1,3 +1,4 @@
+import net from "node:net";
 import readline from "node:readline";
 
 /*
@@ -509,9 +510,59 @@ function diagnostic(values) {
   process.stderr.write(`${values.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join(" ")}\n`);
 }
 
+/*
+ * MAELYS_PROVIDER_FD (docs/launch-contract-design.md, "The child's
+ * descriptors"): the launcher's declaration that this child was started
+ * under MAELYS_MCP_PROCESS_FD_ISOLATED, with the protocol duplex on this
+ * descriptor and fd 1 already wired to stderr before this process ever ran.
+ * Absent, empty, or not a clean positive integer all mean the same thing -
+ * STDIO, the layout this SDK has always spoken - never a fatal error.
+ */
+function providerFdFromEnvironment() {
+  const text = process.env.MAELYS_PROVIDER_FD;
+  if (!text || !/^[0-9]+$/.test(text)) return null;
+  const value = Number(text);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 export async function serveProvider(provider, options = {}) {
-  const input = options.input ?? process.stdin;
-  const writeLine = options.writeLine ?? ((line) => process.stdout.write(`${line}\n`));
+  /*
+   * Unconditional defense in depth (applies whether or not this session is
+   * ISOLATED): capture the real protocol writer before anything below can
+   * touch it, then point process.stdout.write at stderr's, so a dependency
+   * that bypasses console.log and writes process.stdout.write directly can no
+   * longer corrupt the frame stream - it lands on stderr instead. Order is
+   * load-bearing: capture before reassign, or the protocol writes to stderr
+   * too. This is defense in depth, not the guarantee ISOLATED gives:
+   * fs.writeSync(1, ...), a native addon, a spawned child inheriting the real
+   * fd 1, or a library that captured process.stdout.write before this ran
+   * all bypass it (docs/launch-contract-design.md, "The TypeScript quick
+   * fix, and its limits").
+   */
+  const protocolWrite = process.stdout.write.bind(process.stdout);
+  if (options.protectStdout !== false) {
+    process.stdout.write = process.stderr.write.bind(process.stderr);
+  }
+  /*
+   * An explicit input/writeLine from the caller is a stronger, more
+   * deliberate statement than an inherited environment variable and always
+   * wins. Otherwise, MAELYS_PROVIDER_FD - when present and usable - supplies
+   * both directions: wrapping it as a net.Socket is also what re-arms
+   * FD_CLOEXEC on it (libuv's uv__stream_open does this for any fd it
+   * adopts), which is this SDK's answer to "the SDK must re-set FD_CLOEXEC on
+   * the protocol fd at startup" without a native addon in a dependency-free
+   * package. Absent, this is byte-identical to before MAELYS_PROVIDER_FD
+   * existed - including that the default writeLine below still goes through
+   * the captured protocolWrite, not through the now-patched
+   * process.stdout.write.
+   */
+  const providerFd = options.input === undefined && options.writeLine === undefined ?
+    providerFdFromEnvironment() : null;
+  const providerSocket = providerFd !== null ?
+    new net.Socket({ fd: providerFd, readable: true, writable: true }) : null;
+  const input = providerSocket ?? options.input ?? process.stdin;
+  const writeLine = options.writeLine ??
+    (providerSocket ? (line) => providerSocket.write(`${line}\n`) : (line) => protocolWrite(`${line}\n`));
   const eventControl = provider?.[EVENT_CONTROL];
   if (!eventControl) throw new TypeError("provider was not created by createProvider");
   let writeTail = Promise.resolve();
@@ -636,6 +687,8 @@ export async function serveProvider(provider, options = {}) {
     // step - restoring console among them - has already executed.
     const pumpFailure = await pump.then(() => undefined, (error) => error);
     if (options.redirectConsole !== false) Object.assign(console, originalConsole);
+    if (options.protectStdout !== false) process.stdout.write = protocolWrite;
+    providerSocket?.destroy();
     if (pumpFailure) throw pumpFailure;
   }
   return 0;

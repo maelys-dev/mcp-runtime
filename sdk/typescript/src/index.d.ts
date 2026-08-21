@@ -114,8 +114,26 @@ export type NestedRequestBindings = {
   requestRoots?: (params?: RootsRequestParams) => Promise<RootsResult>;
 };
 export function handleProviderMessage(provider: Provider, message: unknown, nested?: NestedRequestBindings): Promise<JsonObject>;
+/**
+ * `input` and `writeLine`, when given, always win over MAELYS_PROVIDER_FD -
+ * the environment variable the launcher sets under the ISOLATED descriptor
+ * layout (docs/launch-contract-design.md, "The child's descriptors").
+ * Otherwise, a present and usable MAELYS_PROVIDER_FD supplies both
+ * directions; absent, this is `process.stdin` / `process.stdout` exactly as
+ * before that variable existed.
+ *
+ * `protectStdout` (default `true`) is unconditional defense in depth,
+ * independent of the descriptor layout: it repoints `process.stdout.write`
+ * at stderr's for the duration of the call, so a dependency that bypasses
+ * `console.log` and writes `process.stdout.write` directly cannot corrupt
+ * the protocol stream. It does not cover `fs.writeSync(1, ...)`, a native
+ * addon, or a child process this provider spawns of its own - see
+ * docs/launch-contract-design.md, "The TypeScript quick fix, and its
+ * limits".
+ */
 export function serveProvider(provider: Provider, options?: {
   input?: Readable;
   writeLine?: (line: string) => void | Promise<void>;
   redirectConsole?: boolean;
+  protectStdout?: boolean;
 }): Promise<number>;

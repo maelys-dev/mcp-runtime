@@ -35,22 +35,33 @@ extern "C" {
  * Which descriptor arrangement the child gets. NOT operator configuration: it
  * is a function of the child's protocol type, derived by the runtime.
  *
- * Only STDIO exists today, and it is the zero value, so a zeroed spec
- * reproduces the arrangement both providers shipped with:
+ * STDIO is the zero value, so a zeroed spec reproduces the arrangement both
+ * providers shipped with:
  *
  *     fd 0  <- socketpair peer
  *     fd 1  <- socketpair peer
  *     fd 2  unchanged (inherited stderr)
  *
- * The ISOLATED layout designed in docs/launch-contract-design.md ("The child's
- * descriptors") - protocol on fd 3, stdout wired to stderr - is a later wave
- * and is deliberately not declared here: an enumerator no launcher accepts
- * would advertise an arrangement that does not exist. Adding it later is
- * additive. What this wave owes it is the field, and a derivation site that
- * already fills the field in rather than assuming the default.
+ * ISOLATED (docs/launch-contract-design.md, "The child's descriptors") is:
+ *
+ *     fd 0  <- /dev/null                nothing to read from stdin
+ *     fd 1  <- dup of fd 2              stdout IS stderr, at the kernel level
+ *     fd 2  unchanged (inherited stderr)
+ *     fd 3  <- socketpair peer          duplex protocol transport
+ *     env   MAELYS_PROVIDER_FD=3
+ *
+ * Available only to native maelys-provider children, whose first-party SDKs
+ * can be taught MAELYS_PROVIDER_FD; an mcp-proxy upstream speaks MCP's stdio
+ * transport by specification and stays STDIO structurally -
+ * maelys_mcp_proxy_options_t carries no layout field, so this kind cannot be
+ * given ISOLATED even by mistake. Selection this release is via the public
+ * spec only: neither the stock host nor the manifest chooses it yet - STDIO
+ * stays the native default through M4, the first step of the transition plan
+ * ("The layout is a function of the child's protocol type").
  */
 typedef enum maelys_mcp_process_fd_layout {
-    MAELYS_MCP_PROCESS_FD_STDIO = 0
+    MAELYS_MCP_PROCESS_FD_STDIO = 0,
+    MAELYS_MCP_PROCESS_FD_ISOLATED = 1
 } maelys_mcp_process_fd_layout_t;
 
 /*

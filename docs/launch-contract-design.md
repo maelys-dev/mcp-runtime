@@ -1,15 +1,20 @@
 # Process launch contract — design
 
-> **Status: M4.1 to M4.4 are implemented; M4.5 and M4.6 are not.** The seam, the
-> POSIX launcher, both consumers, the boundary rule, the public API and the
-> conformance suite are in the tree (`src/process/`,
-> `include/maelys/mcp/process_launcher.h`, `tests/test_process_launcher.c`).
-> Manifest v2 — `args` and `executionProfile` — is not, so `execution_profile` is
-> carried by the spec and enforced by the POSIX launcher but has no manifest key
-> feeding it yet. The `ISOLATED` descriptor layout is not implemented either, and
-> its enumerator is deliberately absent rather than declared-and-refused: an
-> enumerator no launcher accepts would advertise an arrangement that does not
-> exist. Adding it later is additive.
+> **Status: M4.1 to M4.4 are implemented, plus the `ISOLATED` descriptor
+> layout; M4.5 and M4.6 are not.** The seam, the POSIX launcher, both
+> consumers, the boundary rule, the public API and the conformance suite are
+> in the tree (`src/process/`, `include/maelys/mcp/process_launcher.h`,
+> `tests/test_process_launcher.c`). Manifest v2 — `args` and
+> `executionProfile` — is not, so `execution_profile` is carried by the spec
+> and enforced by the POSIX launcher but has no manifest key feeding it yet.
+> `MAELYS_MCP_PROCESS_FD_ISOLATED` (native providers only; `mcp-proxy` stays
+> `STDIO` structurally, as designed) is now declared and implemented by the
+> POSIX launcher exactly as specified in "The child's descriptors" below, and
+> all three first-party SDKs adopt `MAELYS_PROVIDER_FD` when it is set. What
+> remains exactly as this document specified: selection is via the public
+> spec only this release, nothing in `host/` or the manifest chooses it, and
+> `STDIO` stays the native default through M4 - the transition plan's first
+> step, not a change to it.
 >
 > **Two deviations from the phasing table below, both deliberate.**
 > M4.2's row says `MAELYS_MCP_ABI_VERSION` → 4; it stayed at 3, because

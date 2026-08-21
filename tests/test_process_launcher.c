@@ -1231,6 +1231,167 @@ static int case_posix_refuses_unknown_profile(const char *example_provider) {
     return 0;
 }
 
+/*
+ * 14. MAELYS_MCP_PROCESS_FD_ISOLATED, driven directly through the ops - no
+ * manifest key or options field selects it this release
+ * (docs/launch-contract-design.md, "The layout is a function of the child's
+ * protocol type"), so an embedder wanting it today builds the spec by hand,
+ * exactly as this case does. The real C SDK provider (example_provider,
+ * which links the provider_sdk.c this same change teaches
+ * MAELYS_PROVIDER_FD) completes a real describe -> call -> shutdown session
+ * entirely over fd 3, proving the launcher's arrangement and the SDK's
+ * adoption of it actually interoperate, not just each side's half in
+ * isolation.
+ */
+static int case_isolated_layout(const char *example_provider) {
+    int before = open_descriptor_count();
+    const maelys_mcp_process_launcher_t *posix_launcher = maelys_mcp_posix_launcher();
+    char *const argv_vector[] = {(char *)example_provider, (char *)"--provider", NULL};
+    maelys_mcp_process_spec_t spec = {
+        .executable_path = example_provider,
+        .argv = argv_vector,
+        .max_message_bytes = 65536u,
+        .spawn_timeout_ms = 5000u,
+        .grace_timeout_ms = 2000u,
+        .force_timeout_ms = 2000u,
+        .fd_layout = MAELYS_MCP_PROCESS_FD_ISOLATED
+    };
+    maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
+    char *error = NULL;
+    ASSERT_TRUE(maelys_mcp_process_launch(posix_launcher, &spec, &instance,
+        &error) == MAELYS_MCP_OK);
+    free(error);
+    error = NULL;
+
+    maelys_mcp_line_reader_t reader;
+    ASSERT_TRUE(maelys_mcp_line_reader_init(&reader, 65536u) == MAELYS_MCP_OK);
+
+    json_t *describe = json_pack("{s:s,s:i,s:s,s:{}}",
+        "protocol", MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR,
+        "id", 1, "method", "provider/describe", "params");
+    ASSERT_TRUE(describe != NULL);
+    ASSERT_TRUE(maelys_mcp_write_json_line(instance.protocol_fd, describe) ==
+        MAELYS_MCP_OK);
+    json_decref(describe);
+    json_t *message = NULL;
+    ASSERT_TRUE(maelys_mcp_line_reader_read(&reader, instance.protocol_fd,
+        &message, &error) == MAELYS_MCP_OK);
+    free(error);
+    error = NULL;
+    json_t *result = json_object_get(message, "result");
+    ASSERT_TRUE(json_is_object(result));
+    ASSERT_TRUE(maelys_mcp_json_string_equals(json_object_get(result, "name"),
+        "example"));
+    json_decref(message);
+
+    json_t *call = json_pack("{s:s,s:i,s:s,s:{s:s,s:{s:s}}}",
+        "protocol", MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR,
+        "id", 2, "method", "provider/call",
+        "params", "name", "example.echo", "arguments", "message", "over fd 3");
+    ASSERT_TRUE(call != NULL);
+    ASSERT_TRUE(maelys_mcp_write_json_line(instance.protocol_fd, call) ==
+        MAELYS_MCP_OK);
+    json_decref(call);
+    message = NULL;
+    ASSERT_TRUE(maelys_mcp_line_reader_read(&reader, instance.protocol_fd,
+        &message, &error) == MAELYS_MCP_OK);
+    free(error);
+    error = NULL;
+    result = json_object_get(message, "result");
+    json_t *structured = json_is_object(result) ?
+        json_object_get(result, "structuredContent") : NULL;
+    ASSERT_TRUE(maelys_mcp_json_string_equals(
+        json_object_get(structured, "message"), "over fd 3"));
+    json_decref(message);
+
+    json_t *goodbye = json_pack("{s:s,s:i,s:s,s:{}}",
+        "protocol", MAELYS_MCP_PROVIDER_PROTOCOL_FLOOR,
+        "id", 3, "method", "provider/shutdown", "params");
+    ASSERT_TRUE(goodbye != NULL);
+    ASSERT_TRUE(maelys_mcp_write_json_line(instance.protocol_fd, goodbye) ==
+        MAELYS_MCP_OK);
+    json_decref(goodbye);
+    message = NULL;
+    ASSERT_TRUE(maelys_mcp_line_reader_read(&reader, instance.protocol_fd,
+        &message, &error) == MAELYS_MCP_OK);
+    free(error);
+    json_decref(message);
+    maelys_mcp_line_reader_clear(&reader);
+
+    close(instance.protocol_fd);
+    error = NULL;
+    ASSERT_TRUE(maelys_mcp_process_shutdown(posix_launcher, &instance, 2000u,
+        2000u, &error) == MAELYS_MCP_OK);
+    free(error);
+    ASSERT_TRUE(open_descriptor_count() == before);
+    return 0;
+}
+
+/*
+ * 15. Old-SDK tolerability under ISOLATED. The stubborn fixture
+ * (tests/helpers/adversarial_provider.c) reads stdin and writes stdout
+ * directly and has no notion of MAELYS_PROVIDER_FD at all - exactly what a
+ * first-party SDK shipped before this change looks like. Spawned under
+ * ISOLATED, its fd 0 is /dev/null, so its first fgets() returns EOF
+ * immediately and it exits clean before ever answering describe
+ * (docs/launch-contract-design.md, "Correcting the framing: this is a
+ * declaration, not a negotiation"). What this proves is not merely that it
+ * dies, but that the runtime notices FAST, through the fd, rather than
+ * hanging to the describe deadline - so the assertion is a loose wall-clock
+ * bound against a fixture that should answer in milliseconds, not the
+ * generous 30s budget the other real-child cases in this file give a fixture
+ * that is expected to actually take its time.
+ */
+static int case_isolated_old_sdk_tolerability(const char *stubborn_executable) {
+    int before = open_descriptor_count();
+    const maelys_mcp_process_launcher_t *posix_launcher = maelys_mcp_posix_launcher();
+    char *const argv_vector[] = {
+        (char *)stubborn_executable, (char *)"--provider", NULL
+    };
+    maelys_mcp_process_spec_t spec = {
+        .executable_path = stubborn_executable,
+        .argv = argv_vector,
+        .max_message_bytes = 65536u,
+        .spawn_timeout_ms = 5000u,
+        .grace_timeout_ms = 500u,
+        .force_timeout_ms = 500u,
+        .fd_layout = MAELYS_MCP_PROCESS_FD_ISOLATED
+    };
+    maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
+    char *error = NULL;
+    ASSERT_TRUE(maelys_mcp_process_launch(posix_launcher, &spec, &instance,
+        &error) == MAELYS_MCP_OK);
+    free(error);
+    error = NULL;
+
+    maelys_mcp_line_reader_t reader;
+    ASSERT_TRUE(maelys_mcp_line_reader_init(&reader, 65536u) == MAELYS_MCP_OK);
+    long long started = milliseconds();
+    json_t *message = NULL;
+    /* EOF, not a describe response: the fixture never reads
+     * MAELYS_PROVIDER_FD and speaks plain stdin/stdout, which under ISOLATED
+     * are /dev/null and stderr. Its own fgets() sees immediate EOF and it
+     * exits without ever writing a byte to fd 3. */
+    maelys_mcp_result_t status = maelys_mcp_line_reader_read(&reader,
+        instance.protocol_fd, &message, &error);
+    long long elapsed = milliseconds() - started;
+    ASSERT_TRUE(status == MAELYS_MCP_ERR_NOT_FOUND);
+    ASSERT_TRUE(message == NULL);
+    free(error);
+    error = NULL;
+    /* Fast, not just eventually: an old SDK under ISOLATED must read as "died
+     * before describe", never as "hung until the describe deadline". */
+    ASSERT_TRUE(elapsed < 3000LL);
+    maelys_mcp_line_reader_clear(&reader);
+
+    close(instance.protocol_fd);
+    ASSERT_TRUE(maelys_mcp_process_shutdown(posix_launcher, &instance, 500u,
+        500u, &error) == MAELYS_MCP_OK);
+    free(error);
+    ASSERT_TRUE(open_descriptor_count() == before);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     /* example-provider, one that answers describe a second late, and one that
      * ignores SIGTERM. The fourth real child - a binary that exits at once -
@@ -1256,6 +1417,8 @@ int main(int argc, char **argv) {
     ASSERT_TRUE(case_old_apis_unchanged(example_provider) == 0);
     ASSERT_TRUE(case_handle_opacity() == 0);
     ASSERT_TRUE(case_posix_refuses_unknown_profile(example_provider) == 0);
+    ASSERT_TRUE(case_isolated_layout(example_provider) == 0);
+    ASSERT_TRUE(case_isolated_old_sdk_tolerability(stubborn_executable) == 0);
     printf("test_process_launcher: OK\n");
     return 0;
 }

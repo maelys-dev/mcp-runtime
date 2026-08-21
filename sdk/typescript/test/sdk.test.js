@@ -187,6 +187,7 @@ test("provider/3 serializes asynchronous events with normal responses", async ()
     input: Readable.from(requests.map((request) => `${JSON.stringify(request)}\n`)),
     writeLine: (line) => { output.push(JSON.parse(line)); },
     redirectConsole: false,
+    protectStdout: false,
   });
   assert.deepEqual(output.map((message) => message.method ?? `response:${message.id}`), [
     "response:1",
@@ -239,6 +240,7 @@ test("a provider that never nests declares maelys-provider/4 on every frame it w
     input: Readable.from(requests.map((request) => `${JSON.stringify(request)}\n`)),
     writeLine: (line) => { output.push(JSON.parse(line)); },
     redirectConsole: false,
+    protectStdout: false,
   });
   // Every response and every event: describe, activate, the call's own
   // response, the event the handler emitted mid-call, and shutdown.
@@ -284,7 +286,7 @@ test("the first nested request raises the declared protocol to /5 for the rest o
   // is strictly one frame at a time), so this pins the "before" state too.
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/describe", params: {} });
   harness.send({ protocol: "maelys-provider/3", id: 100, method: "provider/call", params: { name: "confirm", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
 
   assert.equal(harness.output.find((message) => message.id === 1).protocol, "maelys-provider/4");
   const nestedRequestFrame = harness.output.find((message) => message.method === "provider/nestedRequest");
@@ -329,7 +331,7 @@ test("requestElicitation completes a real round trip through serveProvider", asy
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent,
     { action: "accept", content: { ok: true } });
 });
@@ -348,7 +350,7 @@ test("requestSampling completes a real round trip through serveProvider", async 
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent,
     { role: "assistant", content: { type: "text", text: "hello" } });
 });
@@ -369,7 +371,7 @@ test("requestRoots completes a real round trip through serveProvider", async () 
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent, { count: 2 });
 });
 
@@ -392,7 +394,7 @@ test("a host denial rejects the nested-request promise with the host's code", as
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent,
     { code: "denied", message: "client did not declare elicitation" });
 });
@@ -430,7 +432,7 @@ test("a nested reply queued alongside ordinary dispatch traffic loses nothing an
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "confirm", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   const ids = harness.output.filter((message) => typeof message.id === "number").map((message) => message.id);
   assert.deepEqual(ids, [1, 2, 3]);
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent, { action: "accept" });
@@ -456,7 +458,7 @@ test("a malformed nested reply rejects with a locally synthesized protocol error
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent, { code: "protocol" });
 });
 
@@ -478,7 +480,7 @@ test("the input channel closing mid-wait rejects the nested-request promise as c
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent, { code: "channel_closed" });
 });
 
@@ -504,7 +506,7 @@ test("a second nested request while one is outstanding is refused locally, not s
     },
   });
   harness.send({ protocol: "maelys-provider/3", id: 1, method: "provider/call", params: { name: "op", arguments: {} } });
-  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false });
+  await serveProvider(provider, { input: harness.input, writeLine: harness.writeLine, redirectConsole: false, protectStdout: false });
   assert.deepEqual(harness.output.find((message) => message.id === 1).result.structuredContent, { secondCode: "unavailable" });
   // Exactly one nested request ever reached the wire.
   assert.equal(harness.output.filter((message) => message.method === "provider/nestedRequest").length, 1);
