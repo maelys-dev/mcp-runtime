@@ -412,6 +412,15 @@ static const char *const H_CALL_NAME_SENTINEL_UTF8[] = CALL_HEADERS("=?base64?c8
 static const char *const H_CALL_NAME_BAD_ALPHABET[] = CALL_HEADERS("=?base64?c2Vh*mNo?=");
 static const char *const H_CALL_NAME_URLSAFE[] = CALL_HEADERS("=?base64?a-b_?=");
 static const char *const H_CALL_NAME_BAD_LENGTH[] = CALL_HEADERS("=?base64?c2VhcmNoZ?=");
+/*
+ * Payload length 6, which is 2 mod 4 - and unlike a length of 1 mod 4 this is
+ * the shape where dropping the multiple-of-four check is a HEAP OVERFLOW rather
+ * than merely a wrong answer. capacity is (6/4)*3 = 3, and the second group
+ * writes a fourth byte before the alphabet test on the byte after it can
+ * refuse. The 9-byte case above cannot show that: its second group is fully
+ * inside the payload and its third is refused before the write.
+ */
+static const char *const H_CALL_NAME_BAD_LENGTH_2MOD4[] = CALL_HEADERS("=?base64?c2Vhcm?=");
 static const char *const H_CALL_NAME_BAD_PADBITS[] = CALL_HEADERS("=?base64?YR==?=");
 static const char *const H_CALL_NAME_BAD_PADBITS_ONE[] = CALL_HEADERS("=?base64?YWJ=?=");
 static const char *const H_CALL_NAME_INNER_PAD[] = CALL_HEADERS("=?base64?YQ==YQ==?=");
@@ -574,6 +583,10 @@ static const matrix_case_t MATRIX[] = {
      REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"wrong padding length is a rejection",
      "sentinel payload not a multiple of four", H_CALL_NAME_BAD_LENGTH,
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
+    {"wrong padding length is a rejection, at the length where dropping the "
+     "check overflows the decode buffer rather than just answering wrongly",
+     "sentinel payload two short of a group", H_CALL_NAME_BAD_LENGTH_2MOD4,
      REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"non-zero bits in the padding are a rejection",
      "sentinel with non-zero bits under two pad bytes", H_CALL_NAME_BAD_PADBITS,

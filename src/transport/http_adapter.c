@@ -109,22 +109,24 @@ static int base64_value(unsigned char c) {
  *
  * Returns 1 on success, with *out malloc'd and *out_length set.
  *
- * TWO OF THESE RULES SURVIVE MUTATION, and the reason is worth stating rather
- * than leaving for the next reader to rediscover.
+ * THE LENGTH CHECK IS MEMORY SAFETY, not tidiness, and the distinction took a
+ * mutation under ASan to establish. `capacity` is (length / 4) * 3, which is
+ * the exact size of a whole number of groups. Remove the check and a payload
+ * whose length is 2 or 3 mod 4 writes past that buffer: at length 6, capacity
+ * is 3, and the second group writes a fourth byte BEFORE the alphabet test on
+ * the byte after it gets a chance to refuse. A payload of length 1 mod 4 does
+ * not show this - its trailing group is refused before any write - so a test
+ * that happens to pick that length proves nothing about the rule.
  *
- * Deleting the length check, or the padding-position check, changes nothing
- * observable THROUGH THE ONLY CALLER THIS FILE HAS. decode_mcp_name always
- * hands over a slice whose next byte is the sentinel's '?', and '?' is not in
- * the alphabet - so a group that runs past the payload is refused by the
- * alphabet test before it can write anything, and an '=' in the interior is
- * refused the same way. Both checks are therefore redundant here and
- * load-bearing for any second caller, which is why they stay: a decoder whose
- * safety depends on its caller's framing is a decoder that breaks the first
- * time it is reused.
+ * The padding-position check is the one that is genuinely redundant here, and
+ * it stays anyway. decode_mcp_name always hands over a slice whose next byte is
+ * the sentinel's '?', and an '=' in the interior is refused by the alphabet
+ * test regardless - but a decoder whose safety depends on its caller's framing
+ * is a decoder that breaks the first time it is reused.
  *
- * The alphabet test they lean on must return a value that is not a valid
- * index. `-0` is `0`, which is 'A', so folding an unrecognised byte to zero
- * would silently decode it - see base64_value.
+ * The alphabet test both of them lean on must return a value that is not a
+ * valid index. `-0` is `0`, which is 'A', so folding an unrecognised byte to
+ * zero would silently decode it - see base64_value.
  */
 static int base64_decode_strict(
     const char *in, size_t length, unsigned char **out, size_t *out_length) {
