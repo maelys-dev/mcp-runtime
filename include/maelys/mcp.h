@@ -6,6 +6,7 @@
 #include "maelys/mcp/middleware.h"
 #include "maelys/mcp/module.h"
 #include "maelys/mcp/outbox.h"
+#include "maelys/mcp/process_launcher.h"
 #include "maelys/mcp/provider.h"
 #include "maelys/mcp/provider_sdk.h"
 #include "maelys/mcp/resources.h"
