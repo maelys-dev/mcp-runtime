@@ -1018,7 +1018,12 @@ static maelys_mcp_result_t spawn_process(
     int no_sigpipe = 1;
     if (setsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
         close(sockets[0]);
-        (void)kill(pid, SIGTERM);
+        /* SIGKILL, not SIGTERM: the child is seconds old, has produced
+         * nothing to flush, and a provider that ignores SIGTERM (a shell
+         * wrapper, a runtime with a handler) would park this waitpid - and
+         * host startup with it - forever. Every sibling failure path below
+         * already kills; these two predated that convention. */
+        (void)kill(pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);
         replace_error(out_error, "cannot configure provider socket safety");
         return MAELYS_MCP_ERR_IO;
@@ -1027,7 +1032,7 @@ static maelys_mcp_result_t spawn_process(
     maelys_mcp_process_context_t *process = calloc(1u, sizeof(*process));
     if (!process) {
         close(sockets[0]);
-        (void)kill(pid, SIGTERM);
+        (void)kill(pid, SIGKILL);
         (void)waitpid(pid, NULL, 0);
         return MAELYS_MCP_ERR_MEMORY;
     }

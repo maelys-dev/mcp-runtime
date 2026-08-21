@@ -79,9 +79,11 @@ or containers.
 The runtime never accepts an executable path, argv, environment variable, or shell
 fragment from an MCP request.
 
-Version 0.10.0 is still a local stdio runtime. It does not expose HTTP, authenticate a
+The runtime remains a local stdio host. It does not expose HTTP, authenticate a
 network principal or apply per-principal effect policy. Those controls are mandatory
-before a network transport can safely expose providers that run with host privileges.
+before a network transport can safely expose providers that run with host privileges;
+the middleware chain's per-channel context and resolved-identity policy decisions
+are the foundation a transport-established principal will bind to.
 
 ## Required provider practices
 
