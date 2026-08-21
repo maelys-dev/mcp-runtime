@@ -59,6 +59,8 @@ LIB_SOURCES := \
 	src/modules/tools.c \
 	src/modules/resources.c \
 	src/modules/subscriptions.c \
+	src/process/launcher.c \
+	src/process/posix_launcher.c \
 	src/provider/provider.c \
 	src/provider/process_provider.c \
 	src/provider/mcp_proxy.c \

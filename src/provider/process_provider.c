@@ -1,14 +1,11 @@
 #include "src/internal/internal.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -875,27 +872,6 @@ static maelys_mcp_result_t process_read_resource_nested(
         out_error);
 }
 
-static long long monotonic_milliseconds(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return (long long)now.tv_sec * 1000LL + (long long)now.tv_nsec / 1000000LL;
-}
-
-static int wait_for_child(pid_t pid, unsigned int timeout_ms) {
-    long long start = monotonic_milliseconds();
-    if (start < 0) return 0;
-    for (;;) {
-        int status = 0;
-        pid_t waited = waitpid(pid, &status, WNOHANG);
-        if (waited == pid || (waited < 0 && errno == ECHILD)) return 1;
-        if (waited < 0 && errno != EINTR) return 0;
-        long long now = monotonic_milliseconds();
-        if (now < 0 || now - start >= (long long)timeout_ms) return 0;
-        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
-        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {}
-    }
-}
-
 static maelys_mcp_result_t process_activate(void *context, char **out_error) {
     maelys_mcp_process_context_t *process = context;
     pthread_mutex_lock(&process->state_mutex);
@@ -938,13 +914,25 @@ static void process_destroy(void *context) {
         close(process->fd);
         process->fd = -1;
     }
-    if (process->pid > 0 && !wait_for_child(process->pid, process->shutdown_timeout_ms)) {
-        (void)kill(process->pid, SIGTERM);
-        if (!wait_for_child(process->pid, process->shutdown_timeout_ms)) {
-            (void)kill(process->pid, SIGKILL);
-            while (waitpid(process->pid, NULL, 0) < 0 && errno == EINTR) {}
-        }
-    }
+    /*
+     * The protocol goodbye above stays here, above the seam: a
+     * provider/shutdown exchange is a protocol fact and belongs to this
+     * provider kind. Everything after it is the one bounded ladder, shared
+     * with the proxy.
+     *
+     * The ladder can report a containment failure - a child that outlived a
+     * forced stop - and this is where that report stops, because the destroy
+     * contract is void from here all the way up through
+     * maelys_mcp_provider_destroy and there is no caller left to hand it to.
+     * The ladder's own return is what tests/test_process_launcher.c pins, at
+     * the level where a caller does exist. What matters here is that teardown
+     * still returns: bounded at every rung, including the last.
+     */
+    char *containment_error = NULL;
+    (void)maelys_mcp_process_shutdown(process->launcher, &process->instance,
+        process->shutdown_timeout_ms, process->shutdown_timeout_ms,
+        &containment_error);
+    free(containment_error);
     if (process->reader) {
         maelys_mcp_line_reader_clear(process->reader);
         free(process->reader);
@@ -968,81 +956,57 @@ static void process_destroy(void *context) {
     free(process);
 }
 
-static int set_close_on_exec(int fd) {
-    int flags = fcntl(fd, F_GETFD);
-    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
+/*
+ * The launch itself happens behind the seam: this compiles a spec, hands it to
+ * the launcher it was given, and never sees a pid, a socketpair or a fork.
+ * docs/launch-contract-design.md explains why that matters more than the
+ * duplication it removes - a second fork/exec site is a second bypass of any
+ * confinement the launcher applies.
+ */
 static maelys_mcp_result_t spawn_process(
     const maelys_mcp_provider_process_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_process_context_t **out_process,
     char **out_error) {
-    int sockets[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
-        replace_error(out_error, "socketpair failed");
-        return MAELYS_MCP_ERR_IO;
-    }
-    if (!set_close_on_exec(sockets[0]) || !set_close_on_exec(sockets[1])) {
-        close(sockets[0]);
-        close(sockets[1]);
-        replace_error(out_error, "cannot protect provider descriptors");
-        return MAELYS_MCP_ERR_IO;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(sockets[0]);
-        close(sockets[1]);
-        replace_error(out_error, "fork failed");
-        return MAELYS_MCP_ERR_IO;
-    }
-    if (pid == 0) {
-        close(sockets[0]);
-        if (dup2(sockets[1], STDIN_FILENO) < 0 || dup2(sockets[1], STDOUT_FILENO) < 0) _exit(126);
-        if (sockets[1] != STDIN_FILENO && sockets[1] != STDOUT_FILENO) close(sockets[1]);
-        /* dup2 with oldfd == newfd is a POSIX no-op that leaves FD_CLOEXEC
-         * set - execve would then close the protocol end, and the child
-         * would start with stdin or stdout already gone. The line above
-         * guards that same edge case for the close; this clears the flag.
-         * For the common oldfd != newfd case dup2 already cleared it and
-         * this is a harmless second clear. */
-        if (fcntl(STDIN_FILENO, F_SETFD, 0) != 0 ||
-            fcntl(STDOUT_FILENO, F_SETFD, 0) != 0) _exit(126);
-
-        char *const argv[] = {(char *)options->executable_path, (char *)"--provider", NULL};
-        char *const environment[] = {
-#ifdef __APPLE__
-            (char *)"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-#else
-            (char *)"PATH=/usr/local/bin:/usr/bin:/bin",
-#endif
-            (char *)"LANG=C",
-            (char *)"LC_ALL=C",
-            NULL
-        };
-        execve(options->executable_path, argv, environment);
-        _exit(127);
-    }
-    close(sockets[1]);
-#ifdef SO_NOSIGPIPE
-    int no_sigpipe = 1;
-    if (setsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
-        close(sockets[0]);
-        /* SIGKILL, not SIGTERM: the child is seconds old, has produced
-         * nothing to flush, and a provider that ignores SIGTERM (a shell
-         * wrapper, a runtime with a handler) would park this waitpid - and
-         * host startup with it - forever. Every sibling failure path below
-         * already kills; these two predated that convention. */
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
-        replace_error(out_error, "cannot configure provider socket safety");
-        return MAELYS_MCP_ERR_IO;
-    }
-#endif
+    /*
+     * The COMPLETE vector, argv[0] included: nothing below the seam ever
+     * receives "extra arguments". --provider is what puts a maelys-provider
+     * binary into provider mode, and the runtime compiles it rather than
+     * letting configuration write argv[1] - which would turn a provider
+     * declaration into an arbitrary invocation of a trusted binary.
+     */
+    char *const argv[] = {
+        (char *)options->executable_path, (char *)"--provider", NULL
+    };
+    maelys_mcp_process_spec_t spec = {
+        .executable_path = options->executable_path,
+        .argv = argv,
+        /* Manifest v2's executionProfile is what will fill this in; until then
+         * every native provider takes the launcher's own default. */
+        .execution_profile = NULL,
+        .max_message_bytes = options->max_message_bytes,
+        /* The enclosing budget this launch has to complete inside - a provider
+         * that is not up in time to answer describe is not up. Carried rather
+         * than enforced: this runtime has no thread to time a spawn out with,
+         * and a launcher that can block is the one that has to honour it. */
+        .spawn_timeout_ms = options->describe_timeout_ms,
+        .grace_timeout_ms = options->shutdown_timeout_ms,
+        .force_timeout_ms = options->shutdown_timeout_ms,
+        /* Derived from the child's protocol type, never configured. Native
+         * children run a first-party SDK, so the isolated layout is available
+         * to this kind when it lands; today both kinds are stdio. */
+        .fd_layout = MAELYS_MCP_PROCESS_FD_STDIO
+    };
+    maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
+    maelys_mcp_result_t status = maelys_mcp_process_launch(launcher, &spec,
+        &instance, out_error);
+    if (status != MAELYS_MCP_OK) return status;
+    int fd = instance.protocol_fd;
     maelys_mcp_process_context_t *process = calloc(1u, sizeof(*process));
     if (!process) {
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(fd);
+        maelys_mcp_process_abandon(launcher, &instance,
+            options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_MEMORY;
     }
     process->reader = calloc(1u, sizeof(*process->reader));
@@ -1050,18 +1014,18 @@ static maelys_mcp_result_t spawn_process(
         process->reader, options->max_message_bytes) != MAELYS_MCP_OK) {
         free(process->reader);
         free(process);
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(fd);
+        maelys_mcp_process_abandon(launcher, &instance,
+            options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_MEMORY;
     }
     if (pthread_mutex_init(&process->exchange_mutex, NULL) != 0) {
         maelys_mcp_line_reader_clear(process->reader);
         free(process->reader);
         free(process);
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(fd);
+        maelys_mcp_process_abandon(launcher, &instance,
+            options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->exchange_mutex_initialized = 1;
@@ -1070,9 +1034,9 @@ static maelys_mcp_result_t spawn_process(
         maelys_mcp_line_reader_clear(process->reader);
         free(process->reader);
         free(process);
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(fd);
+        maelys_mcp_process_abandon(launcher, &instance,
+            options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->state_mutex_initialized = 1;
@@ -1082,14 +1046,15 @@ static maelys_mcp_result_t spawn_process(
         maelys_mcp_line_reader_clear(process->reader);
         free(process->reader);
         free(process);
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(fd);
+        maelys_mcp_process_abandon(launcher, &instance,
+            options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->response_ready_initialized = 1;
-    process->pid = pid;
-    process->fd = sockets[0];
+    process->launcher = launcher;
+    process->instance = instance;
+    process->fd = fd;
     process->max_message_bytes = options->max_message_bytes;
     /* Open at the floor: until this provider tells us otherwise, assume it
      * only understands the version every provider understands. */
@@ -1107,9 +1072,9 @@ static maelys_mcp_result_t spawn_process(
         maelys_mcp_line_reader_clear(process->reader);
         free(process->reader);
         free(process);
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(fd);
+        maelys_mcp_process_abandon(launcher, &instance,
+            options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->reader_started = 1;
@@ -1239,7 +1204,7 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     *out_provider = NULL;
     maelys_mcp_process_context_t *process = NULL;
     maelys_mcp_result_t status = spawn_process(
-        &normalized, &process, out_error);
+        &normalized, maelys_mcp_posix_launcher(), &process, out_error);
     if (status != MAELYS_MCP_OK) return status;
 
     json_t *description = NULL;
