@@ -3,7 +3,9 @@
 #include "tests/test_support.h"
 
 #include <pthread.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1887,6 +1889,250 @@ static int test_detached_destroy_joins_a_finished_worker(void) {
     return 0;
 }
 
+/* ---- the pollable outbox ---- */
+
+/*
+ * Readability, asked the way a transport would ask it. Zero milliseconds
+ * everywhere a raise is synchronous - every enqueue below happens on this
+ * thread and writes its byte before it returns - so these assertions are
+ * decisions, not races.
+ */
+static int wait_fd_is_readable(int fd, int timeout_ms) {
+    struct pollfd descriptor = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int ready = poll(&descriptor, 1u, timeout_ms);
+    return ready > 0 && (descriptor.revents & POLLIN) != 0;
+}
+
+/*
+ * How many descriptors this process holds. The point of the lazy pipe is that
+ * a channel nobody polls costs nothing, and "costs nothing" is a number.
+ */
+static size_t count_open_descriptors(void) {
+    size_t count = 0u;
+    for (int fd = 0; fd < 256; ++fd) {
+        if (fcntl(fd, F_GETFD) >= 0) count++;
+    }
+    return count;
+}
+
+/*
+ * The property that keeps stdio's cost at zero: no pipe exists until a
+ * transport asks for one, and asking twice does not ask twice.
+ */
+static int test_wait_fd_is_absent_until_enabled(void) {
+    ASSERT_TRUE(maelys_mcp_channel_wait_fd(NULL) == -1);
+    ASSERT_TRUE(maelys_mcp_channel_enable_wait_fd(NULL) ==
+        MAELYS_MCP_ERR_ARGUMENT);
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+
+    size_t before = count_open_descriptors();
+    maelys_mcp_channel_t *quiet = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(quiet != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_wait_fd(quiet) == -1);
+    ASSERT_TRUE(handle(quiet, discover_request(1)) == MAELYS_MCP_OK);
+    json_t *response = next_message(quiet, 1000u);
+    ASSERT_TRUE(response != NULL);
+    json_decref(response);
+    /* A whole request and its answer, and still no descriptor: the enqueue
+     * path pays for the pipe only when somebody enabled it. */
+    ASSERT_TRUE(maelys_mcp_channel_wait_fd(quiet) == -1);
+    ASSERT_TRUE(count_open_descriptors() == before);
+
+    maelys_mcp_channel_t *polled = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(polled != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_enable_wait_fd(polled) == MAELYS_MCP_OK);
+    int fd = maelys_mcp_channel_wait_fd(polled);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_TRUE(count_open_descriptors() == before + 2u);
+    /* Idempotent, and the descriptor a caller already holds stays valid. */
+    ASSERT_TRUE(maelys_mcp_channel_enable_wait_fd(polled) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_wait_fd(polled) == fd);
+    ASSERT_TRUE(count_open_descriptors() == before + 2u);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(quiet) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(polled) == MAELYS_MCP_OK);
+    /* And the pipe goes away with the channel. */
+    ASSERT_TRUE(count_open_descriptors() == before);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+/*
+ * Every way a message reaches the outbox has to raise the descriptor, because
+ * a transport that polls it is not calling next() for any other reason. The
+ * three paths are a response, a coalescible notification, and the close that
+ * ends the conversation - the last one because a poller that is never told the
+ * outbox is finished waits out its timeout to discover it.
+ */
+static int test_wait_fd_signals_every_enqueue_path(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_enable_wait_fd(channel) == MAELYS_MCP_OK);
+    int fd = maelys_mcp_channel_wait_fd(channel);
+    ASSERT_TRUE(fd >= 0);
+    ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+
+    /* A response. */
+    ASSERT_TRUE(handle(channel, discover_request(1)) == MAELYS_MCP_OK);
+    ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+    json_t *response = next_message(channel, 1000u);
+    ASSERT_TRUE(response != NULL);
+    json_decref(response);
+    ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+
+    /* A notification, on the coalescing lane. */
+    static const char *uri = "test://wait-fd/resource";
+    ASSERT_TRUE(handle(channel, listen_request(json_integer(2), uri)) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+    json_t *ack = next_message(channel, 1000u);
+    ASSERT_TRUE(ack != NULL);
+    json_decref(ack);
+    ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+    ASSERT_TRUE(maelys_mcp_runtime_notify_resource_updated(runtime, uri) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+    json_t *event = next_message(channel, 1000u);
+    ASSERT_TRUE(event != NULL && is_resource_event(event, uri));
+    json_decref(event);
+    ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+    /* Cancelled rather than left running, so the close below has nothing to
+     * complete and is a clean close rather than an undrained one. A
+     * cancellation produces no message of its own, so the descriptor stays
+     * down across it. */
+    ASSERT_TRUE(handle(channel, cancel_notification(json_integer(2))) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+
+    /* And the end of the conversation, which stays raised: there is nothing
+     * left to drain and nothing that could ever lower it again. */
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
+    ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+    json_t *nothing = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_next(channel, 100u, &nothing) ==
+        MAELYS_MCP_ERR_CLOSED);
+    ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+    ASSERT_TRUE(destroy_channel_and_runtime(channel, runtime));
+    return 0;
+}
+
+/*
+ * One byte per idle->busy transition, not one per message. The count is not
+ * directly observable - the contract forbids the caller to read the pipe - but
+ * its consequence is: a queue drained to empty must leave the descriptor
+ * unreadable, which an implementation writing one byte per message could not
+ * manage, because the surplus bytes would still be sitting there.
+ *
+ * Both shapes the design named are checked, because they are the same
+ * transition arriving differently: three messages in one burst, and three
+ * arriving one at a time with a drain between them.
+ */
+static int test_wait_fd_costs_one_byte_per_transition(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_enable_wait_fd(channel) == MAELYS_MCP_OK);
+    int fd = maelys_mcp_channel_wait_fd(channel);
+    ASSERT_TRUE(fd >= 0);
+
+    for (json_int_t id = 1; id <= 3; ++id) {
+        ASSERT_TRUE(handle(channel, discover_request(id)) == MAELYS_MCP_OK);
+        ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+    }
+    for (int index = 0; index < 3; ++index) {
+        /* Readable until the last one leaves, and not one message sooner. */
+        ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+        json_t *response = next_message(channel, 1000u);
+        ASSERT_TRUE(response != NULL);
+        json_decref(response);
+    }
+    ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+
+    for (json_int_t id = 4; id <= 6; ++id) {
+        ASSERT_TRUE(handle(channel, discover_request(id)) == MAELYS_MCP_OK);
+        ASSERT_TRUE(wait_fd_is_readable(fd, 0));
+        json_t *response = next_message(channel, 1000u);
+        ASSERT_TRUE(response != NULL);
+        json_decref(response);
+        ASSERT_TRUE(!wait_fd_is_readable(fd, 0));
+    }
+    ASSERT_TRUE(destroy_channel_and_runtime(channel, runtime));
+    return 0;
+}
+
+typedef struct polling_reader {
+    maelys_mcp_channel_t *channel;
+    int fd;
+    atomic_int received;
+    atomic_int poll_timeouts;
+    atomic_int closed;
+} polling_reader_t;
+
+/*
+ * What the descriptor is for: a thread that is inside poll() rather than
+ * inside maelys_mcp_channel_next, and would therefore be free to watch a
+ * socket in the same call.
+ */
+static void *polling_reader_main(void *opaque) {
+    polling_reader_t *reader = opaque;
+    for (;;) {
+        if (!wait_fd_is_readable(reader->fd, 2000)) {
+            atomic_fetch_add(&reader->poll_timeouts, 1);
+            return NULL;
+        }
+        json_t *message = NULL;
+        maelys_mcp_result_t status = maelys_mcp_channel_next(reader->channel,
+            50u, &message);
+        if (status == MAELYS_MCP_OK) {
+            json_decref(message);
+            atomic_fetch_add(&reader->received, 1);
+            continue;
+        }
+        if (status == MAELYS_MCP_ERR_CLOSED) {
+            atomic_store(&reader->closed, 1);
+            return NULL;
+        }
+        /* ERR_TIMEOUT is the permitted answer to a spurious wakeup, and the
+         * loop simply goes back to poll(). Anything else is a failure. */
+        if (status != MAELYS_MCP_ERR_TIMEOUT) return NULL;
+    }
+}
+
+static int test_wait_fd_wakes_a_polling_reader(void) {
+    enum { REQUESTS = 16 };
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 8u, 1000u);
+    ASSERT_TRUE(channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_enable_wait_fd(channel) == MAELYS_MCP_OK);
+    polling_reader_t reader = { .channel = channel,
+        .fd = maelys_mcp_channel_wait_fd(channel) };
+    atomic_store(&reader.received, 0);
+    atomic_store(&reader.poll_timeouts, 0);
+    atomic_store(&reader.closed, 0);
+    ASSERT_TRUE(reader.fd >= 0);
+    pthread_t thread;
+    ASSERT_TRUE(pthread_create(&thread, NULL, polling_reader_main, &reader) == 0);
+    for (json_int_t id = 1; id <= REQUESTS; ++id) {
+        ASSERT_TRUE(handle(channel, discover_request(id)) == MAELYS_MCP_OK);
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
+    ASSERT_TRUE(pthread_join(thread, NULL) == 0);
+    ASSERT_TRUE(atomic_load(&reader.received) == REQUESTS);
+    /* The assertion that matters: every wakeup came from the descriptor, so
+     * not one of them was missed and had to be recovered by a timeout. */
+    ASSERT_TRUE(atomic_load(&reader.poll_timeouts) == 0);
+    ASSERT_TRUE(atomic_load(&reader.closed) == 1);
+    ASSERT_TRUE(destroy_channel_and_runtime(channel, runtime));
+    return 0;
+}
+
 /*
  * context_release, the ABI 4 half of detachable destruction. The callback
  * exists so that an embedder whose channel context owns something - an
@@ -2091,6 +2337,14 @@ static int test_context_release_runs_once_on_the_detached_destroy(void) {
 
 int main(void) {
     static const maelys_test_case_t tests[] = {
+        {"wait fd is absent until a transport enables it",
+            test_wait_fd_is_absent_until_enabled},
+        {"wait fd signals every enqueue path and the close",
+            test_wait_fd_signals_every_enqueue_path},
+        {"wait fd costs one byte per idle-to-busy transition",
+            test_wait_fd_costs_one_byte_per_transition},
+        {"wait fd wakes a polling reader without a missed wakeup",
+            test_wait_fd_wakes_a_polling_reader},
         {"context release runs once on the synchronous destroy",
             test_context_release_runs_once_on_the_synchronous_destroy},
         {"context release runs once on the detached destroy",

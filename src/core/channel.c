@@ -813,6 +813,23 @@ void *maelys_mcp_channel_context(const maelys_mcp_channel_t *channel) {
     return channel ? channel->config.context : NULL;
 }
 
+/*
+ * The readiness descriptor is the outbox's, not the channel's: the queue and
+ * the flag that describes it have to be maintained under one lock, and that
+ * lock is the outbox's. The channel keeps the entry points because a channel
+ * is what a transport holds, and because maelys_mcp_outbox_t is not on the
+ * public path a transport reaches.
+ */
+maelys_mcp_result_t maelys_mcp_channel_enable_wait_fd(
+    maelys_mcp_channel_t *channel) {
+    if (!channel) return MAELYS_MCP_ERR_ARGUMENT;
+    return maelys_mcp_outbox_enable_wait_fd(channel->outbox);
+}
+
+int maelys_mcp_channel_wait_fd(const maelys_mcp_channel_t *channel) {
+    return channel ? maelys_mcp_outbox_wait_fd(channel->outbox) : -1;
+}
+
 maelys_mcp_result_t maelys_mcp_channel_next(
     maelys_mcp_channel_t *channel,
     unsigned int timeout_ms,

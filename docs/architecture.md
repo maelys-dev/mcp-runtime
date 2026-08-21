@@ -269,6 +269,12 @@ Responses are preferred, but after eight consecutive responses one pending
 notification is selected. Keyed notification replacement moves the event to the tail,
 preserving the most recent causal position rather than its first occurrence.
 
+A transport that has to watch a socket at the same time as the outbox can ask a
+channel for a readiness descriptor and poll that instead of blocking in
+`maelys_mcp_channel_next`. The pipe is created only on request, so a transport that
+does not poll allocates nothing and pays nothing, and it is level-triggered on the
+empty/non-empty boundary rather than raised per message. See `docs/outbox.md`.
+
 The queues accept multiple producers. Native and process-provider event APIs are
 asynchronous with respect to protocol writes. Request dispatch is synchronous with
 exactly two exceptions, `tools/call` and `resources/read`: a transport that delivers

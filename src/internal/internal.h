@@ -522,6 +522,17 @@ int maelys_mcp_cond_wait_until(
     pthread_cond_t *condition,
     pthread_mutex_t *mutex,
     uint64_t deadline_ms);
+/*
+ * A self-pipe for waking a poll(). Both ends are close-on-exec, so no spawned
+ * provider inherits them, and both are non-blocking, so neither the thread
+ * raising the wakeup nor the thread lowering it can ever be parked by the
+ * kernel's pipe buffer. Two callers want exactly this - the stdio transport,
+ * whose reader has to learn that its writer died, and the outbox, whose
+ * readiness descriptor is the same trick one layer down - and one
+ * implementation is what stops the two sets of flags from drifting apart.
+ * Writes -1 into both entries on failure.
+ */
+maelys_mcp_result_t maelys_mcp_create_wakeup_pipe(int descriptors[2]);
 
 maelys_mcp_result_t maelys_mcp_stdio_finish_status(
     maelys_mcp_result_t primary_status,
@@ -787,6 +798,47 @@ maelys_mcp_result_t maelys_mcp_outbox_wait_drained_until(
     maelys_mcp_outbox_t *outbox,
     uint64_t deadline_ms);
 size_t maelys_mcp_outbox_waiter_count(maelys_mcp_outbox_t *outbox);
+/*
+ * The pollable outbox. maelys_mcp_outbox_next waits on a condition variable,
+ * and a thread inside it is not watching a socket - so a transport whose
+ * connection can go away while a provider is still running has no way to drain
+ * output and notice the peer left at the same time. These two give it one
+ * descriptor it can hand to poll() beside its socket.
+ *
+ * Internal for v1, deliberately: adding a public function later is compatible
+ * and removing one is not, and nothing outside the library needs them while
+ * the only consumer is in the library.
+ *
+ * Creates this channel's wakeup pipe so that maelys_mcp_channel_wait_fd can
+ * return a descriptor. Idempotent, and called by a transport that intends to
+ * poll before it dispatches anything into the channel. Lazy on purpose: stdio
+ * never calls it, so stdio never allocates two descriptors per channel and
+ * never pays the write(2) below - the cost lands only on the transport that
+ * asked for it. Failure (descriptor exhaustion, in practice) is the caller's
+ * to report; it must not be answered by falling back to short timed waits,
+ * which is the polling design this seam exists to avoid.
+ */
+maelys_mcp_result_t maelys_mcp_channel_enable_wait_fd(
+    maelys_mcp_channel_t *channel);
+maelys_mcp_result_t maelys_mcp_outbox_enable_wait_fd(
+    maelys_mcp_outbox_t *outbox);
+/*
+ * A descriptor that becomes readable whenever this channel's outbox has
+ * something for maelys_mcp_channel_next - a message, or the end of a closed
+ * outbox - and stays readable until it does not. Level-triggered by
+ * construction: the byte is written on the transition into that state and
+ * consumed on the transition out of it, so at most one byte is outstanding and
+ * a burst of enqueues costs one write(2), not one per message.
+ *
+ * The caller must not read from it. It is for poll()/select()/kqueue only, and
+ * the only correct response to it being readable is to call
+ * maelys_mcp_channel_next. Spurious readability is possible and harmless -
+ * next() answers ERR_TIMEOUT - but a missed wakeup is not, which is why the
+ * flag is maintained under the same mutex as the queue itself. Returns -1 when
+ * enable_wait_fd was never called or failed.
+ */
+int maelys_mcp_channel_wait_fd(const maelys_mcp_channel_t *channel);
+int maelys_mcp_outbox_wait_fd(maelys_mcp_outbox_t *outbox);
 maelys_mcp_result_t maelys_mcp_channel_complete_subscriptions_until(
     maelys_mcp_channel_t *channel,
     uint64_t deadline_ms);
