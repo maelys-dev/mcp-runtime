@@ -27,12 +27,22 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define VALID_BODY "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"
+/*
+ * A body that satisfies H2's MCP rules, because since H2 the adapter validates
+ * before it answers and a server-layer test that wanted to reach the adapter
+ * would otherwise be refused by a rule it is not testing. It carries the
+ * _meta protocol version the MCP-Protocol-Version header is compared against,
+ * and its method matches the Mcp-Method header in STD_HEADERS.
+ */
+#define VALID_BODY \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"_meta\":" \
+    "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
+#define VALID_BODY_LENGTH "116"
 /* The Content-Length in the table below is written out, so it has to be pinned
  * to the body rather than counted by hand: a body one byte longer than its
  * declared length is indistinguishable from a pipelined request, and the test
  * would fail for a reason that has nothing to do with what it is testing. */
-_Static_assert(sizeof(VALID_BODY) - 1u == 40u, "VALID_BODY is 40 bytes");
+_Static_assert(sizeof(VALID_BODY) - 1u == 116u, "VALID_BODY is 116 bytes");
 
 typedef struct fixture {
     maelys_mcp_authenticator_t authenticator;
@@ -190,10 +200,19 @@ static int exchange(unsigned short port, const char *request, size_t length,
     return got >= 0 ? status_of(response) : -1;
 }
 
-#define STD_HEADERS \
+/*
+ * The MCP routing headers ride along in STD_HEADERS since H2. A case that
+ * expects a server-layer refusal never reaches them, and a case that expects to
+ * reach the adapter needs them: leaving them out would make every 503 case fail
+ * on a -32020 that has nothing to do with the ladder being tested.
+ */
+#define BASE_HEADERS \
     "Host: 127.0.0.1\r\n" \
     "Content-Type: application/json\r\n" \
     "Accept: application/json, text/event-stream\r\n"
+#define STD_HEADERS BASE_HEADERS \
+    "MCP-Protocol-Version: 2026-07-28\r\n" \
+    "Mcp-Method: ping\r\n"
 
 typedef struct wire_case {
     const char *rule;
@@ -205,7 +224,7 @@ typedef struct wire_case {
 
 static const wire_case_t WIRE_CASES[] = {
     {"a well-formed POST reaches the adapter and gets its placeholder answer",
-        "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: 40\r\n\r\n" VALID_BODY,
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY,
         503, "-32600"},
     {"GET on the endpoint is 405 with Allow: POST",
         "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 405, "Allow: POST"},
@@ -261,7 +280,20 @@ static const wire_case_t WIRE_CASES[] = {
         "Content-Length: 2\r\n\r\n{}", 400, NULL},
     {"an absolute-form target matching Host is routed",
         "POST http://127.0.0.1/mcp HTTP/1.1\r\n" STD_HEADERS
-        "Content-Length: 2\r\n\r\n{}", 503, "-32600"}
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY, 503, "-32600"},
+    /*
+     * The two H2 rows the adapter owns, proven on the wire rather than only
+     * through the recording writer: the refusal has to survive the server
+     * layer's response path to be worth anything to a client.
+     */
+    {"a routing header that disagrees with the body is 400 with -32020",
+        "POST /mcp HTTP/1.1\r\n" BASE_HEADERS
+        "MCP-Protocol-Version: 2026-07-28\r\n"
+        "Mcp-Method: tools/list\r\n"
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY, 400, "-32020"},
+    {"a body that is not a JSON object is 400 with -32700",
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS
+        "Content-Length: 7\r\n\r\n[1,2,3]", 400, "-32700"}
 };
 
 static int wire_matrix(void) {
@@ -330,7 +362,8 @@ static int origin_is_refused_before_anything_else(void) {
     ASSERT_TRUE(fixture_start(&fixture, NULL, 0, origins, 1u) == 0);
     const char *allowed =
         "POST /mcp HTTP/1.1\r\n" STD_HEADERS
-        "Origin: https://app.example\r\nContent-Length: 2\r\n\r\n{}";
+        "Origin: https://app.example\r\n"
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     ASSERT_TRUE(exchange(fixture.port, allowed, strlen(allowed),
         response, sizeof(response)) == 503);
     const char *refused =
@@ -352,7 +385,8 @@ static int a_kept_alive_connection_serves_a_second_request(void) {
     int fd = connect_loopback(fixture.port);
     ASSERT_TRUE(fd >= 0);
     const char *request =
-        "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: 2\r\n\r\n{}";
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     char response[4096];
     for (int round = 0; round < 2; ++round) {
         ASSERT_TRUE(send_all(fd, request, strlen(request)) == 0);
@@ -444,7 +478,8 @@ static int bearer_authentication_on_the_wire(void) {
 
     const char *right =
         "POST /mcp HTTP/1.1\r\n" STD_HEADERS
-        "Authorization: Bearer good-token\r\nContent-Length: 2\r\n\r\n{}";
+        "Authorization: Bearer good-token\r\n"
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     ASSERT_TRUE(exchange(fixture.port, right, strlen(right),
         response, sizeof(response)) == 503);
     fixture_stop(&fixture);

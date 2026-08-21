@@ -413,7 +413,8 @@ FUZZ_BUILD := $(BUILD_ROOT)/fuzz
 FUZZ_BIN := $(FUZZ_BUILD)/bin
 FUZZ_CORPUS := $(FUZZ_BUILD)/corpus
 FUZZ_BINARIES := $(FUZZ_BIN)/json-lines $(FUZZ_BIN)/content-length $(FUZZ_BIN)/schema $(FUZZ_BIN)/content $(FUZZ_BIN)/uri \
-	$(FUZZ_BIN)/http-request $(FUZZ_BIN)/http-smuggling $(FUZZ_BIN)/http-origin
+	$(FUZZ_BIN)/http-request $(FUZZ_BIN)/http-smuggling $(FUZZ_BIN)/http-origin \
+	$(FUZZ_BIN)/http-headers
 
 $(FUZZ_BIN)/json-lines: fuzz/fuzz_json_lines.c $(LIB_SOURCES)
 	@mkdir -p $(@D)
@@ -450,12 +451,21 @@ $(FUZZ_BIN)/http-origin: fuzz/fuzz_http_origin.c host/http_parser.c
 	@mkdir -p $(@D)
 	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ -o $@
 
+# http-headers is the one HTTP target that links the LIBRARY rather than the
+# host parser: the sentinel decoder and the header/body comparison live in the
+# adapter, and it drives them through maelys_mcp_http_adapter_handle itself. An
+# iteration still costs no socket and no thread, because the seam is a function.
+$(FUZZ_BIN)/http-headers: fuzz/fuzz_http_headers.c $(LIB_SOURCES)
+	@mkdir -p $(@D)
+	$(FUZZ_CC) $(CPPFLAGS) $(FUZZ_CFLAGS) $^ $(LDLIBS) -o $@
+
 fuzz-build: $(FUZZ_BINARIES)
 
 fuzz-smoke: fuzz-build
 	rm -rf $(FUZZ_CORPUS)
 	mkdir -p $(FUZZ_CORPUS)/json-lines $(FUZZ_CORPUS)/content-length $(FUZZ_CORPUS)/schema $(FUZZ_CORPUS)/content $(FUZZ_CORPUS)/uri \
-		$(FUZZ_CORPUS)/http-request $(FUZZ_CORPUS)/http-smuggling $(FUZZ_CORPUS)/http-origin
+		$(FUZZ_CORPUS)/http-request $(FUZZ_CORPUS)/http-smuggling $(FUZZ_CORPUS)/http-origin \
+		$(FUZZ_CORPUS)/http-headers
 	cp fuzz/seeds/json-lines/* $(FUZZ_CORPUS)/json-lines/
 	printf 'Content-Length: 2\r\n\r\n{}' >$(FUZZ_CORPUS)/content-length/frame
 	cp fuzz/seeds/schema/* $(FUZZ_CORPUS)/schema/
@@ -464,6 +474,7 @@ fuzz-smoke: fuzz-build
 	cp fuzz/seeds/http-request/* $(FUZZ_CORPUS)/http-request/
 	cp fuzz/seeds/http-smuggling/* $(FUZZ_CORPUS)/http-smuggling/
 	cp fuzz/seeds/http-origin/* $(FUZZ_CORPUS)/http-origin/
+	cp fuzz/seeds/http-headers/* $(FUZZ_CORPUS)/http-headers/
 	$(FUZZ_BIN)/json-lines -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/json-lines
 	$(FUZZ_BIN)/content-length -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/content-length
 	$(FUZZ_BIN)/schema -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/schema
@@ -472,6 +483,7 @@ fuzz-smoke: fuzz-build
 	$(FUZZ_BIN)/http-request -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-request
 	$(FUZZ_BIN)/http-smuggling -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-smuggling
 	$(FUZZ_BIN)/http-origin -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-origin
+	$(FUZZ_BIN)/http-headers -runs=2000 -max_len=8192 $(FUZZ_CORPUS)/http-headers
 
 asan-linux-image:
 	$(DOCKER) build --platform $(DOCKER_PLATFORM) \
