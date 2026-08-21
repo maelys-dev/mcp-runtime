@@ -233,7 +233,16 @@ int main(int argc, char **argv) {
                 .call_timeout_ms = entry->call_timeout_ms,
                 .shutdown_timeout_ms = entry->shutdown_timeout_ms
             };
-            status = maelys_mcp_provider_spawn_with_options(&options, &provider, &error);
+            /*
+             * Always the v2-capable entry point: a v1 manifest (or a v2 one
+             * that set neither key) has entry->args == NULL and
+             * entry->execution_profile == NULL, which
+             * maelys_mcp_provider_spawn_with_args defines as byte-identical
+             * to maelys_mcp_provider_spawn_with_options - so there is nothing
+             * for a manifestVersion branch here to do.
+             */
+            status = maelys_mcp_provider_spawn_with_args(
+                &options, entry->args, entry->execution_profile, &provider, &error);
         } else {
             maelys_mcp_proxy_options_t options = {
                 .executable_path = entry->path,
@@ -245,8 +254,10 @@ int main(int argc, char **argv) {
                 .tool_prefix = entry->tool_prefix,
                 .schema_policy = entry->schema_policy
             };
-            status = maelys_mcp_provider_proxy_spawn(
-                &options, &provider, &skipped_tools, &error);
+            /* Same reasoning as the native branch above, for
+             * executionProfile. */
+            status = maelys_mcp_provider_proxy_spawn_with_profile(
+                &options, entry->execution_profile, &provider, &skipped_tools, &error);
         }
         if (status == MAELYS_MCP_OK) {
             status = maelys_mcp_runtime_add_provider(runtime, provider, &error);
