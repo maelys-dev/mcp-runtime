@@ -105,6 +105,13 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
  * runtime or one of its channels. Calls begun after the runtime is freed are
  * invalid C usage. Draining admitted creators may wait for provider activation
  * to reach its configured deadline.
+ *
+ * It also waits, without a bound, for every channel handed to
+ * maelys_mcp_channel_destroy_detached to be released by its last in-flight
+ * operation. Such a channel still points at this runtime while it exists, so
+ * the wait is what stops the runtime being freed underneath it; the bound is
+ * the provider's, which is the same bound the detach did not remove and only
+ * moved off the caller's thread.
  */
 MAELYS_MCP_WARN_UNUSED_RESULT
 maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime);

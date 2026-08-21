@@ -81,6 +81,10 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->channel_create_gate_drained_initialized = 1;
     if (pthread_mutex_init(&runtime->channels_mutex, NULL) != 0) goto failed;
     runtime->channels_mutex_initialized = 1;
+    if (maelys_mcp_cond_init_monotonic(&runtime->detached_channels_drained) != 0) {
+        goto failed;
+    }
+    runtime->detached_channels_drained_initialized = 1;
     if (pthread_mutex_init(&runtime->provider_events_mutex, NULL) != 0) {
         goto failed;
     }
@@ -99,6 +103,9 @@ failed:
     }
     if (runtime->provider_events_mutex_initialized) {
         pthread_mutex_destroy(&runtime->provider_events_mutex);
+    }
+    if (runtime->detached_channels_drained_initialized) {
+        pthread_cond_destroy(&runtime->detached_channels_drained);
     }
     if (runtime->channels_mutex_initialized) {
         pthread_mutex_destroy(&runtime->channels_mutex);
@@ -133,12 +140,46 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     }
     pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
 
+    /*
+     * Detached channels next, and before lifecycle_mutex, for the same reason
+     * the create gate is drained before it: this is an unbounded wait and it
+     * must not be taken with a lock the rest of the runtime needs.
+     *
+     * It exists because maelys_mcp_channel_destroy_detached *decrements*
+     * live_channel_count when it hands a channel off, so the refusal below
+     * would see a runtime with no channels and free one that a worker still
+     * holds a pointer into. The create gate is already closed and drained, so
+     * no new channel - and therefore no new detached channel - can appear from
+     * a creator that has not already been counted.
+     *
+     * Unbounded on purpose. The bound on a stuck in-process provider is the
+     * provider's, and the runtime has none to offer; what the detach bought
+     * was the *caller's* thread, not an escape from waiting somewhere. Waiting
+     * here, once, at shutdown, is where that cost belongs.
+     */
+    pthread_mutex_lock(&runtime->channels_mutex);
+    while (runtime->detached_channel_count != 0u) {
+        pthread_cond_wait(&runtime->detached_channels_drained,
+            &runtime->channels_mutex);
+    }
+    pthread_mutex_unlock(&runtime->channels_mutex);
+
     pthread_mutex_lock(&runtime->lifecycle_mutex);
     runtime->shutdown_requested = 1;
     runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
     pthread_cond_broadcast(&runtime->lifecycle_changed);
     pthread_mutex_lock(&runtime->channels_mutex);
-    if (runtime->live_channel_count != 0u) {
+    /*
+     * The detached count is re-read here, not just drained above, because an
+     * embedder detaching a channel concurrently with this call could land one
+     * in the window between the two. That embedder is already outside the
+     * contract - it is destroying a runtime while still calling into it - and
+     * refusing is the answer this function already gives for "you still hold a
+     * channel", with the same remedy: nothing is freed, and calling again
+     * drains and succeeds.
+     */
+    if (runtime->live_channel_count != 0u ||
+        runtime->detached_channel_count != 0u) {
         pthread_mutex_unlock(&runtime->channels_mutex);
         pthread_mutex_unlock(&runtime->lifecycle_mutex);
         return MAELYS_MCP_ERR_STATE;
@@ -157,6 +198,7 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     maelys_mcp_chain_destroy(runtime);
     pthread_cond_destroy(&runtime->provider_events_idle);
     pthread_mutex_destroy(&runtime->provider_events_mutex);
+    pthread_cond_destroy(&runtime->detached_channels_drained);
     pthread_mutex_destroy(&runtime->channels_mutex);
     pthread_cond_destroy(&runtime->channel_create_gate_drained);
     pthread_mutex_destroy(&runtime->channel_create_gate_mutex);

@@ -65,6 +65,21 @@ client-specific adapter belongs in this library.
 - A channel owns its outbox, subscription ids, resource filters and legacy client
   state. The runtime retains the channel's lifetime entry until `channel_destroy`,
   even after `channel_close` has removed it from event fan-out.
+- `maelys_mcp_channel_destroy` consumes the handle even when its bounded close
+  missed the deadline, and then waits, without a bound, for every operation that
+  had already retained the channel: freeing at the deadline while workers still
+  hold the channel's mutex and outbox would be a use-after-free.
+  `maelys_mcp_channel_destroy_detached` makes the same guarantee without the
+  wait. It aborts the channel, unlinks it from the registry immediately, moves
+  it onto a detached ledger the runtime tracks separately from
+  `live_channel_count`, and returns; whichever operation finishes last performs
+  the real free on its own thread, and a detached channel's worker disposes of
+  its own thread handle because the thread that would have joined it has
+  already returned. `maelys_mcp_runtime_destroy` drains that ledger before it
+  frees anything, so a runtime is never released under a channel that still
+  points at it. The embedder-bound channel context can therefore outlive the
+  detaching call, and is only certainly unreachable once
+  `maelys_mcp_runtime_destroy` has returned.
 - `maelys_mcp_provider_emit_event` borrows the event payload only for the duration of
   the call. Process providers activate once when the first channel is created and
   remain active until runtime destruction.
@@ -236,6 +251,10 @@ entry; it precedes the inflight gate and is never acquired from that gate. One f
 edge exists in one direction only: a process provider's state mutex may precede a
 channel mutex, so that a provider's death can cancel the nested wait a worker is
 blocked on; nothing takes a channel mutex before a provider state mutex.
+A detached channel's real free runs on whichever thread released its last
+operation reference and takes the registry lock to retire it from the detached
+ledger, but only after releasing the channel mutex, so it walks the same
+hierarchy downwards as everything else rather than closing a cycle back up it.
 Each process provider has
 one reader thread that separates id-less events and nested requests from the one
 serialized request/response exchange. A mandatory subscription acknowledgement uses the priority lane so a

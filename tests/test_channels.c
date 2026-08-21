@@ -1378,8 +1378,391 @@ static int test_tools_list_shares_no_schema_across_channels(void) {
     return 0;
 }
 
+/*
+ * Detachable destruction. The shape every test below needs is one in-process
+ * provider call that will not return until the test says so, which is exactly
+ * the failure maelys_mcp_channel_destroy_detached exists for: a bounded close
+ * that cannot succeed, on a channel nobody can free yet.
+ */
+typedef struct stuck_provider {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    /* A count, not a flag: a test that parks two calls has to wait for the
+     * second one to arrive rather than for evidence that the first did. */
+    int entered;
+    int released;
+} stuck_provider_t;
+
+static maelys_mcp_result_t stuck_call(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    stuck_provider_t *stuck = context;
+    (void)request;
+    (void)out_error;
+    pthread_mutex_lock(&stuck->mutex);
+    stuck->entered++;
+    pthread_cond_broadcast(&stuck->changed);
+    while (!stuck->released) {
+        pthread_cond_wait(&stuck->changed, &stuck->mutex);
+    }
+    pthread_mutex_unlock(&stuck->mutex);
+    out_result->type = MAELYS_MCP_PROVIDER_RESULT_COMPLETE;
+    out_result->structured_content = json_pack("{s:b}", "ok", 1);
+    return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+}
+
+static void stuck_provider_init(stuck_provider_t *stuck) {
+    pthread_mutex_init(&stuck->mutex, NULL);
+    pthread_cond_init(&stuck->changed, NULL);
+    stuck->entered = 0;
+    stuck->released = 0;
+}
+
+static void stuck_provider_clear(stuck_provider_t *stuck) {
+    pthread_cond_destroy(&stuck->changed);
+    pthread_mutex_destroy(&stuck->mutex);
+}
+
+static void stuck_provider_await_entries(stuck_provider_t *stuck, int count) {
+    pthread_mutex_lock(&stuck->mutex);
+    while (stuck->entered < count) {
+        pthread_cond_wait(&stuck->changed, &stuck->mutex);
+    }
+    pthread_mutex_unlock(&stuck->mutex);
+}
+
+static void stuck_provider_release(stuck_provider_t *stuck) {
+    pthread_mutex_lock(&stuck->mutex);
+    stuck->released = 1;
+    pthread_cond_broadcast(&stuck->changed);
+    pthread_mutex_unlock(&stuck->mutex);
+}
+
+static maelys_mcp_runtime_t *new_stuck_runtime(
+    stuck_provider_t *stuck,
+    maelys_mcp_provider_t **out_provider) {
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "detach-test",
+        .server_version = "1",
+        .max_providers = 2u,
+        .max_subscriptions = 8u
+    };
+    maelys_mcp_runtime_t *runtime = NULL;
+    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) return NULL;
+    if (maelys_mcp_runtime_enable_module(runtime,
+            MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK) {
+        return NULL;
+    }
+    maelys_mcp_tool_t tool = {
+        .name = "detach.stuck",
+        .title = "Stuck",
+        .description = "Blocks inside the provider until the test releases it.",
+        .effect = MAELYS_MCP_EFFECT_READ
+    };
+    tool.input_schema = json_pack("{s:s}", "type", "object");
+    if (!tool.input_schema) return NULL;
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "stuck-provider", .version = "1",
+        .tools = &tool, .tool_count = 1,
+        .call = stuck_call, .context = stuck
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    maelys_mcp_result_t created = maelys_mcp_provider_create(&provider_config,
+        &provider);
+    json_decref(tool.input_schema);
+    if (created != MAELYS_MCP_OK ||
+        maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) {
+        return NULL;
+    }
+    if (out_provider) *out_provider = provider;
+    return runtime;
+}
+
+static json_t *stuck_call_request(json_int_t id) {
+    return json_pack("{s:s,s:I,s:s,s:{s:s,s:{},s:o}}",
+        "jsonrpc", "2.0", "id", id, "method", "tools/call",
+        "params", "name", "detach.stuck", "arguments", "_meta", modern_meta());
+}
+
+static maelys_mcp_channel_t *new_detach_channel(maelys_mcp_runtime_t *runtime) {
+    maelys_mcp_channel_config_t config = {
+        .max_messages = 8u,
+        .max_bytes = 1024u * 1024u,
+        .response_burst = 8u,
+        .admission_timeout_ms = 200u,
+        .close_timeout_ms = 50u
+    };
+    maelys_mcp_channel_t *channel = NULL;
+    return maelys_mcp_channel_create(runtime, &config, &channel) == MAELYS_MCP_OK ?
+        channel : NULL;
+}
+
+/*
+ * The core promise: the caller is not held hostage by the provider. The call
+ * is offloaded through maelys_mcp_channel_accept, so the operation reference
+ * that outlives the destroy is held by a worker thread - the case that cannot
+ * be fixed by joining, because the freeing thread would be joining itself.
+ */
+static int test_detached_destroy_returns_while_a_provider_is_stuck(void) {
+    stuck_provider_t stuck;
+    stuck_provider_init(&stuck);
+    maelys_mcp_runtime_t *runtime = new_stuck_runtime(&stuck, NULL);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_detach_channel(runtime);
+    ASSERT_TRUE(channel != NULL);
+    json_t *call = stuck_call_request(1);
+    ASSERT_TRUE(call != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_accept(channel, call) == MAELYS_MCP_OK);
+    json_decref(call);
+    stuck_provider_await_entries(&stuck, 1);
+
+    uint64_t started = monotonic_ms();
+    ASSERT_TRUE(started != 0u);
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+    uint64_t elapsed = monotonic_ms() - started;
+    /*
+     * Generous against a loaded CI box and still an order of magnitude below
+     * "as long as the provider takes", which is the status quo this replaces
+     * and which here is unbounded by construction.
+     */
+    ASSERT_TRUE(elapsed < 1000u);
+
+    stuck_provider_release(&stuck);
+    /* The real free happens on the worker; runtime_destroy waits for it. */
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    stuck_provider_clear(&stuck);
+    return 0;
+}
+
+/*
+ * destroy_context_t's sibling, with the one thing the drain tests need that it
+ * does not have: a flag the test can read *before* joining. The assertion these
+ * tests make is that runtime_destroy has NOT returned yet, and a join cannot
+ * express that.
+ */
+typedef struct watched_destroy_context {
+    maelys_mcp_runtime_t *runtime;
+    maelys_mcp_result_t status;
+    atomic_int returned;
+} watched_destroy_context_t;
+
+static void *watched_destroy_runtime_thread(void *opaque) {
+    watched_destroy_context_t *context = opaque;
+    context->status = maelys_mcp_runtime_destroy(context->runtime);
+    atomic_store(&context->returned, 1);
+    return NULL;
+}
+
+/*
+ * The hazard the design priced and the reason detached_channel_count exists:
+ * detaching *decrements* live_channel_count, so a runtime_destroy that only
+ * consulted that counter would free the runtime out from under a channel that
+ * still points at it. This asserts the negative - that destroy has NOT
+ * returned while the provider is stuck - which is the only form in which the
+ * bug is visible before it becomes a use-after-free.
+ */
+static int test_runtime_destroy_waits_for_a_detached_channel(void) {
+    stuck_provider_t stuck;
+    stuck_provider_init(&stuck);
+    maelys_mcp_runtime_t *runtime = new_stuck_runtime(&stuck, NULL);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_detach_channel(runtime);
+    ASSERT_TRUE(channel != NULL);
+    json_t *call = stuck_call_request(1);
+    ASSERT_TRUE(call != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_accept(channel, call) == MAELYS_MCP_OK);
+    json_decref(call);
+    stuck_provider_await_entries(&stuck, 1);
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+
+    watched_destroy_context_t context = { .runtime = runtime,
+        .status = MAELYS_MCP_OK };
+    atomic_store(&context.returned, 0);
+    pthread_t thread;
+    ASSERT_TRUE(pthread_create(&thread, NULL, watched_destroy_runtime_thread,
+        &context) == 0);
+    for (int slept = 0; slept < 20; ++slept) {
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    ASSERT_TRUE(atomic_load(&context.returned) == 0);
+
+    stuck_provider_release(&stuck);
+    ASSERT_TRUE(pthread_join(thread, NULL) == 0);
+    ASSERT_TRUE(context.status == MAELYS_MCP_OK);
+    stuck_provider_clear(&stuck);
+    return 0;
+}
+
+typedef struct inline_call_context {
+    maelys_mcp_channel_t *channel;
+    maelys_mcp_result_t status;
+} inline_call_context_t;
+
+static void *handle_stuck_call(void *opaque) {
+    inline_call_context_t *context = opaque;
+    json_t *call = stuck_call_request(1);
+    if (!call) {
+        context->status = MAELYS_MCP_ERR_MEMORY;
+        return NULL;
+    }
+    context->status = maelys_mcp_channel_handle(context->channel, call);
+    json_decref(call);
+    return NULL;
+}
+
+/*
+ * The other release path. maelys_mcp_channel_handle takes its operation
+ * reference on the caller's thread and gives it back through
+ * maelys_mcp_channel_release_operation, which is a different line of code from
+ * the worker's own decrement; both have to be able to perform the final free,
+ * and a fix applied to only one of them passes the test above.
+ */
+static int test_detached_destroy_frees_from_an_inline_operation(void) {
+    stuck_provider_t stuck;
+    stuck_provider_init(&stuck);
+    maelys_mcp_runtime_t *runtime = new_stuck_runtime(&stuck, NULL);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_detach_channel(runtime);
+    ASSERT_TRUE(channel != NULL);
+    inline_call_context_t context = { .channel = channel,
+        .status = MAELYS_MCP_OK };
+    pthread_t thread;
+    ASSERT_TRUE(pthread_create(&thread, NULL, handle_stuck_call, &context) == 0);
+    stuck_provider_await_entries(&stuck, 1);
+
+    uint64_t started = monotonic_ms();
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+    ASSERT_TRUE(monotonic_ms() - started < 1000u);
+    stuck_provider_release(&stuck);
+    ASSERT_TRUE(pthread_join(thread, NULL) == 0);
+    /* The aborted channel refused this request's output; that is the abort
+     * working, not a defect. */
+    ASSERT_TRUE(context.status != MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    stuck_provider_clear(&stuck);
+    return 0;
+}
+
+/*
+ * Nothing in flight is the common case, and it must not become the detached
+ * case: with no operation left to perform the free, a channel handed off to
+ * nobody would never be released at all. Two shapes - a clean close, and a
+ * close that times out on an undrained outbox with no operation outstanding.
+ */
+static int test_detached_destroy_frees_inline_when_nothing_is_in_flight(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(NULL) ==
+        MAELYS_MCP_ERR_ARGUMENT);
+
+    maelys_mcp_channel_t *clean = new_channel(runtime, 4u, 100u);
+    ASSERT_TRUE(clean != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(clean) == MAELYS_MCP_OK);
+    /* Freed inline, so the runtime is already destroyable. */
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+
+    runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_config_t config = {
+        .max_messages = 4u,
+        .max_bytes = 1024u * 1024u,
+        .response_burst = 8u,
+        .admission_timeout_ms = 100u,
+        .close_timeout_ms = 10u
+    };
+    maelys_mcp_channel_t *stalled = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &stalled) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(handle(stalled, listen_request(json_string("detach-stall"),
+        "test://terminal")) == MAELYS_MCP_OK);
+    json_t *ack = next_message(stalled, 1000u);
+    ASSERT_TRUE(ack != NULL);
+    json_decref(ack);
+    /* The close queues complete and no consumer drains it before the deadline,
+     * so close fails - but no operation is outstanding, so the detaching
+     * thread is itself the last reference and frees before returning. */
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(stalled) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+/*
+ * A channel the embedder already closed itself, then handed to the detaching
+ * destroy: the second call must be an ordinary free, not a second detach.
+ */
+static int test_detached_destroy_after_an_explicit_close(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(1);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_channel(runtime, 4u, 100u);
+    ASSERT_TRUE(channel != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
+    /* close is idempotent, and the destroy that follows it still frees. */
+    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    return 0;
+}
+
+/*
+ * Two channels detached at once, both stuck, released together: the drain has
+ * to be a count rather than a flag, and the last free has to be the one that
+ * wakes runtime_destroy.
+ */
+static int test_two_detached_channels_both_drain(void) {
+    stuck_provider_t stuck;
+    stuck_provider_init(&stuck);
+    maelys_mcp_runtime_t *runtime = new_stuck_runtime(&stuck, NULL);
+    ASSERT_TRUE(runtime != NULL);
+    for (int index = 0; index < 2; ++index) {
+        maelys_mcp_channel_t *channel = new_detach_channel(runtime);
+        ASSERT_TRUE(channel != NULL);
+        json_t *call = stuck_call_request(index + 1);
+        ASSERT_TRUE(call != NULL);
+        ASSERT_TRUE(maelys_mcp_channel_accept(channel, call) == MAELYS_MCP_OK);
+        json_decref(call);
+        stuck_provider_await_entries(&stuck, index + 1);
+        ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) ==
+            MAELYS_MCP_ERR_TIMEOUT);
+    }
+    watched_destroy_context_t context = { .runtime = runtime,
+        .status = MAELYS_MCP_OK };
+    atomic_store(&context.returned, 0);
+    pthread_t thread;
+    ASSERT_TRUE(pthread_create(&thread, NULL, watched_destroy_runtime_thread,
+        &context) == 0);
+    for (int slept = 0; slept < 10; ++slept) {
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    ASSERT_TRUE(atomic_load(&context.returned) == 0);
+    stuck_provider_release(&stuck);
+    ASSERT_TRUE(pthread_join(thread, NULL) == 0);
+    ASSERT_TRUE(context.status == MAELYS_MCP_OK);
+    stuck_provider_clear(&stuck);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
+        {"detached destroy returns while a provider is stuck",
+            test_detached_destroy_returns_while_a_provider_is_stuck},
+        {"runtime destroy waits for a detached channel",
+            test_runtime_destroy_waits_for_a_detached_channel},
+        {"detached destroy frees from an inline operation",
+            test_detached_destroy_frees_from_an_inline_operation},
+        {"detached destroy frees inline when nothing is in flight",
+            test_detached_destroy_frees_inline_when_nothing_is_in_flight},
+        {"detached destroy after an explicit close",
+            test_detached_destroy_after_an_explicit_close},
+        {"two detached channels both drain",
+            test_two_detached_channels_both_drain},
         {"same JSON-RPC id is isolated with exact fanout",
             test_same_id_isolation_and_exact_fanout},
         {"slow channel fault is local", test_slow_channel_fault_is_local},

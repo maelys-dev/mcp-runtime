@@ -132,6 +132,39 @@ maelys_mcp_result_t maelys_mcp_channel_close(
 maelys_mcp_result_t maelys_mcp_channel_destroy(
     maelys_mcp_channel_t *channel);
 
+/*
+ * As maelys_mcp_channel_destroy, except that it never waits without a bound.
+ *
+ * maelys_mcp_channel_destroy answers a bounded close that missed its deadline
+ * by waiting for the channel to drain however long that takes, because the
+ * alternative - freeing at the deadline, while workers still hold the
+ * channel's mutex and outbox - is a use-after-free. That is the right trade
+ * for a transport that destroys one channel at process exit. It is the wrong
+ * trade for a transport that destroys a channel per request, where one wedged
+ * in-process provider would park the calling thread, and whatever the caller
+ * was holding for it, for as long as the provider takes.
+ *
+ * This entry point makes the same guarantee without the wait. When the
+ * bounded close misses its deadline the channel is aborted, taken out of the
+ * runtime immediately, and marked detached; this call then returns
+ * MAELYS_MCP_ERR_TIMEOUT, and whichever in-flight operation finishes last
+ * performs the real free on its own thread. The handle is consumed either
+ * way, exactly as with maelys_mcp_channel_destroy, and must never be used or
+ * destroyed again.
+ *
+ * The channel's context (maelys_mcp_channel_config_t::context) may therefore
+ * outlive this call. An embedder that frees what it designates must do so from
+ * the runtime it detached the channel into, after
+ * maelys_mcp_runtime_destroy - which waits for every detached channel - and
+ * not on the return from this call.
+ *
+ * MAELYS_MCP_OK means the channel closed cleanly and was freed before this
+ * returned; there is nothing outstanding. Any other status is the bounded
+ * close's, and the free may still be pending.
+ */
+maelys_mcp_result_t maelys_mcp_channel_destroy_detached(
+    maelys_mcp_channel_t *channel);
+
 #ifdef __cplusplus
 }
 #endif
