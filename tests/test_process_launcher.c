@@ -165,6 +165,15 @@ static void fake_launcher_init(fake_launcher_t *fake, fake_behaviour_t behaviour
     (void)pthread_mutex_init(&fake->mutex, NULL);
 }
 
+/* Read under the mutex: a graceful stop clears this from the ladder's thread
+ * while the server thread is deciding whether to outlive its transport. */
+static int child_ignores_graceful(fake_child_t *child) {
+    pthread_mutex_lock(&child->mutex);
+    int ignores = child->ignores_graceful;
+    pthread_mutex_unlock(&child->mutex);
+    return ignores;
+}
+
 static int child_should_stop(fake_child_t *child) {
     pthread_mutex_lock(&child->mutex);
     int stop = child->stop_requested;
@@ -250,7 +259,7 @@ static json_t *native_describe_result(void) {
  * Returns non-zero when the loop should end.
  */
 static int child_survives_eof(fake_child_t *child) {
-    if (!child->ignores_graceful) return 0;
+    if (!child_ignores_graceful(child)) return 0;
     while (!child_should_stop(child)) {
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 5000000L};
         while (nanosleep(&pause, &pause) != 0) {}
@@ -296,7 +305,7 @@ static void *native_server_main(void *opaque) {
                 "resultType", "complete",
                 "content", "type", "text", "text", "ok");
         } else if (method && strcmp(method, "provider/shutdown") == 0) {
-            if (child->ignores_graceful) {
+            if (child_ignores_graceful(child)) {
                 /* Deaf to every polite request, protocol and signal alike -
                  * the same shape as the stubborn fixture the POSIX half of
                  * this case uses, and the only way the ladder's second rung is
@@ -529,7 +538,8 @@ static maelys_mcp_result_t fake_stop(
     pthread_mutex_unlock(&fake->mutex);
     fake_child_t *child = resolve_child(fake, handle);
     if (!child) return MAELYS_MCP_OK;
-    if (mode == MAELYS_MCP_PROCESS_STOP_GRACEFUL && child->ignores_graceful) {
+    if (mode == MAELYS_MCP_PROCESS_STOP_GRACEFUL &&
+        child_ignores_graceful(child)) {
         /* A child that ignores the polite request, which is the only reason
          * the second rung exists. */
         return MAELYS_MCP_OK;
