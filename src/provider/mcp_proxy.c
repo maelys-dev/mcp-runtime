@@ -729,6 +729,15 @@ static maelys_mcp_result_t spawn_upstream(
         if (sockets[1] != STDIN_FILENO && sockets[1] != STDOUT_FILENO) {
             close(sockets[1]);
         }
+        /* dup2 with oldfd == newfd is a POSIX no-op that leaves FD_CLOEXEC
+         * set - execve would then close the protocol end, and the child
+         * would start with stdin or stdout already gone. The line above
+         * guards that same edge case for the close; this clears the flag.
+         * For the common oldfd != newfd case dup2 already cleared it and
+         * this is a harmless second clear. */
+        if (fcntl(STDIN_FILENO, F_SETFD, 0) != 0 ||
+            fcntl(STDOUT_FILENO, F_SETFD, 0) != 0) _exit(126);
+
         /* Same scrubbed environment the process provider hands its children:
          * an upstream inherits no ambient credentials from this process. */
         char *const environment[] = {
