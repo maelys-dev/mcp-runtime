@@ -421,6 +421,21 @@ static const char *const H_CALL_NAME_SHORT_PATTERN[] = CALL_HEADERS("=?base64?="
 static const char *const H_CALL_NAME_COLLISION_RAW[] = CALL_HEADERS("=?base64?QQ==?=");
 static const char *const H_CALL_NAME_COLLISION_ENCODED[] =
     CALL_HEADERS("=?base64?PT9iYXNlNjQ/UVE9PT89?=");
+/*
+ * A payload that uses every boundary of the Base64 alphabet - 'A', 'Z', 'a',
+ * 'z', '0', '9', '+' and '/' all appear in it - and decodes to clean UTF-8.
+ *
+ * It exists because mutating base64_value's range tests one boundary at a time
+ * (`c >= 'A'` to `c > 'A'`, `c <= 'Z'` to `c < 'Z'`, and so on) SURVIVED a
+ * matrix whose every other payload happened to avoid those six characters. A
+ * decoder that silently stops recognising 'A' is a decoder that mis-decodes a
+ * name, and nothing here noticed.
+ */
+#define ALPHABET_NAME "<5}RXZP~E?B@ss?pK~kzCKu2g6KL<b<SQ_woiouF8<f"
+#define ALPHABET_B64 "PDV9UlhaUH5FP0JAc3M/cEt+a3pDS3UyZzZLTDxiPFNRX3dvaW91Rjg8Zg=="
+static const char *const H_CALL_NAME_ALPHABET[] =
+    CALL_HEADERS("=?base64?" ALPHABET_B64 "?=");
+
 /* Prefix without suffix: not a sentinel, so it is compared literally. */
 static const char *const H_CALL_NAME_PREFIX_ONLY[] = CALL_HEADERS("=?base64?c2VhcmNo");
 /* The URL-safe spelling of "fn5+", which is base64 for "~~~". */
@@ -627,6 +642,13 @@ static const matrix_case_t MATRIX[] = {
      "URL-safe spelling that would otherwise decode to the body's name",
      H_CALL_NAME_URLSAFE_DECODABLE,
      REQ("tools/call", "\"name\":\"~~~\"," META), 400, -32020, 1, NULL},
+
+    {"every boundary of the Base64 alphabet decodes to the byte it names",
+     "payload using A, Z, a, z, 0, 9, + and /", H_CALL_NAME_ALPHABET,
+     REQ("tools/call", "\"name\":\"" ALPHABET_NAME "\"," META), 503, 0, 0, NULL},
+    {"one wrong byte out of that payload is still a mismatch",
+     "alphabet payload against a different name", H_CALL_NAME_ALPHABET,
+     REQ("tools/call", "\"name\":\"" ALPHABET_NAME "x\"," META), 400, -32020, 1, NULL},
 
     /* --- the happy path --- */
     {"a request that satisfies every rule reaches the placeholder",
