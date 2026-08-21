@@ -47,10 +47,24 @@
   a `socketpair` landing on fds 0/1 produced a provider whose protocol end
   was closed by `execve` — dead before describe. The flag is now cleared
   explicitly, and a forked test pins the exact scenario.
+- **A native provider's stdout can no longer corrupt the protocol — at the
+  kernel level.** The new `ISOLATED` launch layout hands the child its
+  protocol on fd 3 (announced via `MAELYS_PROVIDER_FD`) and wires its
+  stdout to stderr before exec, so a stray `printf`, `fs.writeSync(1)` or
+  native-extension write in ANY language lands in diagnostics, never in
+  the protocol stream. All three SDKs adopt the descriptor automatically
+  and are byte-identical when it is absent; an old SDK launched ISOLATED
+  fails fast and cleanly instead of hanging. Native providers only —
+  a third-party MCP upstream speaks stdin/stdout by specification, so the
+  proxy is structurally excluded. Off by default this release (embedder
+  API only); the TypeScript SDK additionally redirects
+  `process.stdout.write` to stderr in every layout, as defense in depth
+  with its limits documented.
 - The 0.17 design cycle's documents ship in-tree: the process launch
   contract (`docs/launch-contract-design.md`, implemented above through
-  M4.5) and the security model's new "process externality" section. The
-  HTTP transport and authenticated-principal designs remain under review.
+  M4.5 and the ISOLATED layout) and the security model's new "process
+  externality" section. The HTTP transport and authenticated-principal
+  designs remain under review.
 
 ## 0.16.0 - 2026-08-21
 
