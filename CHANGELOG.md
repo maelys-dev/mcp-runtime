@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.18.0 - 2026-08-21
+
+- **API break (ABI 3 → 4): the channel config now owns eras and context
+  lifetime.** `maelys_mcp_channel_config_t` gains three fields:
+  `protocol_eras` (which MCP eras this channel serves — zero keeps today's
+  both-eras behaviour, so an existing zero-initialized config is unchanged),
+  and `context_release` + `release_context` — a callback the runtime invokes
+  **exactly once** when the channel's storage is really freed, on the
+  synchronous and the detached destruction path alike. That closes the gap
+  that made a per-request transport unable to release an authenticated
+  principal at the right moment: the last in-flight operation of a detached
+  channel now frees the principal, not a runtime-wide teardown hours later.
+  **Migration**: set `protocol_eras` in the config instead of calling
+  `maelys_mcp_channel_set_protocol_eras`, which is removed with its
+  call-order rules. See `docs/abi-policy.md` and
+  `docs/authenticated-principal-design.md`.
+- **A transport can now wait on a socket and a channel's output with one
+  poll.** The outbox gains a lazily created wait descriptor (internal seam
+  for now): readable exactly when output is pending or the channel stopped
+  accepting, one wakeup byte per idle-to-busy transition, nothing allocated
+  and nothing written unless a transport enables it — stdio pays zero. This
+  is the mechanism that makes HTTP request cancellation genuinely
+  observable, shipped ahead of the transport that will use it.
+- The authenticated-transport-principal contract ships in-tree
+  (`docs/authenticated-principal-design.md`): how an HTTP-era principal is
+  established per request, bound to the channel context at creation, and
+  released by the runtime — never derived from client-controlled fields.
+  The HTTP transport design that consumes it remains under review for 0.19.
+
 ## 0.17.0 - 2026-08-21
 
 - **Every child process now starts through one injectable launch seam.** An
