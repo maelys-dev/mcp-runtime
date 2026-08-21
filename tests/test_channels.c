@@ -3,6 +3,7 @@
 #include "tests/test_support.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1387,10 +1388,12 @@ static int test_tools_list_shares_no_schema_across_channels(void) {
 typedef struct stuck_provider {
     pthread_mutex_t mutex;
     pthread_cond_t changed;
-    /* A count, not a flag: a test that parks two calls has to wait for the
-     * second one to arrive rather than for evidence that the first did. */
+    /* Counts, not flags. A test that parks two calls has to wait for the
+     * second one to arrive rather than for evidence that the first did, and
+     * the mixed case needs to let exactly one of them go. Each call takes a
+     * ticket on entry and leaves once release_through has reached it. */
     int entered;
-    int released;
+    int release_through;
 } stuck_provider_t;
 
 static maelys_mcp_result_t stuck_call(
@@ -1402,9 +1405,9 @@ static maelys_mcp_result_t stuck_call(
     (void)request;
     (void)out_error;
     pthread_mutex_lock(&stuck->mutex);
-    stuck->entered++;
+    int ticket = ++stuck->entered;
     pthread_cond_broadcast(&stuck->changed);
-    while (!stuck->released) {
+    while (stuck->release_through < ticket) {
         pthread_cond_wait(&stuck->changed, &stuck->mutex);
     }
     pthread_mutex_unlock(&stuck->mutex);
@@ -1417,7 +1420,7 @@ static void stuck_provider_init(stuck_provider_t *stuck) {
     pthread_mutex_init(&stuck->mutex, NULL);
     pthread_cond_init(&stuck->changed, NULL);
     stuck->entered = 0;
-    stuck->released = 0;
+    stuck->release_through = 0;
 }
 
 static void stuck_provider_clear(stuck_provider_t *stuck) {
@@ -1433,11 +1436,32 @@ static void stuck_provider_await_entries(stuck_provider_t *stuck, int count) {
     pthread_mutex_unlock(&stuck->mutex);
 }
 
-static void stuck_provider_release(stuck_provider_t *stuck) {
+static void stuck_provider_release_through(
+    stuck_provider_t *stuck,
+    int ticket) {
     pthread_mutex_lock(&stuck->mutex);
-    stuck->released = 1;
+    stuck->release_through = ticket;
     pthread_cond_broadcast(&stuck->changed);
     pthread_mutex_unlock(&stuck->mutex);
+}
+
+static void stuck_provider_release(stuck_provider_t *stuck) {
+    stuck_provider_release_through(stuck, INT_MAX);
+}
+
+/* Spins until the channel reports `expected` operation references, so a test
+ * can tell "the worker has finished" from "the worker is about to". Returns
+ * non-zero on success. */
+static int await_operations(maelys_mcp_channel_t *channel, size_t expected) {
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        pthread_mutex_lock(&channel->mutex);
+        size_t inflight = channel->operations_inflight;
+        pthread_mutex_unlock(&channel->mutex);
+        if (inflight == expected) return 1;
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    return 0;
 }
 
 static maelys_mcp_runtime_t *new_stuck_runtime(
@@ -1749,8 +1773,55 @@ static int test_two_detached_channels_both_drain(void) {
     return 0;
 }
 
+/*
+ * The mixed case, and the only shape in which both halves of the worker
+ * hand-off run at once: one worker has already finished when the detach
+ * happens and one is still inside the provider. The finished slot is the
+ * detacher's to join; the running one disposes of its own handle at its tail.
+ * Getting the exclusivity wrong either leaves a thread nobody disposes of or
+ * disposes of one twice, and neither is reachable with a single worker.
+ *
+ * The close has to fail on the *operations* drain rather than on the outbox,
+ * because maelys_mcp_channel_close reaps finished workers itself once the
+ * drain succeeds - so a channel that closed cleanly never reaches the detach
+ * with a finished slot still in the array.
+ */
+static int test_detached_destroy_joins_a_finished_worker(void) {
+    stuck_provider_t stuck;
+    stuck_provider_init(&stuck);
+    maelys_mcp_runtime_t *runtime = new_stuck_runtime(&stuck, NULL);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_t *channel = new_detach_channel(runtime);
+    ASSERT_TRUE(channel != NULL);
+    for (int index = 0; index < 2; ++index) {
+        json_t *call = stuck_call_request(index + 1);
+        ASSERT_TRUE(call != NULL);
+        ASSERT_TRUE(maelys_mcp_channel_accept(channel, call) == MAELYS_MCP_OK);
+        json_decref(call);
+    }
+    stuck_provider_await_entries(&stuck, 2);
+    ASSERT_TRUE(await_operations(channel, 2u));
+    /* Let exactly the first one out. Its slot is now active-and-finished, and
+     * nothing has reaped it: reap_workers runs from accept and from a close
+     * that drained, and neither has happened. */
+    stuck_provider_release_through(&stuck, 1);
+    ASSERT_TRUE(await_operations(channel, 1u));
+
+    uint64_t started = monotonic_ms();
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+    ASSERT_TRUE(monotonic_ms() - started < 1000u);
+
+    stuck_provider_release(&stuck);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    stuck_provider_clear(&stuck);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
+        {"detached destroy joins a finished worker and detaches a running one",
+            test_detached_destroy_joins_a_finished_worker},
         {"detached destroy returns while a provider is stuck",
             test_detached_destroy_returns_while_a_provider_is_stuck},
         {"runtime destroy waits for a detached channel",
