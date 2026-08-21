@@ -1,6 +1,40 @@
 # Process launch contract — design
 
-> **Status: design only. Nothing here is implemented.** This document
+> **Status: M4.1 to M4.4 are implemented; M4.5 and M4.6 are not.** The seam, the
+> POSIX launcher, both consumers, the boundary rule, the public API and the
+> conformance suite are in the tree (`src/process/`,
+> `include/maelys/mcp/process_launcher.h`, `tests/test_process_launcher.c`).
+> Manifest v2 — `args` and `executionProfile` — is not, so `execution_profile` is
+> carried by the spec and enforced by the POSIX launcher but has no manifest key
+> feeding it yet. The `ISOLATED` descriptor layout is not implemented either, and
+> its enumerator is deliberately absent rather than declared-and-refused: an
+> enumerator no launcher accepts would advertise an arrangement that does not
+> exist. Adding it later is additive.
+>
+> **Two deviations from the phasing table below, both deliberate.**
+> M4.2's row says `MAELYS_MCP_ABI_VERSION` → 4; it stayed at 3, because
+> everything M4.2 added is a new structure reached by a new entry point with every
+> released layout untouched, which `docs/abi-policy.md:38-46` names as this
+> project's preferred idiom. Bumping the constant would have announced a break
+> that did not happen and forced every embedder to re-check a version for nothing.
+> And M4.1's ladder work could not be deferred to M4.3: the seam has no unbounded
+> operation, so the moment both teardowns went through it their blocking
+> `waitpid` calls had to become the bounded ladder. M4.3 is therefore verification
+> and tests rather than new mechanism, which is what its section already predicted
+> ("Most of this exists").
+>
+> One line of the M4.3 contract could not be honoured as written, and the
+> implementation says so where it happens: the containment diagnostic is
+> propagated by `maelys_mcp_process_shutdown`, but the provider teardown that
+> calls it is `void` all the way up through `maelys_mcp_provider_destroy`, so
+> there is no caller left to hand it to. The suite pins the ladder's own return
+> instead, at the level where a caller does exist.
+>
+> Everything below is the design as approved, unedited — including the original
+> preamble, which is kept as written rather than rewritten in place so that what
+> was decided before any code can still be read separately from what was built.
+
+> **Original preamble (written before implementation).** This document
 > specifies the seam through which every child process this runtime starts
 > will be launched, the manifest evolution that configures it, and the phasing
 > that gets there. It is written now, before any code, so that the decisions

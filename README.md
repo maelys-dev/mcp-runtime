@@ -127,6 +127,7 @@ This installs the public headers, static library, host executable, and
 include/maelys/mcp/  public C API
 src/core/            MCP core, middleware chain, content, URI and schema validation
 src/modules/         capability registry, Tools, Resources, MRTR and Subscriptions
+src/process/         the one process launch seam and its POSIX launcher
 src/provider/        in-process, process-provider and MCP proxy adapters
 src/transport/       MCP transports
 host/                maelys-mcp executable

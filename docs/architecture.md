@@ -103,6 +103,39 @@ catalog entry cannot be transformed back into view. Arguments are validated
 against the real tool's schema, on `on_resolve`'s output. See
 `docs/middleware.md`.
 
+## Process launch boundary
+
+Every child process this runtime starts - a native `maelys-provider` binary and an
+`mcp-proxy` upstream alike - is started through one seam,
+`maelys/mcp/process_launcher.h`, implemented by whatever launcher the embedder binds.
+The four operations are start it, has it exited, signal it, release it. The stock
+`maelys_mcp_posix_launcher()` reproduces what both providers used to do for
+themselves: a socketpair, a fork, the peer end on the child's stdin and stdout, a
+closed-allowlist environment, `execve`.
+
+The seam exists for confinement rather than for tidiness. A sandboxing policy
+enforcement point that governed native providers but not proxied upstreams would
+govern nothing, because a manifest can already declare an arbitrary program as an
+upstream. So `scripts/audit_boundaries.sh` forbids `fork`, `execve`, `posix_spawn`,
+`waitpid` and `socketpair` anywhere outside `src/process/`: a second launch site
+cannot merge. The design and its reasoning are `docs/launch-contract-design.md`.
+
+Three consequences are load-bearing above the seam:
+
+- **The runtime holds no pid.** It holds an opaque handle it never dereferences, and
+  its only liveness signal is EOF on the protocol descriptor. That is what lets a
+  container id or a remote executord ticket stand in for a local process with no
+  change here. `NULL` is a valid handle, so exactly-once teardown is tracked by an
+  explicit `instance_live` flag rather than by handle nullity.
+- **Teardown is bounded at every rung**, including the last: `stop(GRACEFUL)` ->
+  `wait(grace)` -> `stop(FORCED)` -> `wait(force)` -> `destroy`, where destroy is
+  local release only and cannot wait for anything. A child that outlives a forced
+  stop is reported as a containment failure and left behind; the alternative is an
+  unkillable host with no message.
+- **The protocol goodbye stays above the seam** and is not unified: a native provider
+  gets a `provider/shutdown` exchange, an MCP upstream gets a half-close, because
+  those are protocol facts rather than launch facts.
+
 ## Protocol eras
 
 The same dispatcher supports:
