@@ -20,8 +20,16 @@
  *
  * And over everything, the shape invariant: whatever the bytes, the writer is
  * driven exactly once in JSON mode and the status is one the design allows.
+ *
+ * H3 NOTE. The adapter dispatches now, so this target carries a runtime - one,
+ * created once and reused, with NO modules enabled. That is deliberate rather
+ * than lazy: a request that survives validation then reaches method routing and
+ * is answered "method not found", which is a 404 that costs one channel and no
+ * provider. So "accepted" reads as 404 here and "refused" reads as 400, and the
+ * two are still exactly as far apart as they were when the second was 503.
  */
 #include "maelys/mcp/http.h"
+#include "maelys/mcp/runtime.h"
 
 #include <assert.h>
 #include <stddef.h>
@@ -183,10 +191,25 @@ static int looks_like_sentinel(const char *value, size_t length) {
         value[length - 2u] == '?' && value[length - 1u] == '=';
 }
 
+/* One runtime for the whole campaign. Creating one per iteration would spend
+ * the campaign in provider activation rather than in the decoder under test. */
+static maelys_mcp_runtime_t *shared_runtime(void) {
+    static maelys_mcp_runtime_t *runtime = NULL;
+    if (runtime) return runtime;
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "http-headers-fuzz",
+        .server_version = "0.0.0"
+    };
+    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) return NULL;
+    return runtime;
+}
+
 static int drive(const char *header_name, const char *body, int *out_status) {
+    maelys_mcp_runtime_t *runtime = shared_runtime();
+    if (!runtime) return 0;
     maelys_mcp_http_adapter_t *adapter = NULL;
-    if (maelys_mcp_http_adapter_create(
-            MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &adapter) != MAELYS_MCP_OK) {
+    maelys_mcp_http_adapter_config_t adapter_config = {.runtime = runtime};
+    if (maelys_mcp_http_adapter_create(&adapter_config, &adapter) != MAELYS_MCP_OK) {
         return 0;
     }
     headers_t headers = {
@@ -202,7 +225,8 @@ static int drive(const char *header_name, const char *body, int *out_status) {
         .body = body,
         .body_length = strlen(body),
         .principal = NULL,
-        .cancel_fd = -1
+        .cancel_fd = -1,
+        .shutdown_fd = -1
     };
     recorder_t recorder = {0};
     maelys_mcp_http_response_writer_t writer = {
@@ -223,9 +247,10 @@ static int drive(const char *header_name, const char *body, int *out_status) {
     assert(recorder.begin_stream_calls == 0);
     assert(recorder.status_only_calls == 0);
     assert(recorder.end_stream_calls == 0);
-    /* 400 is a refusal; 503 is the H2 placeholder for a request that passed
-     * validation. Nothing else is reachable from this layer. */
-    assert(recorder.status == 400 || recorder.status == 503);
+    /* 400 is a refusal; 404 is a request that passed validation and reached a
+     * runtime with no module that claims tools/call. Nothing else is reachable
+     * from a body this file is the only writer of. */
+    assert(recorder.status == 400 || recorder.status == 404);
     *out_status = recorder.status;
     return 1;
 }
@@ -254,7 +279,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         memcpy(header, name, name_length + 1u);
         if (!drive(header, body, &status)) return 0;
         if (!looks_like_sentinel(name, name_length)) {
-            assert(status == 503);
+            assert(status == 404);
         }
         return 0;
     }
@@ -268,7 +293,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         int written = snprintf(header, sizeof(header), "=?base64?%s?=", encoded);
         if (written < 0 || (size_t)written >= sizeof(header)) return 0;
         if (!drive(header, body, &status)) return 0;
-        assert(status == 503);
+        assert(status == 404);
         return 0;
     }
 
