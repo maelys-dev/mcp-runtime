@@ -954,6 +954,26 @@ static maelys_mcp_result_t drain_gracefully(drain_state_t *state) {
  * further messages for it" therefore holds by construction rather than by
  * discipline. Whether the PROVIDER stops is the provider's own timeout, and
  * this does not shorten it.
+ *
+ * WHAT THE ABORT IS AND IS NOT LOAD-BEARING FOR, because a mutation that
+ * deleted it survived the whole suite and the reason is worth recording rather
+ * than papering over. It is NOT what stops the bytes: the drain loop has
+ * already left, so nothing would write whatever the channel produced next
+ * either way. It is NOT what frees the slot: the destroy below is bounded by
+ * its own deadline and aborts on the way past it, so the end state is the same
+ * a moment later. It IS an EARLINESS guarantee, and it buys two things that
+ * arrive at the deadline instead without it:
+ *
+ *   - sink->cancelled() answers 1 NOW, so a provider that polls its reporter
+ *     can return early. That is the spec's SHOULD, and the only mechanism this
+ *     runtime has for it;
+ *   - the channel is faulted before the close, so the close skips completing
+ *     surviving subscriptions - a peer that has gone is not owed a
+ *     `resultType: "complete"` nobody will read.
+ *
+ * Neither is observable through this transport without asserting on a
+ * duration, and a timing gate in CI is a flakiness source this repository has
+ * already decided against (tests/test_channel_perf.c).
  */
 static maelys_mcp_result_t abandon(drain_state_t *state) {
     maelys_mcp_channel_abort(state->channel);

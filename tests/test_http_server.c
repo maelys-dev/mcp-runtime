@@ -99,9 +99,16 @@ static maelys_mcp_result_t emitting_call(
         (void)written;
     }
     if (state->hold_read >= 0) {
+        /*
+         * Far longer than any deadline in this suite, deliberately. If the hold
+         * could expire inside a test's window then "the slot was freed" would
+         * have two possible causes, and the test would pass for the wrong one -
+         * which is exactly how a mutation that deleted the socket watcher
+         * survived an earlier version of this file.
+         */
         struct pollfd descriptor = {
             .fd = state->hold_read, .events = POLLIN, .revents = 0};
-        (void)poll(&descriptor, 1u, 5000);
+        (void)poll(&descriptor, 1u, 30000);
         /* Attempted AFTER the wait, which is the only ordering that proves
          * anything: whatever happened to this exchange happened while this call
          * was blocked. */
@@ -1185,6 +1192,50 @@ static ssize_t read_until(int fd, char *buffer, size_t capacity,
     return (ssize_t)total;
 }
 
+/*
+ * Reads to EOF, bounded by a TOTAL deadline rather than by a per-poll one.
+ *
+ * read_response's timeout is per poll, which is right for a reply that ends,
+ * and wrong for asserting that a stream stopped: a stream that did NOT stop
+ * keeps a keep-alive arriving inside every poll window, so the reader runs
+ * until its buffer fills. That is not a failure, it is a slow failure - a
+ * mutation that removed the cancellation took three minutes to be noticed
+ * instead of two seconds, and a test whose failure mode is a timeout is a test
+ * that will one day be disabled for being slow.
+ */
+static ssize_t read_to_eof(int fd, char *buffer, size_t capacity, int timeout_ms,
+    int *out_saw_eof) {
+    size_t total = 0;
+    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
+    buffer[0] = '\0';
+    if (out_saw_eof) *out_saw_eof = 0;
+    for (;;) {
+        uint64_t now = now_ms();
+        if (now >= deadline) break;
+        struct pollfd descriptor = {.fd = fd, .events = POLLIN, .revents = 0};
+        int ready = poll(&descriptor, 1u, (int)(deadline - now));
+        if (ready <= 0) break;
+        ssize_t got = recv(fd, buffer + total, capacity - total - 1u, 0);
+        if (got == 0) {
+            /*
+             * The server closed, which is the END the caller is asking about
+             * and not merely the absence of more bytes. Reporting it separately
+             * is what lets a test say "the stream stopped" rather than "the
+             * stream was quiet for a while" - and on this transport those are
+             * very different claims, because a stream that did not stop keeps a
+             * keep-alive arriving inside every window a reader might wait.
+             */
+            if (out_saw_eof) *out_saw_eof = 1;
+            break;
+        }
+        if (got < 0) break;
+        total += (size_t)got;
+        buffer[total] = '\0';
+        if (total + 1u >= capacity) break;
+    }
+    return (ssize_t)total;
+}
+
 /* The byte offset of `needle` in `haystack`, or -1. Ordering assertions are
  * made on offsets rather than on presence, because "both arrived" is also what
  * an out-of-order stream looks like. */
@@ -1369,8 +1420,18 @@ static int a_client_disconnect_cancels_the_call(void) {
 
     /* Read to EOF. Whatever arrives after the FIN is the thing under test. */
     char after[16384];
-    ssize_t tail = read_response(fd, after, sizeof(after), 2000);
+    int saw_eof = 0;
+    ssize_t tail = read_to_eof(fd, after, sizeof(after), 1500, &saw_eof);
     ASSERT_TRUE(tail >= 0);
+    /*
+     * The server CLOSED the connection, and this is the assertion that says the
+     * cancellation happened at all. Everything else here is about what was not
+     * written, and "nothing more was written" is indistinguishable from "the
+     * stream is still open and quiet" unless the end is observed. It is not
+     * quiet, either: an uncancelled stream keeps sending keep-alives, so a
+     * reader would go on collecting them until its buffer filled.
+     */
+    ASSERT_TRUE(saw_eof);
     /* No terminal chunk, ever: a chunked body that ends without one is how
      * HTTP/1.1 says "truncated", and 0\r\n\r\n would have told this client the
      * cancelled call completed normally. */
@@ -1387,7 +1448,13 @@ static int a_client_disconnect_cancels_the_call(void) {
      * last worker, so a network peer cannot hold a slot for as long as a
      * provider takes.
      */
-    uint64_t deadline = now_ms() + 3000u;
+    /*
+     * Loose against the correct behaviour and tight against the wedged
+     * provider: a cancelled exchange lets its slot go within the close deadline
+     * (200 ms here), and the provider is held for thirty seconds, so this
+     * window can only be satisfied by the cancellation path.
+     */
+    uint64_t deadline = now_ms() + 1500u;
     int freed = 0;
     while (!freed) {
         if (now_ms() >= deadline) break;
@@ -1470,7 +1537,10 @@ static int a_listen_stream_is_opened_and_closed_by_the_client(void) {
     /* The client ends it. Half-closed, so the truncation is observable. */
     ASSERT_TRUE(shutdown(fd, SHUT_WR) == 0);
     char after[16384];
-    ASSERT_TRUE(read_response(fd, after, sizeof(after), 2000) >= 0);
+    int saw_eof = 0;
+    ASSERT_TRUE(read_to_eof(fd, after, sizeof(after), 1500, &saw_eof) >= 0);
+    /* The server closed rather than went quiet - see the disconnect test. */
+    ASSERT_TRUE(saw_eof);
     /* Cut, not completed: no terminal chunk and no resultType complete. A
      * client that walked away is not owed an ending it will not read. */
     ASSERT_TRUE(strstr(after, "0\r\n\r\n") == NULL);
@@ -1506,7 +1576,8 @@ static int shutdown_completes_an_open_listen_stream(void) {
     ASSERT_TRUE(maelys_http_server_stop(server) == MAELYS_MCP_OK);
 
     char closing[8192];
-    ssize_t got = read_response(fd, closing, sizeof(closing), 2000);
+    int saw_eof = 0;
+    ssize_t got = read_to_eof(fd, closing, sizeof(closing), 2000, &saw_eof);
     close(fd);
     ASSERT_TRUE(got > 0);
     /* The completion, and then the terminal chunk. A cancellation would have

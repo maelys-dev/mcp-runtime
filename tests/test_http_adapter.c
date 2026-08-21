@@ -1681,6 +1681,73 @@ static int a_cancel_before_the_first_frame_writes_nothing(void) {
 }
 
 /*
+ * maelys_mcp_http_exchange_cancel works even when the embedder supplied a
+ * cancellation DESCRIPTOR and never made it readable.
+ *
+ * The two are not alternatives that happen to overlap. A descriptor is how an
+ * embedder that owns a socket cancels; the entry point is how one that does not
+ * cancels; and an embedder is free to hold a descriptor and still call the
+ * function - a deadline reaper, say, that has no reason to touch the connection
+ * thread's pipe. Because no wakeup pipe is allocated when a descriptor was
+ * supplied, the recorded flag is then the ONLY signal, and something has to
+ * consult it rather than wait for descriptor readiness that will never come.
+ *
+ * Mutation found this: deleting the flag check at the top of the drain's wait
+ * left every other test green, because all of them raise a descriptor. Under
+ * that mutant this exchange never ends.
+ */
+static maelys_mcp_result_t cancel_on_the_second_keepalive(void *context) {
+    shutdown_writer_t *writer = context;
+    maelys_mcp_result_t status = record_keepalive(&writer->recording);
+    if (writer->recording.keepalive_calls == 2) {
+        maelys_mcp_http_exchange_cancel(*writer->exchange);
+    }
+    return status;
+}
+
+static int an_out_of_band_cancel_works_without_a_readable_descriptor(void) {
+    /* Supplied and never raised, which is what makes the flag load-bearing. */
+    int quiet[2] = {-1, -1};
+    ASSERT_TRUE(pipe(quiet) == 0);
+    tool_state_t tools = {.entered_write = -1, .hold_read = -1};
+    maelys_mcp_runtime_t *runtime = serving_runtime(&tools);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_http_adapter_config_t config = {
+        .runtime = runtime,
+        .close_timeout_ms = 1000u,
+        .keepalive_interval_ms = 10u
+    };
+    maelys_mcp_http_adapter_t *adapter = NULL;
+    ASSERT_TRUE(maelys_mcp_http_adapter_create(&config, &adapter) == MAELYS_MCP_OK);
+    static const char *const listen_headers[] = {
+        "MCP-Protocol-Version", "2026-07-28",
+        "Mcp-Method", "subscriptions/listen",
+        NULL
+    };
+    static const char listen_body[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"subscriptions/listen\","
+        "\"params\":{\"notifications\":{\"resourceSubscriptions\":"
+        "[\"fx://repo/doc.txt\"]}," MODERN_META "}}";
+    slice_headers_t headers = {.pairs = listen_headers};
+    maelys_mcp_http_request_t request = make_request(&headers, listen_body);
+    request.cancel_fd = quiet[0];
+    maelys_mcp_http_exchange_t *exchange = NULL;
+    shutdown_writer_t state = {.recording = {0}, .exchange = &exchange};
+    maelys_mcp_http_response_writer_t writer = make_writer(&state.recording);
+    writer.context = &state;
+    writer.write_keepalive = cancel_on_the_second_keepalive;
+    ASSERT_TRUE(maelys_mcp_http_adapter_handle(adapter, &request, &writer, &exchange) ==
+        MAELYS_MCP_ERR_CLOSED);
+    ASSERT_TRUE(state.recording.end_stream_calls == 1);
+    ASSERT_TRUE(state.recording.disposition == MAELYS_MCP_HTTP_STREAM_ABORTED);
+    maelys_mcp_http_adapter_destroy(adapter);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    close(quiet[0]);
+    close(quiet[1]);
+    return 0;
+}
+
+/*
  * The keep-alive comment, which is the one thing an idle stream costs. It is
  * written only once a stream exists - there is nothing to keep alive before the
  * reply's mode is chosen, and a JSON reply has nowhere to put one - and it is
@@ -1762,6 +1829,8 @@ int main(void) {
             a_notification_is_accepted_with_202},
         {"a cancelled notification writes nothing at all",
             a_cancelled_notification_writes_nothing},
+        {"an out-of-band cancel works without a readable descriptor",
+            an_out_of_band_cancel_works_without_a_readable_descriptor},
         {"the principal is retained once and released once",
             the_principal_is_retained_once_and_released_once},
         {"a detached channel releases the principal exactly once, later",
