@@ -14,41 +14,177 @@
 #include "host/http_auth.h"
 #include "host/http_parser.h"
 #include "host/http_server.h"
+#include "maelys/mcp.h"
 #include "maelys/mcp/http.h"
 #include "tests/test_support.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <jansson.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
- * A body that satisfies H2's MCP rules, because since H2 the adapter validates
- * before it answers and a server-layer test that wanted to reach the adapter
- * would otherwise be refused by a rule it is not testing. It carries the
- * _meta protocol version the MCP-Protocol-Version header is compared against,
- * and its method matches the Mcp-Method header in STD_HEADERS.
+ * A body that satisfies the MCP rules and then dispatches, because since H2 the
+ * adapter validates before it answers and since H3 it answers by dispatching. A
+ * server-layer test that wanted to reach either would otherwise be refused by a
+ * rule it is not testing.
+ *
+ * `ping` deliberately: it answers in every state, before the initialization
+ * gate, so it isolates the ladder under test from the runtime's lifecycle. The
+ * clientCapabilities key is not optional on a modern request and was not needed
+ * while the adapter stopped at validation.
  */
+#define MODERN_META \
+    "\"_meta\":{" \
+    "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"," \
+    "\"io.modelcontextprotocol/clientCapabilities\":{}}"
 #define VALID_BODY \
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"_meta\":" \
-    "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
-#define VALID_BODY_LENGTH "116"
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{" \
+    MODERN_META "}}"
+#define VALID_BODY_LENGTH "164"
 /* The Content-Length in the table below is written out, so it has to be pinned
  * to the body rather than counted by hand: a body one byte longer than its
  * declared length is indistinguishable from a pipelined request, and the test
  * would fail for a reason that has nothing to do with what it is testing. */
-_Static_assert(sizeof(VALID_BODY) - 1u == 116u, "VALID_BODY is 116 bytes");
+_Static_assert(sizeof(VALID_BODY) - 1u == 164u, "VALID_BODY is 164 bytes");
+
+/* ------------------------------------------------------------ the runtime */
+
+/*
+ * The provider behind the listener, and the two knobs the H3 cases need from
+ * it: a tool that reports progress, so a call over HTTP produces frames before
+ * its response; and a way to keep that call inside the provider until the test
+ * says otherwise, so "the client disconnected mid-call" is a state the test
+ * chooses rather than one it races for.
+ */
+typedef struct tool_state {
+    int calls;
+    /* Raised once the provider is inside the call. */
+    int entered_write;
+    /* The provider does not return until this is readable. */
+    int hold_read;
+    /*
+     * What an emit attempted AFTER the hold released answered. On a live
+     * exchange that is MAELYS_MCP_OK; on a cancelled one it is
+     * MAELYS_MCP_ERR_CLOSED, because the abort closed the channel's outbox and
+     * every subsequent emit and complete fails against it. That is the "MUST
+     * NOT send any further messages for it" rule holding by construction, seen
+     * from the only place that can see it.
+     */
+    maelys_mcp_result_t emit_after_hold;
+} tool_state_t;
+
+static maelys_mcp_result_t emitting_call(
+    void *context,
+    const maelys_mcp_provider_request_t *request,
+    maelys_mcp_provider_result_t *out_result,
+    char **out_error) {
+    (void)out_error;
+    tool_state_t *state = context;
+    state->calls++;
+    for (int step = 0; step < 3; ++step) {
+        (void)maelys_mcp_provider_report_progress(request->progress,
+            step * 33.0, 100.0, NULL);
+    }
+    if (state->entered_write >= 0) {
+        ssize_t written = write(state->entered_write, "x", 1u);
+        (void)written;
+    }
+    if (state->hold_read >= 0) {
+        struct pollfd descriptor = {
+            .fd = state->hold_read, .events = POLLIN, .revents = 0};
+        (void)poll(&descriptor, 1u, 5000);
+        /* Attempted AFTER the wait, which is the only ordering that proves
+         * anything: whatever happened to this exchange happened while this call
+         * was blocked. */
+        state->emit_after_hold = maelys_mcp_provider_report_progress(
+            request->progress, 99.0, 100.0, NULL);
+    }
+    out_result->structured_content = json_pack("{s:s}", "tool", request->tool_name);
+    return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+}
+
+static maelys_mcp_result_t fixture_read_resource(
+    void *context,
+    const maelys_mcp_resource_request_t *request,
+    maelys_mcp_resource_result_t *out_result,
+    char **out_error) {
+    (void)context;
+    (void)out_error;
+    out_result->contents = json_pack("[{s:s,s:s,s:s}]",
+        "uri", request->uri, "mimeType", "text/plain", "text", "body");
+    return out_result->contents ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
+}
+
+static maelys_mcp_runtime_t *serving_runtime(tool_state_t *state) {
+    maelys_mcp_runtime_config_t config = {
+        .server_name = "http-server-test", .server_version = "1.0"
+    };
+    maelys_mcp_runtime_t *runtime = NULL;
+    if (maelys_mcp_runtime_create(&config, &runtime) != MAELYS_MCP_OK) return NULL;
+    if (maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_TOOLS) != MAELYS_MCP_OK ||
+        maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) != MAELYS_MCP_OK ||
+        maelys_mcp_runtime_enable_module(runtime,
+            MAELYS_MCP_MODULE_SUBSCRIPTIONS) != MAELYS_MCP_OK) {
+        (void)maelys_mcp_runtime_destroy(runtime);
+        return NULL;
+    }
+    json_t *schema = json_pack("{s:s,s:b}", "type", "object", "additionalProperties", 0);
+    if (!schema) {
+        (void)maelys_mcp_runtime_destroy(runtime);
+        return NULL;
+    }
+    maelys_mcp_tool_t tools[] = {{
+        .name = "fx.stream",
+        .title = "Stream",
+        .description = "A tool that reports progress.",
+        .input_schema = schema,
+        .effect = MAELYS_MCP_EFFECT_READ
+    }};
+    static const maelys_mcp_resource_t resources[] = {{
+        .uri = "fx://repo/doc.txt", .name = "Doc", .mime_type = "text/plain"
+    }};
+    maelys_mcp_provider_config_t provider_config = {
+        .name = "fixture",
+        .version = "1",
+        .tools = tools,
+        .tool_count = 1,
+        .resources = resources,
+        .resource_count = 1,
+        .call = emitting_call,
+        .read_resource = fixture_read_resource,
+        .context = state
+    };
+    maelys_mcp_provider_t *provider = NULL;
+    maelys_mcp_result_t status = maelys_mcp_provider_create(&provider_config, &provider);
+    json_decref(schema);
+    if (status != MAELYS_MCP_OK) {
+        (void)maelys_mcp_runtime_destroy(runtime);
+        return NULL;
+    }
+    if (maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) {
+        maelys_mcp_provider_destroy(provider);
+        (void)maelys_mcp_runtime_destroy(runtime);
+        return NULL;
+    }
+    return runtime;
+}
 
 typedef struct fixture {
     maelys_mcp_authenticator_t authenticator;
+    maelys_mcp_runtime_t *runtime;
     maelys_mcp_http_adapter_t *adapter;
     maelys_http_server_t *server;
     unsigned short port;
+    tool_state_t tools;
 } fixture_t;
 
 static int fixture_start(
@@ -58,12 +194,26 @@ static int fixture_start(
     const char *const *origins,
     size_t origin_count) {
     memset(fixture, 0, sizeof(*fixture));
+    fixture->tools.entered_write = -1;
+    fixture->tools.hold_read = -1;
     maelys_mcp_result_t status = token_count
         ? maelys_http_auth_static_bearer_create(tokens, token_count, &fixture->authenticator)
         : maelys_http_auth_loopback_create(&fixture->authenticator);
     if (status != MAELYS_MCP_OK) return -1;
+    fixture->runtime = serving_runtime(&fixture->tools);
+    if (!fixture->runtime) {
+        fixture->authenticator.destroy(fixture->authenticator.context);
+        return -1;
+    }
+    maelys_mcp_http_adapter_config_t adapter_config = {
+        .runtime = fixture->runtime,
+        /* Short enough that a wedged provider does not stall the suite. */
+        .close_timeout_ms = 200u,
+        .keepalive_interval_ms = 100u
+    };
     if (maelys_mcp_http_adapter_create(
-        MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &fixture->adapter) != MAELYS_MCP_OK) {
+        &adapter_config, &fixture->adapter) != MAELYS_MCP_OK) {
+        (void)maelys_mcp_runtime_destroy(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -84,6 +234,7 @@ static int fixture_start(
     };
     if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
         maelys_mcp_http_adapter_destroy(fixture->adapter);
+        (void)maelys_mcp_runtime_destroy(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -130,6 +281,8 @@ static void counting_destroy(void *context) {
 
 static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) {
     memset(fixture, 0, sizeof(*fixture));
+    fixture->tools.entered_write = -1;
+    fixture->tools.hold_read = -1;
     memset(counter, 0, sizeof(*counter));
     if (maelys_http_auth_loopback_create(&counter->inner) != MAELYS_MCP_OK) return -1;
     fixture->authenticator.name = "counting";
@@ -138,8 +291,19 @@ static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) 
     fixture->authenticator.retain = counting_retain;
     fixture->authenticator.release = counting_release;
     fixture->authenticator.destroy = counting_destroy;
+    fixture->runtime = serving_runtime(&fixture->tools);
+    if (!fixture->runtime) {
+        fixture->authenticator.destroy(fixture->authenticator.context);
+        return -1;
+    }
+    maelys_mcp_http_adapter_config_t adapter_config = {
+        .runtime = fixture->runtime,
+        .close_timeout_ms = 200u,
+        .keepalive_interval_ms = 100u
+    };
     if (maelys_mcp_http_adapter_create(
-        MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &fixture->adapter) != MAELYS_MCP_OK) {
+        &adapter_config, &fixture->adapter) != MAELYS_MCP_OK) {
+        (void)maelys_mcp_runtime_destroy(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -158,6 +322,7 @@ static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) 
     };
     if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
         maelys_mcp_http_adapter_destroy(fixture->adapter);
+        (void)maelys_mcp_runtime_destroy(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -165,13 +330,61 @@ static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) 
     return 0;
 }
 
+/*
+ * Teardown order, and every step of it is load-bearing now that a connection
+ * holds a channel and a channel holds a principal.
+ *
+ * Stop the listener first, so no new channel can be created. Destroy the
+ * runtime SECOND, because a channel that missed its close deadline was detached
+ * rather than waited on and is still out there: runtime destruction drains
+ * those, which is what runs the last context_release. Only then the
+ * authenticator, whose contract is that it is destroyed after the last channel
+ * that could have carried one of its principals - the reverse order would
+ * release a principal into a table that had already been freed.
+ */
 static void fixture_stop(fixture_t *fixture) {
     if (fixture->server) maelys_http_server_stop(fixture->server);
     if (fixture->adapter) maelys_mcp_http_adapter_destroy(fixture->adapter);
+    if (fixture->runtime) (void)maelys_mcp_runtime_destroy(fixture->runtime);
     if (fixture->authenticator.destroy) {
         fixture->authenticator.destroy(fixture->authenticator.context);
     }
+    /*
+     * The tool state SURVIVES teardown, deliberately. Most of what a wedged
+     * provider records is written during the teardown that unwedges it - a
+     * detached channel is freed by its last worker, and that worker runs while
+     * the runtime is being destroyed - so a memset over the whole fixture would
+     * erase the observation the test came for.
+     */
+    tool_state_t observed = fixture->tools;
     memset(fixture, 0, sizeof(*fixture));
+    fixture->tools = observed;
+}
+
+/* A fixture with a connection limit, for the one case that has to observe a
+ * slot being released rather than assume it. */
+static int fixture_start_limited(fixture_t *fixture, size_t max_connections) {
+    if (fixture_start(fixture, NULL, 0, NULL, 0) != 0) return -1;
+    maelys_http_server_stop(fixture->server);
+    maelys_http_server_options_t options = {
+        .bind_address = "127.0.0.1",
+        .port = 0,
+        .max_body_bytes = 1024u,
+        .max_connections = max_connections,
+        .header_timeout_ms = 2000u,
+        .body_timeout_ms = 2000u,
+        .idle_timeout_ms = 2000u,
+        .write_timeout_ms = 2000u,
+        .authenticator = &fixture->authenticator,
+        .adapter = fixture->adapter
+    };
+    if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
+        fixture->server = NULL;
+        fixture_stop(fixture);
+        return -1;
+    }
+    fixture->port = maelys_http_server_port(fixture->server);
+    return 0;
 }
 
 static int connect_loopback(unsigned short port) {
@@ -277,8 +490,8 @@ static int exchange(unsigned short port, const char *request, size_t length,
 /*
  * The MCP routing headers ride along in STD_HEADERS since H2. A case that
  * expects a server-layer refusal never reaches them, and a case that expects to
- * reach the adapter needs them: leaving them out would make every 503 case fail
- * on a -32020 that has nothing to do with the ladder being tested.
+ * reach the adapter needs them: leaving them out would make every accepting
+ * case fail on a -32020 that has nothing to do with the ladder being tested.
  */
 #define BASE_HEADERS \
     "Host: 127.0.0.1\r\n" \
@@ -297,9 +510,9 @@ typedef struct wire_case {
 } wire_case_t;
 
 static const wire_case_t WIRE_CASES[] = {
-    {"a well-formed POST reaches the adapter and gets its placeholder answer",
+    {"a well-formed POST is dispatched and answered by the runtime",
         "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY,
-        503, "-32600"},
+        200, "\"result\""},
     {"GET on the endpoint is 405 with Allow: POST",
         "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 405, "Allow: POST"},
     {"DELETE on the endpoint is 405 with Allow: POST",
@@ -354,7 +567,7 @@ static const wire_case_t WIRE_CASES[] = {
         "Content-Length: 2\r\n\r\n{}", 400, NULL},
     {"an absolute-form target matching Host is routed",
         "POST http://127.0.0.1/mcp HTTP/1.1\r\n" STD_HEADERS
-        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY, 503, "-32600"},
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY, 200, "\"result\""},
     /*
      * The two H2 rows the adapter owns, proven on the wire rather than only
      * through the recording writer: the refusal has to survive the server
@@ -439,7 +652,7 @@ static int origin_is_refused_before_anything_else(void) {
         "Origin: https://app.example\r\n"
         "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     ASSERT_TRUE(exchange(fixture.port, allowed, strlen(allowed),
-        response, sizeof(response)) == 503);
+        response, sizeof(response)) == 200);
     const char *refused =
         "POST /mcp HTTP/1.1\r\n" STD_HEADERS
         "Origin: https://other.example\r\nContent-Length: 2\r\n\r\n{}";
@@ -466,7 +679,7 @@ static int a_kept_alive_connection_serves_a_second_request(void) {
         ASSERT_TRUE(send_all(fd, request, strlen(request)) == 0);
         ssize_t got = read_one_message(fd, response, sizeof(response), 3000);
         ASSERT_TRUE(got > 0);
-        ASSERT_TRUE(status_of(response) == 503);
+        ASSERT_TRUE(status_of(response) == 200);
         ASSERT_TRUE(strstr(response, "Connection: keep-alive") != NULL);
     }
     close(fd);
@@ -491,7 +704,7 @@ static int authenticate_runs_once_per_post(void) {
 
     /* One connection, one POST: exactly one authentication. */
     ASSERT_TRUE(exchange(fixture.port, request, strlen(request),
-        response, sizeof(response)) == 503);
+        response, sizeof(response)) == 200);
     ASSERT_TRUE(counter.calls == 1);
 
     /* One connection, two POSTs: exactly two more. */
@@ -501,7 +714,7 @@ static int authenticate_runs_once_per_post(void) {
         ASSERT_TRUE(send_all(fd, request, strlen(request)) == 0);
         ssize_t got = read_one_message(fd, response, sizeof(response), 3000);
         ASSERT_TRUE(got > 0);
-        ASSERT_TRUE(status_of(response) == 503);
+        ASSERT_TRUE(status_of(response) == 200);
     }
     close(fd);
     ASSERT_TRUE(counter.calls == 3);
@@ -590,7 +803,7 @@ static int bearer_authentication_on_the_wire(void) {
         "Authorization: Bearer good-token\r\n"
         "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     ASSERT_TRUE(exchange(fixture.port, right, strlen(right),
-        response, sizeof(response)) == 503);
+        response, sizeof(response)) == 200);
     fixture_stop(&fixture);
     return 0;
 }
@@ -602,9 +815,13 @@ static int bearer_authentication_on_the_wire(void) {
 static int a_public_bind_refuses_loopback_trust(void) {
     maelys_mcp_authenticator_t authenticator;
     ASSERT_TRUE(maelys_http_auth_loopback_create(&authenticator) == MAELYS_MCP_OK);
+    tool_state_t tools = {.entered_write = -1, .hold_read = -1};
+    maelys_mcp_runtime_t *runtime = serving_runtime(&tools);
+    ASSERT_TRUE(runtime != NULL);
     maelys_mcp_http_adapter_t *adapter = NULL;
-    ASSERT_TRUE(maelys_mcp_http_adapter_create(
-        MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &adapter) == MAELYS_MCP_OK);
+    maelys_mcp_http_adapter_config_t adapter_config = {.runtime = runtime};
+    ASSERT_TRUE(maelys_mcp_http_adapter_create(&adapter_config, &adapter) ==
+        MAELYS_MCP_OK);
     maelys_http_server_t *server = NULL;
     maelys_http_server_options_t options = {
         .bind_address = "0.0.0.0",
@@ -632,9 +849,10 @@ static int a_public_bind_refuses_loopback_trust(void) {
     server = NULL;
     ASSERT_TRUE(maelys_http_server_start(&options, &server) == MAELYS_MCP_ERR_ARGUMENT);
 
+    maelys_mcp_http_adapter_destroy(adapter);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
     bearer.destroy(bearer.context);
     authenticator.destroy(authenticator.context);
-    maelys_mcp_http_adapter_destroy(adapter);
     return 0;
 }
 
@@ -849,6 +1067,458 @@ static int principal_refcounting(void) {
     return 0;
 }
 
+
+/* ------------------------------------------------------- the H3 wire half */
+
+/*
+ * Everything below is MCP over a real socket, against the real server layer and
+ * the real runtime. What the adapter suite proves with a recording writer, this
+ * proves in bytes: which Content-Type came back, in what order the SSE events
+ * arrived, whether the terminal chunk was there, and whether a connection
+ * survived to carry the next request.
+ */
+
+#define REQUEST_LINE(headers, length, body) \
+    "POST /mcp HTTP/1.1\r\n" headers "Content-Length: " length "\r\n\r\n" body
+
+/* tools/list: one buffered response, therefore application/json. */
+#define LIST_BODY \
+    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/list\",\"params\":{" \
+    MODERN_META "}}"
+#define LIST_HEADERS BASE_HEADERS \
+    "MCP-Protocol-Version: 2026-07-28\r\n" \
+    "Mcp-Method: tools/list\r\n"
+
+/* tools/call with a progressToken: frames before the response, therefore SSE. */
+#define CALL_BODY \
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{" \
+    "\"name\":\"fx.stream\",\"arguments\":{}," \
+    "\"_meta\":{" \
+    "\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"," \
+    "\"io.modelcontextprotocol/clientCapabilities\":{}," \
+    "\"progressToken\":\"tok\"}}}"
+#define CALL_HEADERS BASE_HEADERS \
+    "MCP-Protocol-Version: 2026-07-28\r\n" \
+    "Mcp-Method: tools/call\r\n" \
+    "Mcp-Name: fx.stream\r\n"
+
+/* A notification: 202 and an empty body. */
+#define NOTE_BODY \
+    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{" \
+    MODERN_META "}}"
+#define NOTE_HEADERS BASE_HEADERS \
+    "MCP-Protocol-Version: 2026-07-28\r\n" \
+    "Mcp-Method: notifications/initialized\r\n"
+
+/* subscriptions/listen: the acknowledgement first, so also SSE. */
+#define LISTEN_BODY \
+    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"subscriptions/listen\",\"params\":{" \
+    "\"notifications\":{\"resourceSubscriptions\":[\"fx://repo/doc.txt\"]}," \
+    MODERN_META "}}"
+#define LISTEN_HEADERS BASE_HEADERS \
+    "MCP-Protocol-Version: 2026-07-28\r\n" \
+    "Mcp-Method: subscriptions/listen\r\n"
+
+/* Content-Lengths, pinned rather than counted, for the same reason
+ * VALID_BODY_LENGTH is. */
+#define LIST_LENGTH "171"
+#define CALL_LENGTH "227"
+#define NOTE_LENGTH "178"
+#define LISTEN_LENGTH "245"
+_Static_assert(sizeof(LIST_BODY) - 1u == 171u, "LIST_BODY length");
+_Static_assert(sizeof(CALL_BODY) - 1u == 227u, "CALL_BODY length");
+_Static_assert(sizeof(NOTE_BODY) - 1u == 178u, "NOTE_BODY length");
+_Static_assert(sizeof(LISTEN_BODY) - 1u == 245u, "LISTEN_BODY length");
+
+/* The suite's own clock, because the server layer's is static to its
+ * translation unit and a test must not reach into one. */
+static uint64_t now_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0u;
+    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+static void sleep_ms(long milliseconds) {
+    struct timespec pause = {
+        .tv_sec = milliseconds / 1000,
+        .tv_nsec = (milliseconds % 1000) * 1000 * 1000
+    };
+    (void)nanosleep(&pause, NULL);
+}
+
+static int occurrences_of(const char *haystack, const char *needle) {
+    int count = 0;
+    for (const char *scan = haystack;
+         (scan = strstr(scan, needle)) != NULL; ++scan) {
+        ++count;
+    }
+    return count;
+}
+
+/*
+ * Reads until `needle` has appeared `wanted` times, or the deadline passes.
+ *
+ * Reading "until the socket goes quiet" does not work on this transport and the
+ * reason is worth stating: an open SSE stream is never quiet. It emits a
+ * keep-alive comment every interval forever, so a reader that waited for
+ * silence would wait for the provider's own timeout instead of for the frames
+ * it came for - which is exactly the bug that made an earlier version of the
+ * disconnect test observe a completed exchange.
+ */
+static ssize_t read_until(int fd, char *buffer, size_t capacity,
+    const char *needle, int wanted, int timeout_ms) {
+    size_t total = 0;
+    uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
+    buffer[0] = '\0';
+    while (occurrences_of(buffer, needle) < wanted) {
+        uint64_t now = now_ms();
+        if (now >= deadline) break;
+        struct pollfd descriptor = {.fd = fd, .events = POLLIN, .revents = 0};
+        int ready = poll(&descriptor, 1u, (int)(deadline - now));
+        if (ready <= 0) break;
+        ssize_t got = recv(fd, buffer + total, capacity - total - 1u, 0);
+        if (got <= 0) break;
+        total += (size_t)got;
+        buffer[total] = '\0';
+        if (total + 1u >= capacity) break;
+    }
+    return (ssize_t)total;
+}
+
+/* The byte offset of `needle` in `haystack`, or -1. Ordering assertions are
+ * made on offsets rather than on presence, because "both arrived" is also what
+ * an out-of-order stream looks like. */
+static long offset_of(const char *haystack, const char *needle) {
+    const char *found = strstr(haystack, needle);
+    return found ? (long)(found - haystack) : -1;
+}
+
+/*
+ * tools/list over HTTP: the smallest complete statement that this endpoint
+ * serves MCP. A real catalogue comes back, as application/json, on a connection
+ * that stays open.
+ */
+static int tools_list_is_answered_as_json(void) {
+    fixture_t fixture;
+    ASSERT_TRUE(fixture_start(&fixture, NULL, 0, NULL, 0) == 0);
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    static const char request[] = REQUEST_LINE(LIST_HEADERS, LIST_LENGTH, LIST_BODY);
+    ASSERT_TRUE(send_all(fd, request, sizeof(request) - 1u) == 0);
+    char response[8192];
+    ASSERT_TRUE(read_one_message(fd, response, sizeof(response), 3000) > 0);
+    ASSERT_TRUE(status_of(response) == 200);
+    ASSERT_TRUE(strstr(response, "Content-Type: application/json") != NULL);
+    /* Buffered, not streamed: a known length and no chunked framing. */
+    ASSERT_TRUE(strstr(response, "Transfer-Encoding") == NULL);
+    ASSERT_TRUE(strstr(response, "Content-Length:") != NULL);
+    ASSERT_TRUE(strstr(response, "fx.stream") != NULL);
+    ASSERT_TRUE(strstr(response, "\"id\":11") != NULL);
+    /* Keep-alive, and the same connection carries a second request. */
+    ASSERT_TRUE(strstr(response, "Connection: keep-alive") != NULL);
+    ASSERT_TRUE(send_all(fd, request, sizeof(request) - 1u) == 0);
+    ASSERT_TRUE(read_one_message(fd, response, sizeof(response), 3000) > 0);
+    ASSERT_TRUE(status_of(response) == 200);
+    ASSERT_TRUE(strstr(response, "fx.stream") != NULL);
+    close(fd);
+    fixture_stop(&fixture);
+    return 0;
+}
+
+/*
+ * The ordering proof, over HTTP.
+ *
+ * tests/test_middleware.c states this one layer down as
+ * test_wrap_sink_keeps_progress_ahead_of_the_response; here it is asserted on
+ * the bytes a client would actually read. Over SSE the final response
+ * terminates the stream, so a progress frame behind it is not late - it is
+ * gone - which is why the assertion is on OFFSETS and not on presence.
+ */
+static int a_call_with_progress_streams_in_order(void) {
+    fixture_t fixture;
+    ASSERT_TRUE(fixture_start(&fixture, NULL, 0, NULL, 0) == 0);
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    static const char request[] = REQUEST_LINE(CALL_HEADERS, CALL_LENGTH, CALL_BODY);
+    ASSERT_TRUE(send_all(fd, request, sizeof(request) - 1u) == 0);
+    char response[16384];
+    /* Read to EOF: an SSE reply is Connection: close, so the peer closing is
+     * the end of the body. */
+    ASSERT_TRUE(read_response(fd, response, sizeof(response), 3000) > 0);
+    close(fd);
+    ASSERT_TRUE(status_of(response) == 200);
+    ASSERT_TRUE(strstr(response, "Content-Type: text/event-stream") != NULL);
+    ASSERT_TRUE(strstr(response, "Transfer-Encoding: chunked") != NULL);
+    ASSERT_TRUE(strstr(response, "Cache-Control: no-store") != NULL);
+    ASSERT_TRUE(strstr(response, "X-Accel-Buffering: no") != NULL);
+    /* An SSE reply is never reused. */
+    ASSERT_TRUE(strstr(response, "Connection: close") != NULL);
+
+    /* Three progress frames, then the response, in that order. */
+    long first = offset_of(response, "notifications/progress");
+    ASSERT_TRUE(first > 0);
+    long last_progress = -1;
+    for (const char *scan = response;
+         (scan = strstr(scan, "notifications/progress")) != NULL; ++scan) {
+        last_progress = (long)(scan - response);
+    }
+    long response_frame = offset_of(response, "\"id\":12");
+    ASSERT_TRUE(response_frame > 0);
+    ASSERT_TRUE(last_progress < response_frame);
+    /* And the terminal chunk came after the response, not before it. */
+    long terminal = offset_of(response, "\r\n0\r\n\r\n");
+    ASSERT_TRUE(terminal > response_frame);
+    /* Every frame is its own `data:` line with a blank line after it. */
+    ASSERT_TRUE(strstr(response, "data: {\"jsonrpc\":\"2.0\",\"method\":"
+        "\"notifications/progress\"") != NULL);
+    fixture_stop(&fixture);
+    return 0;
+}
+
+/*
+ * A notification is 202 with an empty body, on a connection that is still
+ * reusable - a client that batches notifications pays one handshake, not one
+ * per notification.
+ */
+static int a_notification_is_202_and_keeps_the_connection(void) {
+    fixture_t fixture;
+    ASSERT_TRUE(fixture_start(&fixture, NULL, 0, NULL, 0) == 0);
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    static const char note[] = REQUEST_LINE(NOTE_HEADERS, NOTE_LENGTH, NOTE_BODY);
+    char response[4096];
+    ASSERT_TRUE(send_all(fd, note, sizeof(note) - 1u) == 0);
+    ASSERT_TRUE(read_one_message(fd, response, sizeof(response), 3000) > 0);
+    ASSERT_TRUE(status_of(response) == 202);
+    ASSERT_TRUE(strstr(response, "Content-Length: 0") != NULL);
+    ASSERT_TRUE(strstr(response, "Connection: keep-alive") != NULL);
+    /* No MCP body of any kind: not a result, not an error. */
+    ASSERT_TRUE(strstr(response, "jsonrpc") == NULL);
+
+    /* The same connection then carries a request and answers it. */
+    static const char list[] = REQUEST_LINE(LIST_HEADERS, LIST_LENGTH, LIST_BODY);
+    ASSERT_TRUE(send_all(fd, list, sizeof(list) - 1u) == 0);
+    ASSERT_TRUE(read_one_message(fd, response, sizeof(response), 3000) > 0);
+    ASSERT_TRUE(status_of(response) == 200);
+    ASSERT_TRUE(strstr(response, "fx.stream") != NULL);
+    close(fd);
+    fixture_stop(&fixture);
+    return 0;
+}
+
+/*
+ * The full cancellation chain, end to end, and the four claims it has to make
+ * separately because they are four different things:
+ *
+ *   the provider was told - its post-hold emit is refused, which is the
+ *     "MUST NOT send any further messages for it" rule holding by construction;
+ *   no further bytes were written - the stream stops where the disconnect
+ *     found it, with NO terminal chunk, which is how HTTP/1.1 spells truncated;
+ *   the connection slot was freed inside the close deadline, even though the
+ *     provider was still running - the H0b guarantee;
+ *   the principal was released exactly once, counted rather than assumed.
+ *
+ * The provider is held inside its call on purpose, so "mid-call" is a state
+ * this test chooses rather than one it races for.
+ */
+static int a_client_disconnect_cancels_the_call(void) {
+    int hold[2] = {-1, -1};
+    int entered[2] = {-1, -1};
+    ASSERT_TRUE(pipe(hold) == 0);
+    ASSERT_TRUE(pipe(entered) == 0);
+    fixture_t fixture;
+    /*
+     * One connection, so that "the slot was freed" is a fact the next connect
+     * can establish. At the default limit of 128 a probe would succeed whether
+     * or not the wedged exchange had let go of anything.
+     */
+    ASSERT_TRUE(fixture_start_limited(&fixture, 1u) == 0);
+    fixture.tools.hold_read = hold[0];
+    fixture.tools.entered_write = entered[1];
+
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    static const char request[] = REQUEST_LINE(CALL_HEADERS, CALL_LENGTH, CALL_BODY);
+    ASSERT_TRUE(send_all(fd, request, sizeof(request) - 1u) == 0);
+
+    /* Wait until the provider is demonstrably inside the call. */
+    struct pollfd wait_entered = {.fd = entered[0], .events = POLLIN, .revents = 0};
+    ASSERT_TRUE(poll(&wait_entered, 1u, 3000) == 1);
+
+    /* Every frame the call produced before it wedged, and no further. */
+    char received[16384];
+    ASSERT_TRUE(read_until(fd, received, sizeof(received),
+        "notifications/progress", 3, 3000) > 0);
+    ASSERT_TRUE(status_of(received) == 200);
+    ASSERT_TRUE(strstr(received, "text/event-stream") != NULL);
+    ASSERT_TRUE(occurrences_of(received, "notifications/progress") == 3);
+    /* Still mid-exchange: no response for this id, and no terminal chunk. */
+    ASSERT_TRUE(strstr(received, "\"id\":12") == NULL);
+    ASSERT_TRUE(strstr(received, "\r\n0\r\n\r\n") == NULL);
+
+    /*
+     * The disconnect, as a half-close rather than a full one, and the choice is
+     * the instrument rather than a compromise. What the server observes is
+     * identical - recv returns 0 on a socket that has been shut down for
+     * writing exactly as on one whose peer is gone - but the read half stays
+     * open, so this test can assert what the server did NEXT. A full close
+     * would make "no further writes" unobservable, which is the one claim
+     * worth making here.
+     */
+    ASSERT_TRUE(shutdown(fd, SHUT_WR) == 0);
+
+    /* Read to EOF. Whatever arrives after the FIN is the thing under test. */
+    char after[16384];
+    ssize_t tail = read_response(fd, after, sizeof(after), 2000);
+    ASSERT_TRUE(tail >= 0);
+    /* No terminal chunk, ever: a chunked body that ends without one is how
+     * HTTP/1.1 says "truncated", and 0\r\n\r\n would have told this client the
+     * cancelled call completed normally. */
+    ASSERT_TRUE(strstr(after, "\r\n0\r\n\r\n") == NULL);
+    ASSERT_TRUE(strstr(after, "0\r\n\r\n") == NULL);
+    /* And the response never arrived, because the abort closed the outbox
+     * before the provider could complete into it. */
+    ASSERT_TRUE(strstr(after, "\"id\":12") == NULL);
+    close(fd);
+
+    /*
+     * The connection slot is released while the provider is still wedged. This
+     * is the H0b claim: the channel outlives the connection and is freed by its
+     * last worker, so a network peer cannot hold a slot for as long as a
+     * provider takes.
+     */
+    uint64_t deadline = now_ms() + 3000u;
+    int freed = 0;
+    while (!freed) {
+        if (now_ms() >= deadline) break;
+        /* A new connection being accepted and answered is the observable form
+         * of "the slot is available again". */
+        int probe = connect_loopback(fixture.port);
+        if (probe >= 0) {
+            static const char list[] =
+                REQUEST_LINE(LIST_HEADERS, LIST_LENGTH, LIST_BODY);
+            char response[8192];
+            if (send_all(probe, list, sizeof(list) - 1u) == 0 &&
+                read_one_message(probe, response, sizeof(response), 1000) > 0 &&
+                status_of(response) == 200) {
+                freed = 1;
+            }
+            close(probe);
+        }
+        if (!freed) sleep_ms(5);
+    }
+    ASSERT_TRUE(freed);
+
+    /* Exactly one call reached the provider, so nothing was retried behind the
+     * client's back on the way to all of the above. */
+    ASSERT_TRUE(fixture.tools.calls == 1);
+
+    /* Let the wedged provider go and shut everything down. */
+    ssize_t written = write(hold[1], "x", 1u);
+    (void)written;
+    fixture_stop(&fixture);
+
+    /* The provider learned: its emit after the hold was refused, because the
+     * abort had already closed the channel's outbox. */
+    ASSERT_TRUE(fixture.tools.emit_after_hold == MAELYS_MCP_ERR_CLOSED);
+
+    close(hold[0]);
+    close(hold[1]);
+    close(entered[0]);
+    close(entered[1]);
+    return 0;
+}
+
+/*
+ * subscriptions/listen over HTTP: the acknowledgement opens the stream - the
+ * fact most readers guess wrong, because that acknowledgement travels the
+ * completion path even though it is a notification with no id - and the client
+ * closing ends it truncated.
+ */
+static int a_listen_stream_is_opened_and_closed_by_the_client(void) {
+    fixture_t fixture;
+    ASSERT_TRUE(fixture_start(&fixture, NULL, 0, NULL, 0) == 0);
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    static const char request[] =
+        REQUEST_LINE(LISTEN_HEADERS, LISTEN_LENGTH, LISTEN_BODY);
+    ASSERT_TRUE(send_all(fd, request, sizeof(request) - 1u) == 0);
+    char received[16384];
+    ASSERT_TRUE(read_until(fd, received, sizeof(received),
+        "notifications/subscriptions/acknowledged", 1, 3000) > 0);
+    ASSERT_TRUE(status_of(received) == 200);
+    ASSERT_TRUE(strstr(received, "Content-Type: text/event-stream") != NULL);
+    /*
+     * The acknowledgement opened the stream, which is the fact most readers
+     * guess wrong: it travels the completion path even though it is a JSON-RPC
+     * notification with no id, so "is this the final response for this id?"
+     * says no and the reply becomes a stream instead of ending on it.
+     */
+    ASSERT_TRUE(strstr(received, "\"id\":14") == NULL);
+    ASSERT_TRUE(strstr(received, "\r\n0\r\n\r\n") == NULL);
+
+    /*
+     * The keep-alive, on the wire. One chunk carrying a bare `:` comment,
+     * written when the drain loop's poll goes idle - which is what an open
+     * subscriptions/listen stream does between events, and the reason this
+     * suite cannot read such a stream "until it goes quiet".
+     */
+    char idle[16384];
+    ASSERT_TRUE(read_until(fd, idle, sizeof(idle), "3\r\n:\r\n\r\n", 2, 3000) > 0);
+    ASSERT_TRUE(occurrences_of(idle, "3\r\n:\r\n\r\n") >= 2);
+
+    /* The client ends it. Half-closed, so the truncation is observable. */
+    ASSERT_TRUE(shutdown(fd, SHUT_WR) == 0);
+    char after[16384];
+    ASSERT_TRUE(read_response(fd, after, sizeof(after), 2000) >= 0);
+    /* Cut, not completed: no terminal chunk and no resultType complete. A
+     * client that walked away is not owed an ending it will not read. */
+    ASSERT_TRUE(strstr(after, "0\r\n\r\n") == NULL);
+    ASSERT_TRUE(strstr(after, "resultType") == NULL);
+    close(fd);
+    /* And the server lets go of it: stop returns rather than waiting for a
+     * stream whose client is gone. */
+    fixture_stop(&fixture);
+    return 0;
+}
+
+/*
+ * Server shutdown, which is the other way a stream ends and the one that is
+ * NOT a cancellation. Every surviving subscription is completed with
+ * `resultType: "complete"`, that frame is written, and the body is terminated
+ * properly - because the peer is still connected and still reading.
+ */
+static int shutdown_completes_an_open_listen_stream(void) {
+    fixture_t fixture;
+    ASSERT_TRUE(fixture_start(&fixture, NULL, 0, NULL, 0) == 0);
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    static const char request[] =
+        REQUEST_LINE(LISTEN_HEADERS, LISTEN_LENGTH, LISTEN_BODY);
+    ASSERT_TRUE(send_all(fd, request, sizeof(request) - 1u) == 0);
+    char opening[8192];
+    ASSERT_TRUE(read_until(fd, opening, sizeof(opening),
+        "notifications/subscriptions/acknowledged", 1, 3000) > 0);
+
+    /* Phase 2: the listener stops, and this stream is asked to FINISH. */
+    maelys_http_server_t *server = fixture.server;
+    fixture.server = NULL;
+    ASSERT_TRUE(maelys_http_server_stop(server) == MAELYS_MCP_OK);
+
+    char closing[8192];
+    ssize_t got = read_response(fd, closing, sizeof(closing), 2000);
+    close(fd);
+    ASSERT_TRUE(got > 0);
+    /* The completion, and then the terminal chunk. A cancellation would have
+     * written neither. */
+    ASSERT_TRUE(strstr(closing, "\"resultType\":\"complete\"") != NULL);
+    ASSERT_TRUE(strstr(closing, "\"id\":14") != NULL);
+    ASSERT_TRUE(offset_of(closing, "\r\n0\r\n\r\n") >
+        offset_of(closing, "\"resultType\":\"complete\""));
+    fixture_stop(&fixture);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t cases[] = {
         {"the status ladder on the wire", wire_matrix},
@@ -866,7 +1536,19 @@ int main(void) {
         {"static-bearer outcomes", static_bearer_outcomes},
         {"principal refcounting", principal_refcounting},
         {"authenticate runs once per POST, twice on a reused connection",
-            authenticate_runs_once_per_post}
+            authenticate_runs_once_per_post},
+        {"tools/list over HTTP is answered as JSON on a reused connection",
+            tools_list_is_answered_as_json},
+        {"a tools/call with progress streams its frames ahead of the response",
+            a_call_with_progress_streams_in_order},
+        {"a notification is 202 and the connection survives it",
+            a_notification_is_202_and_keeps_the_connection},
+        {"a client disconnect mid-call cancels it and frees the slot",
+            a_client_disconnect_cancels_the_call},
+        {"a listen stream opens on its acknowledgement and the client ends it",
+            a_listen_stream_is_opened_and_closed_by_the_client},
+        {"shutdown completes an open listen stream rather than cutting it",
+            shutdown_completes_an_open_listen_stream}
     };
     return maelys_run_tests(cases, sizeof(cases) / sizeof(*cases));
 }

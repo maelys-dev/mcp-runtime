@@ -325,12 +325,28 @@ static void reject_and_close(
 
 /* ------------------------------------------------------------ the writer */
 
+/* The S-chain's watcher, defined below with the rest of it. The writer only
+ * needs to tell it when the response is finished. */
+typedef struct socket_watcher socket_watcher_t;
+static void watcher_mark_finished(socket_watcher_t *watcher);
+
 typedef struct socket_writer {
     connection_t *connection;
     int keep_alive;
     int began;
     int streamed;
+    /* NULL when no watcher was started, which is the half-closed case. */
+    socket_watcher_t *watcher;
 } socket_writer_t;
+
+/*
+ * The instant the pipelining window closes: the response this exchange owes is
+ * on the wire in full. Every terminal writer entry point ends here, and nothing
+ * else does - a stream that has written an event is still mid-response.
+ */
+static void writer_response_complete(socket_writer_t *writer) {
+    if (writer->watcher) watcher_mark_finished(writer->watcher);
+}
 
 static maelys_mcp_result_t writer_begin_json(
     void *context, int status, const char *body, size_t length) {
@@ -355,6 +371,7 @@ static maelys_mcp_result_t writer_begin_json(
         result = write_all(writer->connection->fd, body, length,
             writer->connection->server->write_timeout_ms);
     }
+    writer_response_complete(writer);
     return result;
 }
 
@@ -440,9 +457,14 @@ static maelys_mcp_result_t writer_end_stream(
      * stream completed normally, which would silently turn a cancelled call
      * into an apparently-successful empty one.
      */
-    if (disposition == MAELYS_MCP_HTTP_STREAM_ABORTED) return MAELYS_MCP_OK;
-    return write_all(writer->connection->fd, "0\r\n\r\n", 5u,
+    if (disposition == MAELYS_MCP_HTTP_STREAM_ABORTED) {
+        writer_response_complete(writer);
+        return MAELYS_MCP_OK;
+    }
+    maelys_mcp_result_t result = write_all(writer->connection->fd, "0\r\n\r\n", 5u,
         writer->connection->server->write_timeout_ms);
+    writer_response_complete(writer);
+    return result;
 }
 
 /*
@@ -479,6 +501,7 @@ static maelys_mcp_result_t writer_status_only(
             : "Content-Length: 0\r\nConnection: close\r\n\r\n";
         result = write_all(fd, tail, strlen(tail), timeout);
     }
+    writer_response_complete(writer);
     return result;
 }
 
@@ -510,7 +533,7 @@ static maelys_mcp_result_t writer_status_only(
 /* Defined with the listener below, where the acceptor's own wakeup pipe is. */
 static int create_wakeup_pipe(int *read_fd, int *write_fd);
 
-typedef struct socket_watcher {
+struct socket_watcher {
     pthread_t thread;
     int started;
     int fd;
@@ -518,12 +541,40 @@ typedef struct socket_watcher {
     int cancel_read;
     int cancel_write;
     const char *peer;
-} socket_watcher_t;
+    /*
+     * Set by the connection thread the moment the exchange is over, and read by
+     * the watcher before it decides that an inbound byte means anything.
+     *
+     * Without it a kept-alive client that sends its NEXT request promptly is
+     * reported as pipelining: the byte is legitimate, because this request's
+     * response was already complete, but the watcher is still in poll() and
+     * cannot tell that from the socket alone. The pipelining rule is about
+     * bytes arriving BETWEEN a request's body and its response, and this flag
+     * is what makes the watcher's view of "between" the same as the rule's.
+     */
+    pthread_mutex_t mutex;
+    int mutex_ready;
+    int finished;
+};
+
+static void watcher_mark_finished(socket_watcher_t *watcher) {
+    if (!watcher->mutex_ready) return;
+    pthread_mutex_lock(&watcher->mutex);
+    watcher->finished = 1;
+    pthread_mutex_unlock(&watcher->mutex);
+}
 
 static void watcher_raise(socket_watcher_t *watcher) {
     if (watcher->cancel_write < 0) return;
     ssize_t written = write(watcher->cancel_write, "x", 1u);
     (void)written;
+}
+
+static int watcher_finished(socket_watcher_t *watcher) {
+    pthread_mutex_lock(&watcher->mutex);
+    int finished = watcher->finished;
+    pthread_mutex_unlock(&watcher->mutex);
+    return finished;
 }
 
 static void *watcher_main(void *argument) {
@@ -546,6 +597,10 @@ static void *watcher_main(void *argument) {
         if (descriptors[1].revents) return NULL;
         if (!descriptors[0].revents) continue;
         int peeked = maelys_http_peek_disambiguate(watcher->fd);
+        /* Checked AFTER the peek and before acting on it: an exchange that
+         * ended while this thread was in poll() has nothing left to cancel, and
+         * whatever the peer sent belongs to its next request. */
+        if (watcher_finished(watcher)) return NULL;
         if (peeked == 0) {
             /* FIN. On this transport the client closing IS the cancellation. */
             watcher_raise(watcher);
@@ -572,6 +627,8 @@ static int watcher_start(socket_watcher_t *watcher, int fd, const char *peer) {
     watcher->peer = peer;
     watcher->cancel_read = -1;
     watcher->cancel_write = -1;
+    if (pthread_mutex_init(&watcher->mutex, NULL) != 0) return -1;
+    watcher->mutex_ready = 1;
     if (create_wakeup_pipe(&watcher->cancel_read, &watcher->cancel_write) != 0) {
         return -1;
     }
@@ -588,6 +645,9 @@ static int watcher_start(socket_watcher_t *watcher, int fd, const char *peer) {
 
 static void watcher_stop(socket_watcher_t *watcher) {
     if (watcher->started) {
+        pthread_mutex_lock(&watcher->mutex);
+        watcher->finished = 1;
+        pthread_mutex_unlock(&watcher->mutex);
         /* Raised by this thread too, so the watcher leaves poll() whether or
          * not the client did anything. Joined before either end is closed. */
         watcher_raise(watcher);
@@ -598,6 +658,10 @@ static void watcher_stop(socket_watcher_t *watcher) {
     if (watcher->cancel_write >= 0) close(watcher->cancel_write);
     watcher->cancel_read = -1;
     watcher->cancel_write = -1;
+    if (watcher->mutex_ready) {
+        pthread_mutex_destroy(&watcher->mutex);
+        watcher->mutex_ready = 0;
+    }
 }
 
 /* ------------------------------------------------------------ the exchange */
@@ -888,24 +952,6 @@ static int serve_request(connection_t *connection, int is_first_request) {
         return 0;
     }
 
-    header_lookup_context_t lookup = {.parser = &parser};
-    socket_writer_t writer_state = {
-        .connection = connection,
-        /* Keep-alive is permitted for JSON-mode replies and refused for event
-         * streams; writer_begin_stream clears it. */
-        .keep_alive = !half_closed && !client_asked_to_close(&parser),
-        .began = 0,
-        .streamed = 0
-    };
-    maelys_mcp_http_response_writer_t writer = {
-        .context = &writer_state,
-        .begin_json = writer_begin_json,
-        .begin_stream = writer_begin_stream,
-        .write_event = writer_write_event,
-        .write_keepalive = writer_write_keepalive,
-        .end_stream = writer_end_stream,
-        .status_only = writer_status_only
-    };
     /*
      * The watcher, and only when there is something left to watch for. A
      * half-closed peer has already said everything it is going to say, so the
@@ -923,6 +969,34 @@ static int serve_request(connection_t *connection, int is_first_request) {
     if (!half_closed) {
         (void)watcher_start(&watcher, connection->fd, connection->peer);
     }
+
+    header_lookup_context_t lookup = {.parser = &parser};
+    socket_writer_t writer_state = {
+        .connection = connection,
+        /* Keep-alive is permitted for JSON-mode replies and refused for event
+         * streams; writer_begin_stream clears it. */
+        .keep_alive = !half_closed && !client_asked_to_close(&parser),
+        .began = 0,
+        .streamed = 0,
+        /*
+         * The writer is what knows when the response is COMPLETE, which is
+         * where the pipelining window closes. Not when _handle returns: the
+         * channel is still being torn down then, and a kept-alive client that
+         * reads its answer and sends the next request promptly would be
+         * reported as pipelining for bytes that arrived after the response the
+         * rule measures against.
+         */
+        .watcher = &watcher
+    };
+    maelys_mcp_http_response_writer_t writer = {
+        .context = &writer_state,
+        .begin_json = writer_begin_json,
+        .begin_stream = writer_begin_stream,
+        .write_event = writer_write_event,
+        .write_keepalive = writer_write_keepalive,
+        .end_stream = writer_end_stream,
+        .status_only = writer_status_only
+    };
 
     maelys_mcp_http_request_t request = {
         .method = "POST",
