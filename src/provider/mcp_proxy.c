@@ -2,14 +2,11 @@
 #include "maelys/mcp/version.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -58,7 +55,14 @@ typedef struct proxy_binding {
 } proxy_binding_t;
 
 typedef struct proxy_context {
-    pid_t pid;
+    /*
+     * The upstream, seen only through the seam - no pid, for the same reason
+     * the native provider has none: EOF on fd is the runtime's sole liveness
+     * signal, and an upstream started inside a container or by an executord
+     * must fit here unchanged.
+     */
+    const maelys_mcp_process_launcher_t *launcher;
+    maelys_mcp_process_instance_t instance;
     int fd;
     size_t max_message_bytes;
     unsigned int call_timeout_ms;
@@ -612,27 +616,6 @@ static maelys_mcp_result_t proxy_call(
     return MAELYS_MCP_OK;
 }
 
-static long long monotonic_milliseconds(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return (long long)now.tv_sec * 1000LL + (long long)now.tv_nsec / 1000000LL;
-}
-
-static int wait_for_child(pid_t pid, unsigned int timeout_ms) {
-    long long start = monotonic_milliseconds();
-    if (start < 0) return 0;
-    for (;;) {
-        int status = 0;
-        pid_t waited = waitpid(pid, &status, WNOHANG);
-        if (waited == pid || (waited < 0 && errno == ECHILD)) return 1;
-        if (waited < 0 && errno != EINTR) return 0;
-        long long now = monotonic_milliseconds();
-        if (now < 0 || now - start >= (long long)timeout_ms) return 0;
-        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
-        while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {}
-    }
-}
-
 static void proxy_destroy(void *context) {
     proxy_context_t *proxy = context;
     if (!proxy) return;
@@ -641,12 +624,21 @@ static void proxy_destroy(void *context) {
         proxy->closing = 1;
         pthread_cond_broadcast(&proxy->response_ready);
         pthread_mutex_unlock(&proxy->state_mutex);
-        /* EOF on the upstream's stdin is how an MCP stdio server is asked to
-         * exit; the SHUT_RDWR below is what guarantees the reader unblocks
-         * even when the upstream ignores it. */
+        /*
+         * EOF on the upstream's stdin is how an MCP stdio server is asked to
+         * exit. That half-close is this kind's protocol goodbye and stays
+         * above the seam, exactly as the native provider's provider/shutdown
+         * exchange does - they are protocol facts, not launch facts, and
+         * unifying them would be wrong.
+         *
+         * The SHUT_RDWR immediately after is not a second goodbye: it belongs
+         * to closing the transport, which is the ladder's first step, and is
+         * what guarantees the reader unblocks so it can be joined. Nothing
+         * separates the two because nothing should - the upstream's time to
+         * exit is the ladder's grace budget, which is a bound the runtime
+         * states, rather than a sleep nobody can account for.
+         */
         (void)shutdown(proxy->fd, SHUT_WR);
-        int exited = proxy->pid > 0 ?
-            wait_for_child(proxy->pid, PROXY_SHUTDOWN_TIMEOUT_MS) : 1;
         (void)shutdown(proxy->fd, SHUT_RDWR);
         if (proxy->reader_started) {
             (void)pthread_join(proxy->reader_thread, NULL);
@@ -654,17 +646,19 @@ static void proxy_destroy(void *context) {
         }
         close(proxy->fd);
         proxy->fd = -1;
-        if (!exited && proxy->pid > 0) {
-            (void)kill(proxy->pid, SIGTERM);
-            if (!wait_for_child(proxy->pid, PROXY_SHUTDOWN_TIMEOUT_MS)) {
-                (void)kill(proxy->pid, SIGKILL);
-                while (waitpid(proxy->pid, NULL, 0) < 0 && errno == EINTR) {}
-            }
-        }
-    } else if (proxy->pid > 0 && !wait_for_child(proxy->pid, PROXY_SHUTDOWN_TIMEOUT_MS)) {
-        (void)kill(proxy->pid, SIGKILL);
-        while (waitpid(proxy->pid, NULL, 0) < 0 && errno == EINTR) {}
     }
+    /*
+     * One bounded ladder for both provider kinds, and for both the
+     * transport-up and transport-never-opened cases this teardown serves.
+     * The containment diagnostic stops here: the destroy contract is void
+     * from this frame all the way up, so there is no caller to hand it to -
+     * tests/test_process_launcher.c pins the ladder's own return instead.
+     */
+    char *containment_error = NULL;
+    (void)maelys_mcp_process_shutdown(proxy->launcher, &proxy->instance,
+        PROXY_SHUTDOWN_TIMEOUT_MS, PROXY_SHUTDOWN_TIMEOUT_MS,
+        &containment_error);
+    free(containment_error);
     if (proxy->reader) {
         maelys_mcp_line_reader_clear(proxy->reader);
         free(proxy->reader);
@@ -693,87 +687,56 @@ static void proxy_destroy(void *context) {
     free(proxy);
 }
 
-static int set_close_on_exec(int fd) {
-    int flags = fcntl(fd, F_GETFD);
-    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
 static maelys_mcp_result_t spawn_upstream(
     const maelys_mcp_proxy_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
     proxy_context_t **out_proxy,
     char **out_error) {
-    int sockets[2] = {-1, -1};
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
-        replace_error(out_error, "socketpair failed");
-        return MAELYS_MCP_ERR_IO;
-    }
-    if (!set_close_on_exec(sockets[0]) || !set_close_on_exec(sockets[1])) {
-        close(sockets[0]);
-        close(sockets[1]);
-        replace_error(out_error, "cannot protect upstream MCP descriptors");
-        return MAELYS_MCP_ERR_IO;
-    }
+    /*
+     * The upstream's argv is the caller's whole vector, not supplements: an
+     * MCP server has an arbitrary CLI (--stdio, serve, a subcommand, a script
+     * path) and the runtime holds no invariant about how a third-party server
+     * is invoked. That is the deliberate asymmetry with the native provider,
+     * where the runtime does hold one and compiles argv itself. Either way the
+     * launcher receives a complete vector.
+     */
     char *const fallback_argv[] = {(char *)options->executable_path, NULL};
-    char *const *child_argv = options->argv ? options->argv : fallback_argv;
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(sockets[0]);
-        close(sockets[1]);
-        replace_error(out_error, "fork failed");
-        return MAELYS_MCP_ERR_IO;
-    }
-    if (pid == 0) {
-        close(sockets[0]);
-        if (dup2(sockets[1], STDIN_FILENO) < 0 ||
-            dup2(sockets[1], STDOUT_FILENO) < 0) _exit(126);
-        if (sockets[1] != STDIN_FILENO && sockets[1] != STDOUT_FILENO) {
-            close(sockets[1]);
-        }
-        /* dup2 with oldfd == newfd is a POSIX no-op that leaves FD_CLOEXEC
-         * set - execve would then close the protocol end, and the child
-         * would start with stdin or stdout already gone. The line above
-         * guards that same edge case for the close; this clears the flag.
-         * For the common oldfd != newfd case dup2 already cleared it and
-         * this is a harmless second clear. */
-        if (fcntl(STDIN_FILENO, F_SETFD, 0) != 0 ||
-            fcntl(STDOUT_FILENO, F_SETFD, 0) != 0) _exit(126);
-
-        /* Same scrubbed environment the process provider hands its children:
-         * an upstream inherits no ambient credentials from this process. */
-        char *const environment[] = {
-#ifdef __APPLE__
-            (char *)"PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-#else
-            (char *)"PATH=/usr/local/bin:/usr/bin:/bin",
-#endif
-            (char *)"LANG=C",
-            (char *)"LC_ALL=C",
-            NULL
-        };
-        execve(options->executable_path, child_argv, environment);
-        _exit(127);
-    }
-    close(sockets[1]);
-#ifdef SO_NOSIGPIPE
-    int no_sigpipe = 1;
-    if (setsockopt(sockets[0], SOL_SOCKET, SO_NOSIGPIPE,
-        &no_sigpipe, sizeof(no_sigpipe)) != 0) {
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
-        replace_error(out_error, "cannot configure upstream MCP socket safety");
-        return MAELYS_MCP_ERR_IO;
-    }
-#endif
+    maelys_mcp_process_spec_t spec = {
+        .executable_path = options->executable_path,
+        .argv = options->argv ? options->argv : fallback_argv,
+        .execution_profile = NULL,
+        .max_message_bytes = options->max_message_bytes,
+        /* One connect budget covers spawn, era negotiation and the single
+         * tools/list, so the launch's share of it is the whole thing. */
+        .spawn_timeout_ms = options->connect_timeout_ms,
+        .grace_timeout_ms = PROXY_SHUTDOWN_TIMEOUT_MS,
+        .force_timeout_ms = PROXY_SHUTDOWN_TIMEOUT_MS,
+        /*
+         * STDIO, necessarily, and structurally rather than by policy: an
+         * mcp-proxy upstream is a third-party MCP server that speaks stdin and
+         * stdout by specification and will never understand a protocol
+         * descriptor on fd 3. maelys_mcp_proxy_options_t exposes no layout
+         * field, so this kind cannot be given anything else even by mistake.
+         */
+        .fd_layout = MAELYS_MCP_PROCESS_FD_STDIO
+    };
+    maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
+    maelys_mcp_result_t launch_status = maelys_mcp_process_launch(launcher,
+        &spec, &instance, out_error);
+    if (launch_status != MAELYS_MCP_OK) return launch_status;
     proxy_context_t *proxy = calloc(1u, sizeof(*proxy));
     if (!proxy) {
-        close(sockets[0]);
-        (void)kill(pid, SIGKILL);
-        (void)waitpid(pid, NULL, 0);
+        close(instance.protocol_fd);
+        /* Forced, with no graceful rung: the child is seconds old and has
+         * produced nothing to flush, and this is a failure of the runtime's
+         * own rather than a shutdown the upstream deserves notice of. */
+        maelys_mcp_process_abandon(launcher, &instance,
+            PROXY_SHUTDOWN_TIMEOUT_MS);
         return MAELYS_MCP_ERR_MEMORY;
     }
     proxy->fd = -1;
-    proxy->pid = pid;
+    proxy->launcher = launcher;
+    proxy->instance = instance;
     proxy->max_message_bytes = options->max_message_bytes;
     proxy->call_timeout_ms = options->call_timeout_ms;
     proxy->reader = calloc(1u, sizeof(*proxy->reader));
@@ -789,8 +752,7 @@ static maelys_mcp_result_t spawn_upstream(
     proxy->state_mutex_initialized = 1;
     if (maelys_mcp_cond_init_monotonic(&proxy->response_ready) != 0) goto failed;
     proxy->response_ready_initialized = 1;
-    proxy->fd = sockets[0];
-    sockets[0] = -1;
+    proxy->fd = instance.protocol_fd;
     if (pthread_create(&proxy->reader_thread, NULL, proxy_reader_main, proxy) != 0) {
         goto failed;
     }
@@ -798,7 +760,16 @@ static maelys_mcp_result_t spawn_upstream(
     *out_proxy = proxy;
     return MAELYS_MCP_OK;
 failed:
-    if (sockets[0] >= 0) close(sockets[0]);
+    if (proxy->fd < 0) close(instance.protocol_fd);
+    /*
+     * Abandoned rather than shut down: nothing has spoken to this upstream
+     * yet, so it is owed no goodbye and no graceful rung. Doing it here also
+     * leaves instance_live clear, which makes the ladder inside proxy_destroy
+     * the no-op it should be - destroy still reaches the launcher exactly
+     * once, from exactly one place.
+     */
+    maelys_mcp_process_abandon(proxy->launcher, &proxy->instance,
+        PROXY_SHUTDOWN_TIMEOUT_MS);
     replace_error(out_error, "cannot start the upstream MCP transport");
     proxy_destroy(proxy);
     return status;
@@ -1018,7 +989,24 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
     char **out_error) {
+    /* The API that predates the seam, unchanged: it binds the launcher that
+     * reproduces what it always did. */
+    return maelys_mcp_provider_proxy_spawn_with_launcher(options,
+        maelys_mcp_posix_launcher(), out_provider, out_skipped_tools,
+        out_error);
+}
+
+maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
+    const maelys_mcp_proxy_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
+    char **out_error) {
     if (out_skipped_tools) *out_skipped_tools = NULL;
+    if (!launcher) {
+        replace_error(out_error, "upstream MCP launcher must not be null");
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
     if (!options || !options->executable_path ||
         options->executable_path[0] != '/' || !out_provider ||
         (options->tool_prefix && !*options->tool_prefix)) {
@@ -1063,7 +1051,8 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
         return MAELYS_MCP_ERR_IO;
     }
     proxy_context_t *proxy = NULL;
-    maelys_mcp_result_t status = spawn_upstream(&normalized, &proxy, out_error);
+    maelys_mcp_result_t status = spawn_upstream(&normalized, launcher, &proxy,
+        out_error);
     if (status != MAELYS_MCP_OK) return status;
     status = negotiate_era(proxy, deadline_ms, out_error);
     if (status != MAELYS_MCP_OK) {

@@ -35,6 +35,16 @@ channels, enqueue requests through `maelys_mcp_channel_handle`, pump ordered out
 with `maelys_mcp_channel_next`, and destroy every channel before destroying its
 runtime. No ABI 1 compatibility wrappers are exported.
 
+The process launch seam (`maelys/mcp/process_launcher.h`,
+`maelys_mcp_provider_spawn_with_launcher` and its proxy twin) is the most recent
+addition made that way: new structures reached by new entry points, with every
+existing entry point preserved as a wrapper that binds the POSIX launcher, so no
+released layout changed and `MAELYS_MCP_ABI_VERSION` did not move. None of its
+structures carries a `struct_size` field, and none will: this policy's answer to
+extension is a new structure or a new versioned constructor, and a second mechanism
+would buy silent tolerance of mismatched builds in place of the link error this
+policy prefers.
+
 ABI 3 was introduced by version 0.14.0. It removes `authorize`, `audit` and
 `policy_context` from `maelys_mcp_runtime_config_t`: the middleware chain
 (`maelys/mcp/middleware.h`) replaces those callbacks, and

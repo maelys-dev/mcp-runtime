@@ -22,6 +22,40 @@ if search_c '(^|[^[:alnum:]_])(system|popen)[[:space:]]*\(|/bin/(ba)?sh|sh[[:spa
   exit 1
 fi
 
+# The launch seam, mechanically. A second fork/exec site is a second bypass of
+# whatever confinement the launcher applies, so process creation is permitted
+# only under src/process/ - the one directory the Executor adapter replaces.
+# Without this rule the next provider kind grows its own fork in review-sized
+# increments; with it, a bypass cannot merge. See docs/launch-contract-design.md.
+search_process_primitives() {
+  local pattern=$1
+  shift
+  if command -v rg >/dev/null 2>&1; then
+    rg -n "$pattern" "$@" --glob '*.[ch]' --glob '!src/process/*'
+  else
+    grep -R -n -E --include='*.c' --include='*.h' --exclude-dir='process' \
+      "$pattern" "$@"
+  fi
+}
+
+process_primitive='(^|[^[:alnum:]_])(fork|execve|execvp|posix_spawn|waitpid|socketpair)[[:space:]]*\('
+if search_process_primitives "$process_primitive" src host; then
+  echo "Process launch primitive outside src/process/" >&2
+  exit 1
+fi
+
+# The seam's own conformance suite proves a provider lifecycle runs on a
+# launcher that starts no process at all. A fork in that file would mean it was
+# testing the POSIX path again by accident. socketpair is deliberately not in
+# this narrower pattern: the fake launcher's transport is one, and a socketpair
+# creates no process.
+process_creation='(^|[^[:alnum:]_])(fork|execve|execvp|posix_spawn|waitpid)[[:space:]]*\('
+if [ -f tests/test_process_launcher.c ] &&
+   search_c "$process_creation" tests/test_process_launcher.c; then
+  echo "The launcher conformance suite must not create processes itself" >&2
+  exit 1
+fi
+
 if search_c '^#include[[:space:]]+"src/' include; then
   echo "Public header includes a private implementation header" >&2
   exit 1
