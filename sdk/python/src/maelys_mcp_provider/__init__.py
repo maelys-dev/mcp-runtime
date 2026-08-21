@@ -808,15 +808,72 @@ def _isolated_transport() -> TextIO:
     return os.fdopen(transport_fd, "w", encoding="utf-8", buffering=1)
 
 
+def _provider_fd_from_environment() -> int | None:
+    """MAELYS_PROVIDER_FD (docs/launch-contract-design.md, "The child's
+    descriptors"): the launcher's declaration that this child was started
+    under MAELYS_MCP_PROCESS_FD_ISOLATED, with the protocol duplex on this
+    descriptor and fd 1 already wired to stderr before this process ever ran.
+    Absent, empty, or not a clean positive integer all mean the same thing -
+    "STDIO", the layout this SDK has always spoken - never a fatal error: an
+    unparsable value is treated exactly like an absent one.
+    """
+    text = os.environ.get("MAELYS_PROVIDER_FD")
+    if not text:
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _provider_fd_streams(fd: int) -> tuple[TextIO, TextIO]:
+    """Adopts the launcher's descriptor for both directions of the protocol.
+
+    The launcher clears FD_CLOEXEC on this fd so it survives execve, which
+    also makes it inheritable by anything this provider spawns of its own. A
+    grandchild holding a live copy would defeat the runtime's only liveness
+    signal - EOF on the fd when the provider itself dies - so this re-arms
+    close-on-exec on both directions the instant they are opened
+    (docs/launch-contract-design.md, "The SDK must re-set FD_CLOEXEC on the
+    protocol fd at startup"). The write direction is a dup rather than a
+    second fdopen of the same fd, so each stream's own buffering and closing
+    stays independent - the same shape _isolated_transport already uses for
+    its duplicate.
+    """
+    os.set_inheritable(fd, False)
+    write_fd = os.dup(fd)
+    os.set_inheritable(write_fd, False)
+    read_stream = os.fdopen(fd, "r", encoding="utf-8")
+    write_stream = os.fdopen(write_fd, "w", encoding="utf-8", buffering=1)
+    return read_stream, write_stream
+
+
 def serve_provider(
     provider: Provider,
     input_stream: TextIO | None = None,
     transport_stream: TextIO | None = None,
     isolate_stdout: bool = True,
 ) -> int:
-    source = input_stream or sys.stdin
-    owns_transport = transport_stream is None and isolate_stdout
-    transport = transport_stream or (_isolated_transport() if isolate_stdout else sys.stdout)
+    # An explicit input_stream/transport_stream from the caller is a stronger,
+    # more deliberate statement than an inherited environment variable and
+    # always wins. Otherwise, MAELYS_PROVIDER_FD - when present and usable -
+    # supplies both directions: under ISOLATED the host has already wired fd 1
+    # to stderr, so isolate_stdout (which only ever touches sys.stdout) has
+    # nothing left to protect and is not consulted. Absent, this is
+    # byte-identical to before MAELYS_PROVIDER_FD existed.
+    provider_fd = None
+    if input_stream is None and transport_stream is None:
+        provider_fd = _provider_fd_from_environment()
+    owns_source = False
+    if provider_fd is not None:
+        source, transport = _provider_fd_streams(provider_fd)
+        owns_transport = True
+        owns_source = True
+    else:
+        source = input_stream or sys.stdin
+        owns_transport = transport_stream is None and isolate_stdout
+        transport = transport_stream or (_isolated_transport() if isolate_stdout else sys.stdout)
     write_lock = threading.Lock()
 
     def write_message(message: JsonObject) -> None:
@@ -854,6 +911,8 @@ def serve_provider(
         provider.events._deactivate()
         if owns_transport:
             transport.close()
+        if owns_source:
+            source.close()
     return 0
 
 
