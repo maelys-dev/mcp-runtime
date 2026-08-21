@@ -52,8 +52,10 @@
 - Stdio output writes have a bounded per-message deadline; a non-draining client closes
   the output bus and wakes blocked producers instead of freezing the runtime.
 - Every client channel has an independent bounded queue, subscription registry,
-  cancellation scope and legacy state. Identical JSON-RPC ids on different channels
-  cannot collide or receive each other's events.
+  cancellation scope, protocol-era policy and legacy state. Identical JSON-RPC ids on
+  different channels cannot collide or receive each other's events, and a channel
+  narrowed to one protocol era refuses the other one in the dispatcher rather than
+  relying on a transport to filter it out first.
 - Provider event fan-out retains each target channel while delivering outside the
   runtime registry lock. A slow or faulted channel cannot suspend or invalidate its
   peers.

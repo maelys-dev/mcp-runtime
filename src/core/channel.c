@@ -25,6 +25,7 @@ static maelys_mcp_result_t initialize_channel(
         channel->config.admission_timeout_ms = 5000u;
     }
     if (!channel->config.close_timeout_ms) channel->config.close_timeout_ms = 5000u;
+    channel->protocol_eras = MAELYS_MCP_ERA_ALL;
     channel->subscriptions = calloc(runtime->max_subscriptions,
         sizeof(*channel->subscriptions));
     if (!channel->subscriptions) goto failed;
@@ -663,6 +664,36 @@ maelys_mcp_result_t maelys_mcp_channel_accept(
 
 void *maelys_mcp_channel_context(const maelys_mcp_channel_t *channel) {
     return channel ? channel->config.context : NULL;
+}
+
+maelys_mcp_result_t maelys_mcp_channel_set_protocol_eras(
+    maelys_mcp_channel_t *channel,
+    unsigned int eras) {
+    if (!channel || !eras || (eras & ~(unsigned int)MAELYS_MCP_ERA_ALL)) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
+    pthread_mutex_lock(&channel->mutex);
+    if (channel->state != MAELYS_MCP_CHANNEL_ACTIVE) {
+        maelys_mcp_result_t status = channel->state == MAELYS_MCP_CHANNEL_CLOSED ?
+            MAELYS_MCP_ERR_CLOSED : MAELYS_MCP_ERR_STATE;
+        pthread_mutex_unlock(&channel->mutex);
+        return status;
+    }
+    /*
+     * A legacy session that has already been negotiated cannot be withdrawn
+     * underneath the client that negotiated it: every request it sends from
+     * here on is legal under a revision this channel agreed to serve, and
+     * answering them with -32002 afterwards would be the runtime breaking its
+     * own handshake. Narrowing before the first frame is the supported use.
+     */
+    if (channel->legacy_initialize_received &&
+        !(eras & (unsigned int)MAELYS_MCP_ERA_LEGACY)) {
+        pthread_mutex_unlock(&channel->mutex);
+        return MAELYS_MCP_ERR_STATE;
+    }
+    channel->protocol_eras = eras;
+    pthread_mutex_unlock(&channel->mutex);
+    return MAELYS_MCP_OK;
 }
 
 maelys_mcp_result_t maelys_mcp_channel_next(

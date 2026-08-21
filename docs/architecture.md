@@ -112,6 +112,19 @@ The same dispatcher supports:
 
 Modern behavior is selected by
 `params._meta["io.modelcontextprotocol/protocolVersion"]`.
+
+Which of the two a given connection is offered is a property of the **channel**,
+not of the transport and not of the runtime: one runtime can serve a channel
+that speaks both and a channel that speaks only `2026-07-28` at the same time,
+and no transport ever rewrites a dispatch result to make that true. Every
+channel starts serving both, and `maelys_mcp_channel_set_protocol_eras` narrows
+it. The mask has exactly three effects, all inside the dispatcher:
+`server/discover` announces only the eras still set; `initialize` is refused
+with `-32600` once the legacy era is cleared; and a request carrying modern
+`_meta` negotiation is refused with `-32022` once the modern era is cleared,
+naming what the channel does serve. A negotiated legacy session cannot be
+withdrawn afterwards - the setter refuses that, rather than stranding a client
+mid-session.
 Modern final results carry `resultType: "complete"`, server identity metadata, and
 conservative cache hints on cacheable list/discovery operations. When the MRTR module
 is enabled, a provider may instead return `input_required`; the retry's

@@ -245,6 +245,15 @@ struct maelys_mcp_channel {
     maelys_mcp_channel_state_t state;
     int targetable;
     size_t operations_inflight;
+    /*
+     * Which protocol eras this channel serves and announces. Opens at
+     * MAELYS_MCP_ERA_ALL so an untouched channel behaves exactly as it always
+     * did, and is narrowed by maelys_mcp_channel_set_protocol_eras. Written
+     * and read under channel->mutex, because a dispatch on a worker thread
+     * reads it while the transport that created the channel may still be
+     * setting it up.
+     */
+    unsigned int protocol_eras;
     int legacy_initialize_received;
     int legacy_initialized;
     char legacy_client_name[128];
