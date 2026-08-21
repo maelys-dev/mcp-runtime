@@ -42,7 +42,7 @@ extern "C" {
  * The ABI number changes whenever a released public C layout or calling
  * convention changes incompatibly. It is independent from the package version.
  */
-#define MAELYS_MCP_ABI_VERSION 3u
+#define MAELYS_MCP_ABI_VERSION 4u
 
 const char *maelys_mcp_version_string(void);
 unsigned int maelys_mcp_abi_version(void);

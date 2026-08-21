@@ -59,29 +59,6 @@ static void *stdio_writer_main(void *opaque) {
     }
 }
 
-static int set_descriptor_flag(int fd, int command, int flag) {
-    int current = fcntl(fd, command);
-    if (current < 0) return -1;
-    int set_command = command == F_GETFD ? F_SETFD : F_SETFL;
-    return fcntl(fd, set_command, current | flag);
-}
-
-static maelys_mcp_result_t create_wakeup_pipe(int descriptors[2]) {
-    descriptors[0] = -1;
-    descriptors[1] = -1;
-    if (pipe(descriptors) != 0 ||
-        set_descriptor_flag(descriptors[0], F_GETFD, FD_CLOEXEC) != 0 ||
-        set_descriptor_flag(descriptors[1], F_GETFD, FD_CLOEXEC) != 0 ||
-        set_descriptor_flag(descriptors[1], F_GETFL, O_NONBLOCK) != 0) {
-        if (descriptors[0] >= 0) close(descriptors[0]);
-        if (descriptors[1] >= 0) close(descriptors[1]);
-        descriptors[0] = -1;
-        descriptors[1] = -1;
-        return MAELYS_MCP_ERR_IO;
-    }
-    return MAELYS_MCP_OK;
-}
-
 static maelys_mcp_result_t wait_for_input_or_writer(
     int read_fd,
     int wake_fd,
@@ -161,7 +138,7 @@ maelys_mcp_result_t maelys_mcp_runtime_serve_stdio_with_options(
         &reader, runtime->max_message_bytes);
     if (initialized != MAELYS_MCP_OK) return initialized;
     int wake_pipe[2];
-    initialized = create_wakeup_pipe(wake_pipe);
+    initialized = maelys_mcp_create_wakeup_pipe(wake_pipe);
     if (initialized != MAELYS_MCP_OK) {
         maelys_mcp_line_reader_clear(&reader);
         return initialized;

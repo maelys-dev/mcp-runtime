@@ -23,6 +23,32 @@ never invokes a callback or performs I/O.
 - The queue mutex protects links, counters and state only. No serialization, provider
   callback, transport I/O or thread join runs under it.
 
+## The readiness descriptor
+
+A thread inside `maelys_mcp_outbox_next` is waiting on a condition variable, and a
+thread waiting on a condition variable is not watching a socket. A transport whose
+connection can disappear while a provider is still running therefore needs a
+descriptor it can poll beside its own, which is what
+`maelys_mcp_channel_enable_wait_fd` and `maelys_mcp_channel_wait_fd`
+(`src/internal/internal.h`, internal for now) provide.
+
+- **Lazy.** No pipe exists until a transport asks for one, so a stdio channel
+  allocates no extra descriptors and pays no extra write. Enabling is idempotent, and
+  the descriptor a caller already holds stays the one it gets.
+- **Level-triggered, one byte per transition.** The descriptor is readable exactly
+  when `next` would answer immediately — a queued message, or a closed outbox whose
+  `MAELYS_MCP_ERR_CLOSED` has still to be collected. The byte is written on the
+  transition into that state and consumed on the transition out of it, under the same
+  mutex that guards the queue, so a burst of enqueues costs one `write(2)` rather than
+  one per message and the descriptor can never disagree with `queued_messages`.
+- **Poll it, never read it.** The only correct response to readability is
+  `maelys_mcp_channel_next`. Readability can be spurious, which `next` answers with
+  `MAELYS_MCP_ERR_TIMEOUT`; it is never spuriously absent, which is the failure that
+  would wedge a poller.
+- **Failure is the caller's to report.** If the pipe cannot be created the transport
+  refuses the request. Falling back to short timed waits would reintroduce the polling
+  design this descriptor exists to avoid, and would do it invisibly.
+
 ## Capacity and scheduling
 
 Message count and compact serialized bytes are both bounded. Responses and

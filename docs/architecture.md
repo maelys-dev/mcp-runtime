@@ -78,8 +78,12 @@ client-specific adapter belongs in this library.
   already returned. `maelys_mcp_runtime_destroy` drains that ledger before it
   frees anything, so a runtime is never released under a channel that still
   points at it. The embedder-bound channel context can therefore outlive the
-  detaching call, and is only certainly unreachable once
-  `maelys_mcp_runtime_destroy` has returned.
+  detaching call, which is why `maelys_mcp_channel_config_t::context_release`
+  exists: the free calls it, exactly once, whichever path destruction took, so
+  an embedder whose context owns something learns when it stops being
+  reachable instead of having to wait for `maelys_mcp_runtime_destroy`. An
+  embedder that binds no callback still owns the context and still has that
+  wait as its only bound.
 - `maelys_mcp_provider_emit_event` borrows the event payload only for the duration of
   the call. Process providers activate once when the first channel is created and
   remain active until runtime destruction.
@@ -164,15 +168,16 @@ Modern behavior is selected by
 Which of the two a given connection is offered is a property of the **channel**,
 not of the transport and not of the runtime: one runtime can serve a channel
 that speaks both and a channel that speaks only `2026-07-28` at the same time,
-and no transport ever rewrites a dispatch result to make that true. Every
-channel starts serving both, and `maelys_mcp_channel_set_protocol_eras` narrows
-it. The mask has exactly three effects, all inside the dispatcher:
-`server/discover` announces only the eras still set; `initialize` is refused
-with `-32600` once the legacy era is cleared; and a request carrying modern
-`_meta` negotiation is refused with `-32022` once the modern era is cleared,
-naming what the channel does serve. A negotiated legacy session cannot be
-withdrawn afterwards - the setter refuses that, rather than stranding a client
-mid-session.
+and no transport ever rewrites a dispatch result to make that true. The mask is
+`maelys_mcp_channel_config_t::protocol_eras`, fixed at creation, where zero
+means both eras. It has exactly three effects, all inside the dispatcher:
+`server/discover` announces only the eras set; `initialize` is refused with
+`-32600` when the legacy era is absent; and a request carrying modern `_meta`
+negotiation is refused with `-32022` when the modern era is absent, naming what
+the channel does serve. A negotiated legacy session cannot be withdrawn
+afterwards because there is nothing to withdraw it with: ABI 4 replaced the
+0.17.0 setter with this field precisely so that the mask a client negotiates
+against is the mask the channel was born with.
 Modern final results carry `resultType: "complete"`, server identity metadata, and
 conservative cache hints on cacheable list/discovery operations. When the MRTR module
 is enabled, a provider may instead return `input_required`; the retry's
@@ -263,6 +268,12 @@ outbox.
 Responses are preferred, but after eight consecutive responses one pending
 notification is selected. Keyed notification replacement moves the event to the tail,
 preserving the most recent causal position rather than its first occurrence.
+
+A transport that has to watch a socket at the same time as the outbox can ask a
+channel for a readiness descriptor and poll that instead of blocking in
+`maelys_mcp_channel_next`. The pipe is created only on request, so a transport that
+does not poll allocates nothing and pays nothing, and it is level-triggered on the
+empty/non-empty boundary rather than raised per message. See `docs/outbox.md`.
 
 The queues accept multiple producers. Native and process-provider event APIs are
 asynchronous with respect to protocol writes. Request dispatch is synchronous with

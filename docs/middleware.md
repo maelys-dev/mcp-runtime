@@ -262,7 +262,10 @@ exists; the link does not.
   pointer is the per-principal anchor, and the only thing worth
   authenticating against: `client_name` is client-asserted, unauthenticated
   and defaults to `unknown` in both protocol eras. Record it; never decide on
-  it.
+  it. It is valid for as long as a hook can run: when the embedder binds
+  `maelys_mcp_channel_config_t::context_release`, the runtime hands the context
+  back only at the channel's real free, which is after every operation that
+  could have reached a hook has finished.
 - **The request's whole `params`.** `inputResponses` and `requestState` are
   siblings of `arguments`, so a hook seeing only a name and its arguments
   would be blind to every MRTR continuation — elicitation answers and sampling

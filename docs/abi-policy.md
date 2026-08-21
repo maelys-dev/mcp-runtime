@@ -45,6 +45,37 @@ extension is a new structure or a new versioned constructor, and a second mechan
 would buy silent tolerance of mismatched builds in place of the link error this
 policy prefers.
 
+ABI 4 replaces the 0.17.0 protocol-era setter with two additions to
+`maelys_mcp_channel_config_t`, and the migration is a recompile for anyone who
+never restricted eras.
+
+- **`protocol_eras`, and the removal of `maelys_mcp_channel_set_protocol_eras`.**
+  Set `.protocol_eras` in the config already passed to
+  `maelys_mcp_channel_create` instead of calling the setter after it. Zero means
+  `MAELYS_MCP_ERA_ALL`, so a zero-initialized config behaves exactly as it did
+  before; a non-zero mask carrying a bit outside `MAELYS_MCP_ERA_ALL` is
+  `MAELYS_MCP_ERR_ARGUMENT` from `maelys_mcp_channel_create` and no channel is
+  created. The setter's state rules disappear with it: there is no longer a
+  window in which a channel's era set can be narrowed after traffic has
+  started, and therefore no "cannot withdraw `MAELYS_MCP_ERA_LEGACY` after
+  `initialize`" case and no closing-channel refusal to handle.
+- **`context_release` and `release_context`: the channel context can own
+  something.** When `context_release` is set it is called exactly once, with
+  `release_context` and `context`, at the moment the context stops being
+  reachable - on the synchronous destroy path and on
+  `maelys_mcp_channel_destroy_detached`'s deferred one alike, on whichever
+  thread performs the real free. NULL preserves the previous behaviour, in
+  which the runtime owns nothing. This closes the gap 0.17.0's detached
+  destruction left open, where an embedder had to wait for
+  `maelys_mcp_runtime_destroy` to reclaim a detached channel's context.
+
+The break is taken now for one stated reason - there are no external users, so
+the migration costs a recompile - and its scope is deliberately these fields
+and this removal. The structural changes an ABI bump would otherwise be saved
+for (typed identity, cancellation policy, transport options) are not in it and
+remain on the 1.0 runway. See `docs/authenticated-principal-design.md` for the
+ownership argument behind `context_release`.
+
 ABI 3 was introduced by version 0.14.0. It removes `authorize`, `audit` and
 `policy_context` from `maelys_mcp_runtime_config_t`: the middleware chain
 (`maelys/mcp/middleware.h`) replaces those callbacks, and
