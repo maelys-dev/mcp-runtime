@@ -573,6 +573,32 @@ static void exchange_flags(
 }
 
 /*
+ * Whether this exchange has already been cancelled, asked without waiting.
+ *
+ * It exists for the exchanges that have no drain loop to notice it in. A
+ * notification produces its whole reply synchronously, so nothing would ever
+ * consult the cancellation source - and a peer that has gone would still be
+ * written to, which contradicts the one guarantee this transport makes without
+ * qualification: after a cancellation, no further bytes are written for that
+ * request. Uniform is worth more here than the byte it saves.
+ */
+static int already_cancelled(
+    maelys_mcp_http_exchange_t *exchange, int cancel_fd) {
+    int cancelled = 0;
+    int shutdown = 0;
+    exchange_flags(exchange, &cancelled, &shutdown);
+    if (cancelled) return 1;
+    int descriptors[2] = {cancel_fd, exchange->wake_read};
+    for (size_t index = 0u; index < 2u; ++index) {
+        if (descriptors[index] < 0) continue;
+        struct pollfd probe = {
+            .fd = descriptors[index], .events = POLLIN, .revents = 0};
+        if (poll(&probe, 1u, 0) > 0 && probe.revents) return 1;
+    }
+    return 0;
+}
+
+/*
  * Retiring is what makes maelys_mcp_http_exchange_cancel safe after _handle
  * returns: the handle stops being reachable from the adapter, so a canceller
  * racing the return either got the lock first (and set a flag nobody reads
@@ -1244,7 +1270,16 @@ maelys_mcp_result_t maelys_mcp_http_adapter_handle(
         discard_remaining(channel);
         (void)maelys_mcp_channel_destroy_detached(channel);
         json_decref(root);
-        status = writer->status_only(writer->context, 202, NULL, 0u);
+        /*
+         * Dispatched either way, because the runtime's rules about which
+         * notifications matter are the runtime's; ANSWERED only if there is
+         * still somebody to answer. A cancelled exchange writes nothing, and
+         * that holds for the one reply shape that never enters the drain loop
+         * as much as for the ones that do.
+         */
+        status = already_cancelled(exchange, request->cancel_fd)
+            ? MAELYS_MCP_ERR_CLOSED
+            : writer->status_only(writer->context, 202, NULL, 0u);
         retire_exchange(exchange, out_exchange);
         return status;
     }

@@ -1327,6 +1327,49 @@ static int a_notification_is_accepted_with_202(void) {
     return 0;
 }
 
+/*
+ * A cancelled notification writes nothing either, and this case exists because
+ * the fuzz target found that it did.
+ *
+ * A notification produces its whole reply synchronously, so it never enters the
+ * drain loop and nothing would have consulted the cancellation source: the 202
+ * went out to a peer that had already gone. Harmless in bytes, and wrong in the
+ * only way that matters - it made "after a cancellation, no further bytes are
+ * written for that request" a rule with an exception nobody had written down.
+ *
+ * The notification is still DISPATCHED. Which notifications matter is the
+ * runtime's rule, not the transport's, and a peer leaving does not un-send what
+ * it already said.
+ */
+static int a_cancelled_notification_writes_nothing(void) {
+    int wake[2] = {-1, -1};
+    ASSERT_TRUE(pipe(wake) == 0);
+    ssize_t written = write(wake[1], "x", 1u);
+    ASSERT_TRUE(written == 1);
+    tool_state_t tools = {.entered_write = -1, .hold_read = -1};
+    maelys_mcp_runtime_t *runtime = serving_runtime(&tools);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_http_adapter_t *adapter = adapter_on(runtime);
+    ASSERT_TRUE(adapter != NULL);
+    slice_headers_t headers = {.pairs = H_NOTE_INITIALIZED};
+    maelys_mcp_http_request_t request = make_request(&headers,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\","
+        "\"params\":{" MODERN_META "}}");
+    request.cancel_fd = wake[0];
+    recording_writer_t state = {0};
+    maelys_mcp_http_response_writer_t writer = make_writer(&state);
+    ASSERT_TRUE(maelys_mcp_http_adapter_handle(adapter, &request, &writer, NULL) ==
+        MAELYS_MCP_ERR_CLOSED);
+    ASSERT_TRUE(state.status_only_calls == 0);
+    ASSERT_TRUE(state.begin_json_calls == 0);
+    ASSERT_TRUE(state.begin_stream_calls == 0);
+    maelys_mcp_http_adapter_destroy(adapter);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    close(wake[0]);
+    close(wake[1]);
+    return 0;
+}
+
 /* ------------------------------------------------------ the principal bond */
 
 /*
@@ -1717,6 +1760,8 @@ int main(void) {
             the_dispatch_status_rows},
         {"a notification is accepted with 202 and an empty body",
             a_notification_is_accepted_with_202},
+        {"a cancelled notification writes nothing at all",
+            a_cancelled_notification_writes_nothing},
         {"the principal is retained once and released once",
             the_principal_is_retained_once_and_released_once},
         {"a detached channel releases the principal exactly once, later",
