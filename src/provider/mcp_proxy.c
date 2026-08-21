@@ -981,7 +981,24 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
     char **out_error) {
+    /* The API that predates the seam, unchanged: it binds the launcher that
+     * reproduces what it always did. */
+    return maelys_mcp_provider_proxy_spawn_with_launcher(options,
+        maelys_mcp_posix_launcher(), out_provider, out_skipped_tools,
+        out_error);
+}
+
+maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
+    const maelys_mcp_proxy_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_provider_t **out_provider,
+    char **out_skipped_tools,
+    char **out_error) {
     if (out_skipped_tools) *out_skipped_tools = NULL;
+    if (!launcher) {
+        replace_error(out_error, "upstream MCP launcher must not be null");
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
     if (!options || !options->executable_path ||
         options->executable_path[0] != '/' || !out_provider ||
         (options->tool_prefix && !*options->tool_prefix)) {
@@ -1026,8 +1043,8 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
         return MAELYS_MCP_ERR_IO;
     }
     proxy_context_t *proxy = NULL;
-    maelys_mcp_result_t status = spawn_upstream(&normalized,
-        maelys_mcp_posix_launcher(), &proxy, out_error);
+    maelys_mcp_result_t status = spawn_upstream(&normalized, launcher, &proxy,
+        out_error);
     if (status != MAELYS_MCP_OK) return status;
     status = negotiate_era(proxy, deadline_ms, out_error);
     if (status != MAELYS_MCP_OK) {

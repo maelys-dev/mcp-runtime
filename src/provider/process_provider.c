@@ -1183,6 +1183,21 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     const maelys_mcp_provider_process_options_t *options,
     maelys_mcp_provider_t **out_provider,
     char **out_error) {
+    /* The API that predates the seam, unchanged: it binds the launcher that
+     * reproduces what it always did. */
+    return maelys_mcp_provider_spawn_with_launcher(options,
+        maelys_mcp_posix_launcher(), out_provider, out_error);
+}
+
+maelys_mcp_result_t maelys_mcp_provider_spawn_with_launcher(
+    const maelys_mcp_provider_process_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error) {
+    if (!launcher) {
+        replace_error(out_error, "provider launcher must not be null");
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
     if (!options || !options->executable_path || options->executable_path[0] != '/' ||
         !out_provider) {
         replace_error(out_error, "provider executable must be an absolute path");
@@ -1204,7 +1219,7 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     *out_provider = NULL;
     maelys_mcp_process_context_t *process = NULL;
     maelys_mcp_result_t status = spawn_process(
-        &normalized, maelys_mcp_posix_launcher(), &process, out_error);
+        &normalized, launcher, &process, out_error);
     if (status != MAELYS_MCP_OK) return status;
 
     json_t *description = NULL;
