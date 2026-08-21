@@ -179,10 +179,19 @@ static void build_body(const char *name, char *out, size_t capacity) {
         escaped[produced++] = name[index];
     }
     escaped[produced] = '\0';
+    /*
+     * Full modern metadata, and clientCapabilities is the key that matters
+     * here. Without it the body is refused for malformed `_meta` before method
+     * routing is reached, so every accepted case would answer 200 with -32602
+     * and the target could no longer tell "the header rule passed" from "the
+     * header rule failed" - both would be 200-shaped non-404s. H2 could omit it
+     * because nothing dispatched; H3 cannot.
+     */
     snprintf(out, capacity,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":"
         "{\"name\":\"%s\",\"_meta\":"
-        "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}",
+        "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\","
+        "\"io.modelcontextprotocol/clientCapabilities\":{}}}}",
         escaped);
 }
 
