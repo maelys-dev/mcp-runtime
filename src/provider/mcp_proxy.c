@@ -624,12 +624,20 @@ static void proxy_destroy(void *context) {
         proxy->closing = 1;
         pthread_cond_broadcast(&proxy->response_ready);
         pthread_mutex_unlock(&proxy->state_mutex);
-        /* EOF on the upstream's stdin is how an MCP stdio server is asked to
-         * exit; the SHUT_RDWR below is what guarantees the reader unblocks
-         * even when the upstream ignores it. This half-close is this kind's
-         * protocol goodbye and stays above the seam, exactly as the native
-         * provider's provider/shutdown exchange does - they are protocol
-         * facts, not launch facts, and unifying them would be wrong. */
+        /*
+         * EOF on the upstream's stdin is how an MCP stdio server is asked to
+         * exit. That half-close is this kind's protocol goodbye and stays
+         * above the seam, exactly as the native provider's provider/shutdown
+         * exchange does - they are protocol facts, not launch facts, and
+         * unifying them would be wrong.
+         *
+         * The SHUT_RDWR immediately after is not a second goodbye: it belongs
+         * to closing the transport, which is the ladder's first step, and is
+         * what guarantees the reader unblocks so it can be joined. Nothing
+         * separates the two because nothing should - the upstream's time to
+         * exit is the ladder's grace budget, which is a bound the runtime
+         * states, rather than a sleep nobody can account for.
+         */
         (void)shutdown(proxy->fd, SHUT_WR);
         (void)shutdown(proxy->fd, SHUT_RDWR);
         if (proxy->reader_started) {
