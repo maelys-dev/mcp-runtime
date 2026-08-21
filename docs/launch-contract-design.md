@@ -8,8 +8,19 @@
 > them rather than against memory.
 >
 > Every claim about *current* behaviour below is cited `file:line` against
-> `origin/main` at 0.16.0 and was read, not remembered. Claims about future
-> behaviour are in the future tense throughout.
+> `origin/main` at `475333b`, and was read, not remembered. Claims about
+> future behaviour are in the future tense throughout.
+>
+> **Revised after review.** Four corrections landed: the shutdown ladder is
+> now bounded at its last rung (`destroy` is local release only, and cannot
+> wait); exactly-once teardown is tracked by an explicit `instance_live` flag
+> rather than by handle nullity, since `NULL` is a valid handle; the isolated
+> fd layout is a function of the child's **protocol type** rather than of the
+> deployment, which makes it unavailable to `mcp-proxy` upstreams and
+> withdraws this document's earlier proposal to let `executionProfile` select
+> it; and two descriptor-flag details are stated that the first draft got
+> wrong or omitted. "Decisions taken on the first draft's open questions"
+> records all of it, including what was overturned.
 >
 > The consumer this seam exists for — Maelys Executor, the sandboxing policy
 > enforcement point — is **out of this repository**. Phase M4.6 shows only how
@@ -83,11 +94,24 @@ typedef struct maelys_mcp_process_spec {
      * down so a launcher can size a buffer or refuse an absurd value; the
      * runtime enforces it regardless of what the launcher does with it. */
     size_t max_message_bytes;
-    /* The budget each rung of the shutdown ladder gets. */
-    unsigned int stop_timeout_ms;
-    /* Which descriptor arrangement the child gets; see "The child's
-     * descriptors". MAELYS_MCP_PROCESS_FD_STDIO is zero, so a zeroed spec
-     * reproduces today's behaviour. */
+    /*
+     * The budget spawn itself gets. A fork-and-exec launcher cannot block
+     * and satisfies this trivially; a launcher talking to a remote
+     * maelys-executord can, and must honour it. See "Budgets the runtime
+     * states but cannot enforce".
+     */
+    unsigned int spawn_timeout_ms;
+    /* The two rungs of the shutdown ladder, separately budgeted: a polite
+     * request deserves longer than a kill does. */
+    unsigned int grace_timeout_ms;
+    unsigned int force_timeout_ms;
+    /*
+     * Which descriptor arrangement the child gets. NOT operator
+     * configuration: it is a function of the child's protocol type, derived
+     * by the runtime. See "The child's descriptors".
+     * MAELYS_MCP_PROCESS_FD_STDIO is zero, so a zeroed spec reproduces
+     * today's behaviour.
+     */
     maelys_mcp_process_fd_layout_t fd_layout;
 } maelys_mcp_process_spec_t;
 
@@ -96,8 +120,10 @@ typedef struct maelys_mcp_process_instance {
     /*
      * The duplex protocol transport. Owned by the RUNTIME from the moment
      * spawn returns MAELYS_MCP_OK; the launcher must never touch it again.
-     * Guaranteed by the launcher to be >= 0, close-on-exec, blocking, and
-     * SIGPIPE-safe on write (a write to a dead peer returns EPIPE).
+     * Guaranteed by the launcher to be >= 0, blocking, and close-on-exec in
+     * the RUNTIME's process. Writes to it must not raise SIGPIPE - that is a
+     * property of the write path and of the socket, not of the descriptor;
+     * see "Not raising SIGPIPE is not an fd property".
      */
     int protocol_fd;
     /*
@@ -105,9 +131,20 @@ typedef struct maelys_mcp_process_instance {
      * LAUNCHER. The runtime stores it, hands it back to wait/stop/destroy,
      * and never dereferences, compares, prints or reaps it. It may be a
      * boxed pid_t, an OCI container id, a VM handle, or an id held by a
-     * future maelys-executord. May be NULL if the launcher needs no state.
+     * future maelys-executord.
+     *
+     * NULL is a VALID handle - a stateless launcher needs no state - so
+     * handle nullity must never be used as a liveness marker. That is what
+     * instance_live is for.
      */
     void *handle;
+    /*
+     * Owned and maintained by the RUNTIME, not by the launcher, which must
+     * leave it alone. Set to 1 the moment spawn returns MAELYS_MCP_OK, and
+     * cleared immediately before destroy is called. It is the sole authority
+     * on whether wait/stop/destroy may still be called with this handle.
+     */
+    int instance_live;
 } maelys_mcp_process_instance_t;
 
 typedef enum maelys_mcp_process_stop {
@@ -130,21 +167,34 @@ typedef struct maelys_mcp_process_ops {
         maelys_mcp_process_instance_t *out_instance,
         char **out_error);
     /*
-     * Has it exited? Bounded by timeout_ms; *out_exited is 1 if the launcher
-     * observed termination within the budget, 0 if it did not. Reaps if the
-     * substrate needs reaping. Never called on the request path - only on
-     * the shutdown ladder.
+     * Has it exited? MUST return within timeout_ms. *out_exited is 1 if the
+     * launcher observed termination within the budget, 0 if it did not.
+     * Reaps if the substrate needs reaping - this is the ONLY op that reaps.
+     * Never called on the request path; only on the shutdown ladder.
+     *
+     * A zero return with *out_exited == 0 after a FORCED stop is a
+     * containment failure: the launcher could not terminate what it started.
+     * It is reported as MAELYS_MCP_ERR_STATE with a diagnostic in the
+     * launcher's own channel, and the runtime propagates it rather than
+     * discarding it. See "When the ladder runs out".
      */
     maelys_mcp_result_t (*wait)(
         void *context, void *handle, unsigned int timeout_ms, int *out_exited);
-    /* Signal termination. Non-blocking. Idempotent: the ladder calls it
-     * twice on a stubborn child, and a stop after exit is not an error. */
+    /* Signal termination. MUST NOT block on the child. Idempotent: the
+     * ladder calls it twice on a stubborn child, and a stop after exit is
+     * not an error. */
     maelys_mcp_result_t (*stop)(
         void *context, void *handle, maelys_mcp_process_stop_t mode);
     /*
-     * Release the handle and everything behind it, reaping if that has not
-     * happened. Called EXACTLY ONCE per spawn that returned OK, and never
-     * for one that did not. A handle is invalid the instant this returns.
+     * LOCAL RELEASE ONLY. Frees the handle and any launcher-side memory,
+     * closes launcher-private descriptors, unregisters bookkeeping. It MUST
+     * NOT wait for the child, MUST NOT signal it, and MUST NOT block for an
+     * unbounded time - it is the one op with no timeout parameter, precisely
+     * because it is not allowed to need one.
+     *
+     * Called EXACTLY ONCE per spawn that returned OK, and never for one that
+     * did not; the runtime guarantees this against instance_live. A handle
+     * is invalid the instant this returns.
      */
     void (*destroy)(void *context, void *handle);
 } maelys_mcp_process_ops_t;
@@ -200,6 +250,7 @@ double closes and double reaps. Each is a sentence, not an inference.
 |---|---|---|---|
 | `protocol_fd` | does not exist | **runtime** | does not exist |
 | `handle` | does not exist | **launcher** (runtime holds a token) | does not exist |
+| `instance_live` | — | **runtime**, always | stays 0 |
 | the child itself | does not exist | **launcher** | never started, or already reaped by the launcher |
 | `*out_error` | — | not set | **caller**, `free()` it |
 
@@ -211,14 +262,21 @@ double closes and double reaps. Each is a sentence, not an inference.
   `src/process/` — enforced mechanically, see M4.1. Today the runtime reaps
   in both providers' teardown (`process_provider.c:941-947`,
   `mcp_proxy.c:646-664`); under the seam those calls become `wait`/`stop`/
-  `destroy` and the reaping moves inside the POSIX launcher.
-- **`destroy` is exactly-once, and it is the runtime's job to make it so.**
-  The runtime nulls its stored handle before calling `destroy`, so a second
-  teardown is a no-op rather than a double free. A launcher may assume it is
-  never called twice; the M4.4 suite proves the runtime holds up its end.
-- **A spawn that failed leaves nothing.** No fd, no child, no handle, and
-  emphatically no obligation on the caller to clean up. The launcher unwinds
-  its own partial state before returning non-OK.
+  `destroy`, the reaping moves inside the POSIX launcher, and it happens in
+  `wait` — the only op permitted to block at all.
+- **`destroy` is exactly-once, tracked by `instance_live`, never by handle
+  nullity.** A launcher that needs no per-instance state returns
+  `handle == NULL`, which is valid and must stay usable; treating NULL as
+  "already destroyed" would silently skip teardown for exactly those
+  launchers. So the runtime sets `instance_live = 1` when `spawn` returns OK,
+  clears it immediately before calling `destroy`, and refuses to call `wait`,
+  `stop` or `destroy` on an instance whose flag is clear. A launcher may
+  assume it is never called twice; the M4.4 suite proves the runtime holds up
+  its end, and does it with a launcher whose handle is legitimately NULL.
+- **A spawn that failed leaves nothing.** No fd, no child, no handle,
+  `instance_live` never set, and emphatically no obligation on the caller to
+  clean up. The launcher unwinds its own partial state before returning
+  non-OK.
 
 ### The one case where both sides could be right
 
@@ -238,6 +296,122 @@ launcher" is exactly the property a pluggable seam has to earn.
 Validity is checked as `protocol_fd >= 0` plus one `fcntl(fd, F_GETFD)`. That
 is cheap, happens once per provider, and catches the realistic mistake (an
 uninitialized or already-closed fd) without pretending to catch every one.
+
+### The ladder, and the fact that it must actually be bounded
+
+The teardown sequence is five rungs, and **every rung has a budget**:
+
+```
+stop(GRACEFUL)  ->  wait(grace_timeout_ms)  ->  stop(FORCED)
+                ->  wait(force_timeout_ms)  ->  destroy()
+```
+
+The two `wait` calls are the only places teardown may block, and both are
+bounded by a number the spec carried in. `stop` never blocks on the child.
+`destroy` is local release only.
+
+That last clause is the one worth stating twice, because the obvious
+implementation violates it. It is tempting to let `destroy` "reap if that has
+not already happened" — it reads as tidy, and on POSIX it is one `waitpid`.
+But a `waitpid` with no `WNOHANG` at the end of the ladder reintroduces
+exactly the unbounded wait the ladder exists to eliminate: a child that
+survived `SIGKILL` (uninterruptible sleep in a wedged filesystem or a stuck
+NFS mount, a process the launcher cannot actually signal, a container the
+runtime never had authority over) parks teardown forever. **The bound is
+worth nothing if the last rung can hang**, so `destroy` is defined as unable
+to wait rather than merely discouraged from it — which is also why it is the
+one op with no timeout parameter.
+
+This is not a hypothetical about exotic substrates. It is the same class of
+defect the runtime just fixed on the two early spawn-failure paths
+(`475333b`, PR #53), where an unbounded `waitpid` after a signal the child
+could ignore would park host startup. The ladder is the general form of that
+fix.
+
+### When the ladder runs out
+
+If the second `wait` expires, the child outlived a forced stop. Something has
+to give, and the honest options are a hang or a leak.
+
+**The contract chooses the leak, and requires it to be reported.** `wait`
+returns `MAELYS_MCP_ERR_STATE` with `*out_exited == 0`, which is a
+**containment failure**: the launcher could not terminate what it started.
+The runtime propagates that outcome — it does not swallow it into a void
+teardown — and then calls `destroy`, which releases local state and returns.
+On POSIX the child survives as an orphan the launcher no longer tracks, and
+the process table is the operator's problem from that point.
+
+That is a genuinely bad outcome and the document does not dress it up. It is
+still the right trade: a leaked process is visible in `ps`, survivable, and
+attributable to a named diagnostic, whereas a hung teardown is an unkillable
+host with no message. The wrong version of this design is the one that
+quietly blocks and calls it robustness.
+
+Note also what this makes `destroy`'s return type: `void`, matching
+`maelys_mcp_provider_config_t.destroy` and both existing teardowns
+(`process_destroy`, `proxy_destroy`). The diagnostic has to come from `wait`
+rather than from `destroy` — an op that cannot fail in an interesting way has
+nothing to report.
+
+### Budgets the runtime states but cannot enforce
+
+`spawn_timeout_ms` exists because "a launcher that blocks forever in `spawn`
+is that launcher's problem" is not a guarantee — it is the absence of one.
+A `maelys-executord` reached over a socket can block in `spawn` for as long
+as the far end is unresponsive, and the runtime calling it has no thread to
+time it out with: `spawn` is a blocking call on the startup path, by design.
+
+So the field is a **stated contract obligation**, not an enforced one: a
+launcher must return from `spawn` within `spawn_timeout_ms`, and the runtime
+passes the number so the launcher knows what it is working against. Without
+the field a remote launcher has no budget to honour and has to invent one.
+
+Two other clauses are in the same category and are worth grouping, because a
+reader should know exactly which parts of this contract are checkable:
+
+- the fd must be close-on-exec in the runtime's process;
+- writes to the fd must not raise SIGPIPE;
+- `stop` must not block.
+
+The runtime can cheaply check the *first* of these — `fcntl(F_GETFD)`, which
+it is already doing for validity — and does. The other two it cannot check at
+all without instrumenting the launcher, and pretending otherwise would be
+worse than saying so. What the runtime *can* do, and what M4.4 does, is prove
+that a launcher which violates them produces a diagnosable failure rather
+than a corrupted runtime.
+
+### Not raising SIGPIPE is not an fd property
+
+An earlier draft of this document said the launcher must return an fd that is
+"SIGPIPE-safe". That phrasing is wrong: there is no portable descriptor flag
+that makes a write to a dead peer return `EPIPE` instead of killing the
+process. It is a property of the **write path** and, where the platform
+offers it, of the **socket**, and the runtime already implements it both
+ways:
+
+- **Per write.** `write_all` (`src/core/common.c:141`) and
+  `write_all_with_timeout` (`:190`) both use
+  `send(fd, bytes, n, MSG_NOSIGNAL)` under `#ifdef MSG_NOSIGNAL`, falling
+  back to `write()` on `ENOTSOCK` and on platforms without the flag
+  (`:144-146`, `:209-211`). This is the Linux half.
+- **Per socket.** `setsockopt(SO_NOSIGPIPE)` under `#ifdef SO_NOSIGPIPE`
+  (`process_provider.c:1017-1031`, `mcp_proxy.c:748-758`). This is the
+  macOS/BSD half.
+
+The two are complementary rather than redundant: Linux has `MSG_NOSIGNAL` and
+no `SO_NOSIGPIPE`, macOS has `SO_NOSIGPIPE` and no `MSG_NOSIGNAL`. Together
+they cover both platforms, and on a hypothetical platform with neither the
+runtime would take the signal.
+
+The contract is therefore stated as an obligation on the launcher's
+*arrangement*, not on the descriptor: **a launcher must ensure that writes
+the runtime performs on `protocol_fd` cannot raise SIGPIPE** — by setting
+`SO_NOSIGPIPE` where it exists, and otherwise by returning a descriptor the
+runtime's `MSG_NOSIGNAL` write path can use (i.e. a socket, not a pipe). A
+launcher returning a pipe on Linux would satisfy it via `MSG_NOSIGNAL`'s
+`ENOTSOCK` fallback to `write()` — and would therefore *not* satisfy it,
+which is precisely the kind of thing that has to be written down rather than
+assumed.
 
 ## Two layers of argv
 
@@ -441,6 +615,51 @@ descriptor, use it for reading and writing; otherwise read stdin and write
 stdout as today. Python's `isolate_stdout` becomes redundant under
 `ISOLATED` and stays correct under `STDIO`.
 
+#### Two descriptor-flag details that will otherwise be got wrong
+
+**`dup2` does not clear `FD_CLOEXEC` when the source and target are the same
+descriptor.** Both socketpair ends are marked close-on-exec before the fork
+(`process_provider.c:985`, `mcp_proxy.c:710`) — correctly, so that the
+*parent's* copy does not leak into unrelated children. In the child, `dup2`
+normally clears the flag on the new descriptor, which is what makes today's
+arrangement work. But POSIX specifies that when `oldfd == newfd`, `dup2`
+returns immediately without closing, duplicating, or touching any flag. The
+descriptor then keeps `FD_CLOEXEC` and is closed by `execve`.
+
+So a launcher performing `dup2(sock, 3)` **must explicitly clear
+`FD_CLOEXEC` on fd 3 afterwards**, unconditionally — not only on the branch
+where it believes a duplication occurred. Writing it as "dup2 clears it for
+us" is correct in the common case and silently wrong in the case where
+`socketpair` happened to hand back fd 3, which is exactly the case a
+long-running host with churning descriptors will eventually hit.
+
+This is not only a future concern. **The same latent bug exists in both
+providers today** — see "Contradictions found" — and both files already
+contain a guard for the very same `oldfd == newfd` condition, applied to
+closing rather than to the flag (`process_provider.c:1001`,
+`mcp_proxy.c:729-731`). The authors saw the edge case and handled one of its
+two consequences.
+
+**The SDK must re-set `FD_CLOEXEC` on the protocol fd at startup.** After the
+launcher clears the flag so the descriptor survives `execve`, it is
+inheritable — and a provider that spawns a subprocess of its own hands that
+subprocess a live copy of the protocol socket. Two things then go wrong, and
+the second is worse than the first:
+
+1. The protocol channel leaks into a process that has no business holding it.
+2. **The runtime's death detection stops working.** The grandchild's copy
+   keeps the socket open, so when the provider itself dies the runtime sees
+   no EOF and waits out its full timeout instead of failing immediately.
+   That directly defeats the fd-is-the-only-liveness-signal invariant M4.3
+   establishes.
+
+The fix belongs in the SDKs, one line each, immediately after adopting the
+descriptor: `fcntl(fd, F_SETFD, FD_CLOEXEC)`. Python's `_isolated_transport`
+already does the equivalent for its duplicate today
+(`os.set_inheritable(transport_fd, False)`,
+`sdk/python/src/maelys_mcp_provider/__init__.py:806`), which is the model —
+it is the TypeScript side, and any future SDK, that needs the same care.
+
 ### Correcting the framing: this is a declaration, not a negotiation
 
 It is tempting to describe `MAELYS_PROVIDER_FD` as negotiation with
@@ -465,26 +684,67 @@ than discovered:
    `provider/describe` — the M4.4 "death before describe" case — and reports a
    fast, precise failure. Wiring fd 0 to the socket instead would produce a
    hang until the describe timeout, which is a far worse diagnostic.
-2. **`STDIO` is the zero value**, so nothing gets `ISOLATED` by accident. It
-   is selected, per provider, by whoever configured that provider.
+2. **`STDIO` is the zero value**, so nothing gets `ISOLATED` by accident.
 
-Which means the arrangement is a property of the *deployment*, not of the
-protocol, and it needs a configuration surface. **It is not in manifest v2** —
-v2 carries `args` and `executionProfile`, one bump, both, and no third key.
-In M4.2 the field is set by the embedder through the spec. The two candidate
-resolutions for exposing it, for the owner:
+### The layout is a function of the child's protocol type
 
-- a v3 manifest key (`"stdoutIsolation": true`), explicit and dull; or
-- **let `executionProfile` imply it** — a profile is precisely a statement
-  about how a thing is launched, and `"trusted-local-isolated"` (or a profile
-  an Executor defines) selecting `ISOLATED` needs no new key ever.
+An earlier draft concluded from the above that the arrangement is a property
+of the *deployment* needing a configuration surface, and proposed letting
+`executionProfile` select it. **That was wrong, and the reason it was wrong
+is worth keeping**, because it is the same mistake anyone reasoning from the
+native provider alone will make.
 
-The second is more elegant and is the recommendation, with one honest cost: it
-overloads a field whose defining property is that the *runtime* never
-interprets it. The launcher would interpret it — which is allowed, since
-interpreting profiles is the launcher's entire job — but the mapping then
-lives in launcher documentation rather than in the manifest schema. Open
-question 1.
+`ISOLATED` requires the child to understand `MAELYS_PROVIDER_FD`. A native
+`maelys-provider` child runs a first-party SDK, so that is a thing the
+project can ship. **An `mcp-proxy` upstream is an arbitrary third-party MCP
+server**, and it will never understand `MAELYS_PROVIDER_FD`: it implements
+the MCP stdio transport, which is stdin and stdout, full stop. There is no
+version of "configure it" that changes this. `github-mcp --stdio` speaks
+stdin/stdout because that is what MCP says, and no manifest key, profile
+string or operator intention makes it speak fd 3.
+
+So the layout is **derived, not configured**:
+
+| Provider kind | Layout | Why |
+|---|---|---|
+| native (`maelys-provider` protocol) | `ISOLATED` is available | first-party SDKs, which can be taught the variable |
+| `mcp-proxy` (MCP stdio transport) | **`STDIO`, necessarily** | third-party servers speak stdin/stdout by specification |
+
+The host derives `fd_layout` from the provider's type. No manifest key is
+needed — now or in a future version — and none is proposed. The proxy spawn
+path constructs its own spec, and `fd_layout` is not exposed in
+`maelys_mcp_proxy_options_t`, so a proxy upstream cannot be given `ISOLATED`
+even by mistake: it is structurally unreachable rather than merely checked.
+
+**This also decides the `executionProfile` question, in the negative.**
+Confinement and protocol transport are two independent decisions. Binding the
+layout to the profile would make them one, and the immediate casualty would
+be the case that matters most: a proxied third-party upstream is exactly the
+code you least trust and most want to sandbox, and it can never be
+`ISOLATED`. A profile that implied a layout could therefore never be applied
+to it. `executionProfile` stays purely about confinement and the runtime
+continues never to interpret it.
+
+**None of this weakens the case for the common launcher — it sharpens it.**
+Sandboxing applies to *both* kinds and is the whole reason the seam exists;
+only the transport layout differs, and it differs along a line the runtime
+already knows (the provider kind) rather than one an operator has to get
+right. One launcher, two layouts, one confinement mechanism.
+
+A future compatibility shim could close the gap for proxies — a small relay
+that takes the protocol on fd 3, presents stdin/stdout to the real upstream,
+and is itself the thing that gets `ISOLATED`. It is worth noting as the shape
+of an answer, and it is explicitly not designed here: it adds a process per
+upstream and its own failure modes, and the stdout-corruption risk it
+addresses is far smaller for an upstream the runtime treats as untrusted
+anyway.
+
+For native providers, the transition still needs care, since an old
+first-party SDK breaks under `ISOLATED` exactly as described above.
+`STDIO` therefore stays the default for both kinds through M4: `ISOLATED` is
+opt-in at the C API level, and becomes the native default only in a later
+release, once both first-party SDKs have shipped `MAELYS_PROVIDER_FD` support
+and a deprecation window has passed.
 
 ### The TypeScript quick fix, and its limits
 
@@ -569,14 +829,19 @@ that is largely already done.
    wait → `SIGKILL` → blocking `waitpid`.
    Under the seam, the kind-specific goodbye stays above the seam — a
    `provider/shutdown` exchange for native, a half-close for proxy, because
-   those are protocol facts, not launch facts — and everything after it is one
-   ladder: close `protocol_fd` → `stop(GRACEFUL)` → `wait(stop_timeout_ms)` →
-   `stop(FORCED)` → `destroy`.
-3. **The signalling asymmetry is repaired by construction.** See
-   "Contradictions found" — two of `spawn_process`'s error paths send
-   `SIGTERM` and then block in `waitpid` forever. Once only the launcher
-   signals, there is exactly one escalation policy and it is bounded at every
-   rung.
+   those are protocol facts, not launch facts — and everything after it is the
+   one bounded ladder: close `protocol_fd` → `stop(GRACEFUL)` →
+   `wait(grace_timeout_ms)` → `stop(FORCED)` → `wait(force_timeout_ms)` →
+   `destroy`.
+   Note what both current sequences end with: a blocking `waitpid` with no
+   timeout. Under the ladder that last rung cannot exist — see "The ladder,
+   and the fact that it must actually be bounded" — so this phase removes an
+   unbounded wait from the normal teardown path of both provider kinds, not
+   only from the error paths PR #53 already fixed.
+3. **One escalation policy instead of per-call-site improvisation.** Signals
+   are chosen in exactly one place, so the kind of divergence PR #53 had to
+   repair — `SIGTERM` on two paths and `SIGKILL` on five others in the same
+   function — cannot recur by construction rather than by review vigilance.
 4. **`stop(GRACEFUL)` acquires a substrate-independent meaning:** "request
    termination by whatever means this substrate offers". `SIGTERM` for POSIX,
    a stop request for a container, a control message for an executord. The
@@ -588,8 +853,8 @@ that is largely already done.
 |---|---|---|
 | **M4.1** | Internal extraction into `src/process/posix_launcher.c` plus an internal vtable in `src/process/launcher.h`. Both consumers converted. The three duplicated helpers collapse to one copy. No public API change, no header under `include/`, behaviour byte-identical. | `make check`, `make asan` and `make tsan` green **with no test file modified**. `spawn_process` and `spawn_upstream` contain no `fork`, `execve`, `dup2`, `socketpair`, `kill` or `waitpid`. `scripts/audit_boundaries.sh` gains the process-primitive rule below and passes. |
 | **M4.2** | Public `include/maelys/mcp/process_launcher.h`; `maelys_mcp_provider_spawn_with_launcher` and `maelys_mcp_provider_proxy_spawn_with_launcher`. `maelys_mcp_provider_spawn_with_options` and `maelys_mcp_provider_proxy_spawn` become thin wrappers binding `maelys_mcp_posix_launcher()`. `MAELYS_MCP_ABI_VERSION` → 4. | A new `tests/test_process_launcher.c` installs a fake launcher backed by a `socketpair` and an in-process thread serving `provider/describe`, drives describe → call → destroy to completion, and **contains no `fork`** — asserted by the boundary script, which permits process primitives only in `src/process/`. Every existing test unchanged. |
-| **M4.3** | The single shutdown ladder; death handling stated and enforced as fd-only; the `SIGTERM`/`SIGKILL` asymmetry repaired. | One ladder implementation, called by both provider kinds. A test kills the child mid-call for **both** kinds and asserts the same result code and the same shape of failure message. No `waitpid` or `kill` outside `src/process/`. |
-| **M4.4** | Seam conformance suite, run against **both** the POSIX launcher and the fake launcher. | All eleven cases below pass under both launchers, and under `make asan` and `make tsan`. |
+| **M4.3** | The single bounded shutdown ladder; death handling stated and enforced as fd-only. | One ladder implementation, called by both provider kinds. A test kills the child mid-call for **both** kinds and asserts the same result code and the same shape of failure message. No `waitpid` or `kill` outside `src/process/`, and **no unbounded wait anywhere in teardown** — every blocking call carries a budget from the spec. |
+| **M4.4** | Seam conformance suite, run against **both** the POSIX launcher and the fake launcher. | All thirteen cases below pass under both launchers, and under `make asan` and `make tsan`. |
 | **M4.5** | Manifest v2: `args` and `executionProfile`, one version bump carrying both. `manifestVersion` 1 **and** 2 accepted. | Every existing v1 fixture passes unmodified. New v2 fixtures cover `args` on native, `args` rejected on proxy, `argv` still rejected on native, `executionProfile` accepted and refused. An unrecognized profile fails host startup with a message naming the profile and the provider index. |
 | **M4.6** | **Out of this repository.** The Executor adapter is orchestrator-side. | Nothing merges here. The criterion is that the mapping in "M4.6, elsewhere" holds without a seam change. |
 
@@ -647,28 +912,44 @@ proxy.
 5. **Graceful stop.** Child exits on `stop(GRACEFUL)`. `stop(FORCED)` is never
    reached; asserted by a counting fake launcher.
 6. **Forced escalation.** Child ignores `GRACEFUL`. `FORCED` is reached after
-   `stop_timeout_ms` and the teardown completes — no unbounded wait.
-7. **Double destroy.** The runtime's teardown path is driven twice. `destroy`
+   `grace_timeout_ms` and the teardown completes — no unbounded wait.
+7. **Containment failure.** A fake launcher reports `*out_exited == 0` from
+   *both* waits. Teardown still returns, within roughly
+   `grace_timeout_ms + force_timeout_ms`; `destroy` is still called exactly
+   once; and the `MAELYS_MCP_ERR_STATE` containment diagnostic reaches the
+   caller rather than being swallowed. This is the case that proves the ladder
+   is bounded at its last rung and not merely at its middle ones.
+8. **Double destroy.** The runtime's teardown path is driven twice. `destroy`
    reaches the launcher exactly once; asserted by a counting fake launcher.
-8. **Invalid fd from launcher.** `spawn` returns OK with `protocol_fd = -1`.
-   The runtime calls `stop(FORCED)` then `destroy`, fails with
-   `MAELYS_MCP_ERR_PROTOCOL`, and leaks nothing.
-9. **Both provider kinds through one launcher.** One fake launcher instance
-   serves a native provider and a proxy upstream in the same runtime; both
-   work; the launcher observes two spawns and two destroys.
-10. **Old APIs unchanged.** `maelys_mcp_provider_spawn`,
+9. **NULL handle is not a destroyed handle.** A stateless fake launcher
+   returns `handle == NULL` from every spawn. The full lifecycle still runs:
+   `wait`, `stop` and `destroy` are each called, `destroy` exactly once. This
+   is the case that fails if anyone implements exactly-once against handle
+   nullity instead of against `instance_live`.
+10. **Invalid fd from launcher.** `spawn` returns OK with `protocol_fd = -1`.
+    The runtime calls `stop(FORCED)` then `destroy`, fails with
+    `MAELYS_MCP_ERR_PROTOCOL`, and leaks nothing.
+11. **Both provider kinds through one launcher.** One fake launcher instance
+    serves a native provider and a proxy upstream in the same runtime; both
+    work; the launcher observes two spawns and two destroys. It also observes
+    `fd_layout == STDIO` on the proxy spec — the assertion that the derivation
+    in "The layout is a function of the child's protocol type" is real and not
+    just documented.
+12. **Old APIs unchanged.** `maelys_mcp_provider_spawn`,
     `maelys_mcp_provider_spawn_with_options` and
     `maelys_mcp_provider_proxy_spawn` behave exactly as before, with the
     existing tests as written.
-11. **Handle opacity.** A fake launcher returns a handle that is *not* a valid
+13. **Handle opacity.** A fake launcher returns a handle that is *not* a valid
     pointer to anything the runtime could dereference (a small integer cast to
     `void *`) and the runtime round-trips it through `wait`, `stop` and
     `destroy` untouched. This is the test that would fail the day someone
     "optimizes" the handle into a `pid_t`.
 
-Case 11 is the one worth insisting on. Every other case tests behaviour; that
-one tests the abstraction, and it is the only one that fails loudly if the
-seam quietly re-acquires a PID assumption.
+Cases 9 and 13 are the ones worth insisting on. Every other case tests
+behaviour; those two test the abstraction. 13 fails loudly if the seam
+quietly re-acquires a PID assumption, and 9 fails loudly if it re-acquires the
+assumption that a handle is a pointer worth checking for NULL — the two ways
+this design gets undone by a plausible-looking simplification.
 
 ## Manifest v2
 
@@ -772,14 +1053,23 @@ Drafted here so it can be reviewed as prose rather than assembled later.
 > only through the process launch seam
 > (`docs/launch-contract-design.md`), which starts every child through one
 > vtable, and only for provider kinds that are external processes. The stock
-> POSIX launcher applies no confinement and says so: it accepts no
-> `executionProfile` other than `"trusted-local"` and refuses to start a
-> provider that asks for anything else, rather than starting it unconfined.
+> POSIX launcher applies no confinement and says so: it accepts only an absent
+> `executionProfile` or `"trusted-local"`, and refuses to start a provider
+> that asks for anything else, rather than starting it unconfined.
 >
 > Both external provider kinds — native `maelys-provider` children and
-> `mcp-proxy` upstreams — go through that one seam. A launch path that
-> bypassed it would bypass every future confinement with it, which is why the
-> boundary audit forbids process-creation primitives outside `src/process/`.
+> `mcp-proxy` upstreams — go through that one seam, and confinement applies to
+> both. A launch path that bypassed it would bypass every future confinement
+> with it, which is why the boundary audit forbids process-creation primitives
+> outside `src/process/`.
+>
+> Stdout isolation is a separate and weaker guarantee, and the two must not be
+> confused. A native provider child can be given the protocol on a
+> non-standard descriptor with its stdout wired to stderr, so that no library
+> or dependency inside it can corrupt the protocol stream. An `mcp-proxy`
+> upstream cannot: it is a third-party MCP server that speaks stdin/stdout by
+> specification. Confinement covers both kinds; descriptor isolation covers
+> only the kind whose protocol the project defines.
 >
 > **The runtime never accepts an executable path, an argument vector, an
 > environment variable, an execution profile or a shell fragment from an MCP
@@ -848,12 +1138,20 @@ Each of these is a plausible follow-up; none is decided here, in the style of
   contribute.
 - **No per-call launcher.** One launcher is bound per provider at spawn and
   lives for that provider's lifetime.
-- **No spawn timeout distinct from the describe timeout.** A launcher that
-  blocks forever in `spawn` hangs startup. The mitigation today is that
-  `spawn` is a fork and an exec and cannot block; the mitigation for a remote
-  executord is that launcher's own problem. Naming it because a
-  `maelys-executord` over a socket is exactly the case where it stops being
-  true.
+- **No stdout-isolation shim for `mcp-proxy` upstreams.** They are `STDIO`,
+  necessarily, because MCP's stdio transport is stdin and stdout. A relay
+  process that took the protocol on fd 3 and presented stdin/stdout to the
+  real upstream would close the gap, and is sketched in "The layout is a
+  function of the child's protocol type" — but it costs a process per upstream
+  and brings its own failure modes, for a corruption risk that is smaller
+  precisely where the upstream is least trusted.
+- **No runtime-side enforcement of `spawn_timeout_ms`.** The budget is carried
+  and stated, and a launcher must honour it, but the runtime cannot police it:
+  `spawn` is a blocking call on the startup path with no thread to time it out
+  from. A launcher that blocks forever in `spawn` still hangs startup. See
+  "Budgets the runtime states but cannot enforce" — this is a named gap in the
+  contract rather than an oversight, and closing it would mean either an
+  async spawn or a watchdog thread, neither of which is in M4.
 - **No executable verification.** Inherited unchanged from
   `docs/manifest.md:116-117`: `path` is trusted as given, with no signature or
   checksum check. The seam does not make this better or worse, but it is the
@@ -866,83 +1164,122 @@ Each of these is a plausible follow-up; none is decided here, in the style of
 
 ## Contradictions found in current code and docs
 
-Reported as findings, not fixed here; this document changes no code.
+Reported as findings; this document changes no code. Three of the five raised
+by the first draft have since been fixed on `main` and are kept here, marked,
+because the reasoning above refers to them.
 
-1. **`spawn_process` can hang forever on two error paths.** On the
-   `SO_NOSIGPIPE` failure (`process_provider.c:1019-1025`) and on the context
-   allocation failure (`:1027-1033`), the cleanup sends `SIGTERM` and then
-   calls `waitpid(pid, NULL, 0)` with no `WNOHANG` and no timeout. A child
-   that ignores or blocks `SIGTERM` — a shell wrapper, a Node process with a
-   handler installed, a Python process in an uninterruptible section — leaves
-   the runtime blocked in `waitpid` indefinitely, during host startup, with no
-   diagnostic. The very next error paths in the same function
-   (`:1039-1042`, `:1048-1051`, `:1060-1063`, `:1071-1074`, `:1096-1099`) send
-   `SIGKILL` at the same site, so the function is inconsistent with itself.
-   `mcp_proxy.c:752-754` sends `SIGKILL` at the structurally identical point,
-   so the two files disagree as well. M4.3 removes this by construction — one
-   ladder, bounded at every rung — but it is a live latent hang on `main`
-   today and does not need to wait for M4.
-2. **`docs/abi-policy.md` is stale by one ABI generation.** It describes ABI
-   1 → 2 and ABI 2's semantics (`:32-36`) and never mentions ABI 3, which has
-   shipped: `MAELYS_MCP_ABI_VERSION` is `3u`
-   (`include/maelys/mcp/version.h:19`) and the break is documented in
-   `CHANGELOG.md:229`. Anyone reading the policy document for the current ABI
-   contract — as this design was asked to — gets a version-old answer. A
-   paragraph on ABI 3 mirroring the ABI 2 one would fix it.
-3. **The boundary script does not enforce the layering it is credited with.**
-   Described above under M4.1: its four checks (`scripts/audit_boundaries.sh:14-33`)
-   are application includes, shell primitives, public-header inclusion and
-   tools dispatch in `src/core`. There is no general directory layering rule,
-   so `src/process/` requires a new rule rather than an amended one.
-4. **The two provider kinds disagree about how to ask a child to exit, and
-   neither is wrong.** `process_destroy` sends a `provider/shutdown` request
-   and waits for its answer (`process_provider.c:926-928`); `proxy_destroy`
-   half-closes the socket because EOF on stdin is how an MCP stdio server is
-   told to stop (`mcp_proxy.c:645-647`). Both are correct for their protocol.
-   Flagged because a reader of the M4.3 "uniform death handling" line may
-   expect this difference to be unified too, and it must not be: it is a
-   protocol fact and stays above the seam.
-5. **`docs/security-model.md` is written against 0.10.0.** Line 82 opens
-   "Version 0.10.0 is still a local stdio runtime"; `VERSION` reads `0.16.0`.
-   The statement remains true, but the pinned version number will keep aging.
-   Noted while drafting the new section rather than changed as a drive-by.
+1. **Resolved — `spawn_process` could hang forever on two error paths.** The
+   `SO_NOSIGPIPE` failure path and the context allocation failure path sent
+   `SIGTERM` and then called `waitpid(pid, NULL, 0)` with no `WNOHANG` and no
+   timeout, so a child that ignored or blocked `SIGTERM` parked host startup
+   indefinitely with no diagnostic — while five sibling paths in the same
+   function, and `mcp_proxy.c` at the structurally identical point, already
+   sent `SIGKILL`. **Fixed on `main` by `475333b` (PR #53).** All seven kill
+   sites in `spawn_process` now send `SIGKILL`
+   (`process_provider.c:1026`, `:1035`, `:1045`, `:1054`, `:1065`, `:1077`,
+   `:1102`), with the reasoning recorded in a comment at `:1021-1025`.
+   Note what the fix does **not** cover, and does not claim to: the *normal*
+   teardown paths of both providers still end in a `waitpid` with no
+   `WNOHANG` and no timeout (`process_provider.c:945`, `mcp_proxy.c:661` and
+   `:666`). Those three sit after a `SIGKILL`, so they are bounded in every
+   case where the signal lands — which is why they are a far milder problem
+   than the ones PR #53 fixed, and why they are M4.3's business rather than a
+   hotfix. They are not bounded when it does not land: a child in
+   uninterruptible sleep is unkillable and parks teardown, which is exactly
+   the scenario "When the ladder runs out" exists to answer.
+2. **Resolved — `docs/abi-policy.md` was stale by one ABI generation.** It
+   documented ABI 1 → 2 only, while `MAELYS_MCP_ABI_VERSION` had been `3u`
+   since 0.14.0. **Fixed on `main` by `475333b` (PR #53)**, which added
+   `docs/abi-policy.md:38-46` describing ABI 3 and, usefully for this design,
+   stating outright that later additions within ABI 3 used "new structs and
+   new entry points rather than changes to released layouts, which is this
+   project's preferred idiom". That sentence is now the citable basis for the
+   no-`struct_size` decision above.
+3. **Resolved — `docs/security-model.md` was pinned to 0.10.0.** **Fixed on
+   `main` by `475333b` (PR #53)**; `docs/security-model.md:82-86` now reads
+   "The runtime remains a local stdio host" with no version number to age.
+   The draft section below is written against that revised text.
+4. **Open — the boundary script does not enforce the layering it is credited
+   with.** Described above under M4.1: its four checks
+   (`scripts/audit_boundaries.sh:14-33`) are application includes, shell
+   primitives, public-header inclusion and tools dispatch in `src/core`. There
+   is no general directory layering rule, so `src/process/` requires a new
+   rule rather than an amended one.
+5. **Open, and new — both providers leak `FD_CLOEXEC` into the child on the
+   `oldfd == newfd` path.** Both socketpair ends are marked close-on-exec
+   before the fork (`process_provider.c:985`, `mcp_proxy.c:710`). In the child,
+   `dup2(sockets[1], STDIN_FILENO)` and `dup2(sockets[1], STDOUT_FILENO)`
+   (`process_provider.c:1000`, `mcp_proxy.c:727-728`) normally clear the flag
+   on the new descriptor — but POSIX specifies that `dup2` with equal
+   descriptors returns without closing, duplicating, or touching any flag. So
+   if `socketpair` returns `sockets[1] == 0`, `dup2(0, 0)` is a no-op, fd 0
+   keeps `FD_CLOEXEC`, and `execve` closes it: the child gets a working stdout
+   but no stdin, reads immediate EOF, and exits. The same applies with fd 1
+   and the roles reversed.
+   The condition is rare — it needs stdin or stdout closed in the embedding
+   process when `socketpair` runs — but it is **not** hypothetical to these
+   authors: both files already guard the identical `oldfd == newfd` condition
+   a line later, for closing rather than for the flag
+   (`process_provider.c:1001`, `mcp_proxy.c:729-731`). One of the two
+   consequences of the edge case was handled and the other was not.
+   The fix is an unconditional `set_close_on_exec`-clearing step on fds 0 and
+   1 after the `dup2` pair. It is small and independent of M4; M4.1 would
+   inherit it for free by centralising the child-side arrangement in one
+   place, which is precisely the class of bug the extraction is meant to stop
+   reproducing.
+6. **Not a defect — the two provider kinds disagree about how to ask a child
+   to exit, and neither is wrong.** `process_destroy` sends a
+   `provider/shutdown` request and waits for its answer
+   (`process_provider.c:926-928`); `proxy_destroy` half-closes the socket
+   because EOF on stdin is how an MCP stdio server is told to stop
+   (`mcp_proxy.c:645-647`). Both are correct for their protocol. Recorded
+   because a reader of the M4.3 "uniform death handling" line may expect this
+   difference to be unified too, and it must not be: it is a protocol fact and
+   stays above the seam.
 
-## Open questions for the owner
+## Decisions taken on the first draft's open questions
 
-Everything else in this document is decided, with the argument attached. These
-five are not, and each is a place where the design would change materially
-depending on the answer.
+The first draft of this document ended in five open questions. All five are
+now answered, and the answers are recorded here rather than deleted, because
+two of them overturned a recommendation this document had made and the
+reasoning is worth keeping.
 
-1. **Does `executionProfile` select the fd layout?** The recommendation is yes
-   — a profile is a statement about how a thing is launched, and folding the
-   layout into it means no manifest key is ever needed. The cost is that the
-   layout mapping lives in launcher documentation rather than in the manifest
-   schema, and the field's defining property ("the runtime never interprets
-   it") starts carrying more weight than it looks like it carries. The
-   alternative is a v3 key. This is the only question that changes the shape
-   of a future manifest version.
-2. **Is absence of `execution_profile` the same as `"trusted-local"`, or
-   distinct?** The draft treats `NULL` as "the launcher's own default" and
-   `"trusted-local"` as an explicit request that the POSIX launcher happens to
-   satisfy. Collapsing them is simpler; keeping them distinct lets a future
-   launcher default to *confined* while still refusing an unknown explicit
-   profile. The recommendation is to keep them distinct, because a launcher
-   whose default is confinement is the one worth being able to write.
-3. **Should `wait` be in the vtable at all?** It could be folded into
-   `stop(FORCED)` defined as blocking-until-reaped, giving a three-op table.
-   The argument for keeping it: the escalation ladder needs to know whether
-   the graceful stop worked, and a launcher whose substrate is remote may not
-   be able to make `stop` synchronous cheaply. The argument against: `wait` is
-   the one op a remote executord may find expensive to implement honestly, and
-   a polling `wait` over a socket is a worse primitive than a blocking one.
-   Four ops is the recommendation; the trade is real.
-4. **The `args` bound: 64 entries / 8 KiB, or something else?** These are
-   chosen, not derived. Any bound is better than none, for the reason given;
-   the numbers are policy.
-5. **May M4.1 repair the `SIGTERM`-then-blocking-`waitpid` hang, or must it
-   wait for M4.3?** M4.1's criterion is "behaviour byte-identical", and this is
-   a behaviour change — on an error path that is currently a hang. Repairing it
-   inside M4.1 is the honest engineering choice and slightly weakens the
-   phase's own criterion. Repairing it separately, before M4 starts, is the
-   cleanest and is the recommendation: it is a two-line fix on `main` and it
-   should not be hostage to a refactor.
+1. **`executionProfile` does NOT select the fd layout.** The draft
+   recommended that it should. That was wrong: **confinement and protocol
+   transport are two independent decisions**, and the layout is a function of
+   the child's protocol type rather than of the deployment. An `mcp-proxy`
+   upstream is a third-party MCP server that speaks stdin/stdout by
+   specification and will never understand `MAELYS_PROVIDER_FD`, so it is
+   necessarily `STDIO`; binding the layout to the profile would have made the
+   most sandbox-worthy provider kind the one that could never take a profile.
+   The layout is derived by the host from the provider kind, no manifest key
+   is needed in any version, and `executionProfile` stays purely about
+   confinement. See "The layout is a function of the child's protocol type";
+   this also means the draft's "it needs a configuration surface" conclusion
+   is withdrawn.
+2. **Absence of `execution_profile` and `"trusted-local"` remain DISTINCT**,
+   as recommended. `NULL` means "the launcher's own default";
+   `"trusted-local"` is an explicit request that the POSIX launcher happens to
+   satisfy. Keeping them separate is what lets a future launcher default to
+   *confined* while still refusing an unknown explicit profile — and a
+   launcher whose default is confinement is the one worth being able to write.
+3. **`wait` STAYS in the vtable**, as recommended: four ops, not three. The
+   escalation ladder has to know whether the graceful stop worked, and with
+   `destroy` now defined as local-release-only, `wait` is the *only* op
+   permitted to block at all. Folding it into `stop` would have put the
+   blocking back into an op the ladder needs to be instantaneous.
+4. **The `args` bound is 64 entries / 8 KiB**, accepted as proposed. The
+   numbers are policy rather than derivation; the argument for having a bound
+   at all is that it converts a post-fork `E2BIG` into a precise load-time
+   error naming the offending key.
+5. **The `SIGTERM`-then-blocking-`waitpid` hang was fixed separately on
+   `main`**, as recommended, by `475333b` (PR #53) — before M4 starts and
+   without being made hostage to the refactor. M4.1's "behaviour
+   byte-identical" criterion is therefore unweakened: there is no longer a
+   defect sitting inside the code it has to move. See "Contradictions found",
+   items 1 to 3, for what that change covered and what it deliberately left
+   for M4.3.
+
+No open questions remain. The falsifiable claim in "M4.6, elsewhere" — that a
+real Executor adapter needs no fifth operation — is the next thing this design
+should be checked against, and it can only be checked by building one.
