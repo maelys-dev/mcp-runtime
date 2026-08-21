@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.17.0 - 2026-08-21
+
+- **Every child process now starts through one injectable launch seam.** An
+  embedder can replace how providers are launched — POSIX today, a sandboxed
+  or remote executor tomorrow — by passing a launcher vtable to the new
+  `maelys_mcp_provider_spawn_with_launcher` /
+  `maelys_mcp_provider_proxy_spawn_with_launcher` entry points; existing
+  APIs keep the built-in POSIX launcher and behave exactly as before. The
+  launcher owns spawn, a bounded stop ladder (graceful, then forced, each
+  wait budgeted — a child that ignores SIGTERM can no longer park teardown),
+  and an opaque handle that never assumes a PID. The boundary audit now
+  forbids process-creation primitives outside `src/process/`, so no future
+  launch path can bypass a configured sandbox. See
+  `docs/launch-contract-design.md`.
+- **Manifest v2: static provider arguments and an execution profile.**
+  `manifestVersion: 2` lets a native provider declare `args` — extra
+  command-line arguments appended after the guaranteed
+  `path --provider` prefix (max 64 entries / 8 KiB, validated at load with
+  exact locations) — and both provider kinds declare `executionProfile`, a
+  string the runtime passes through to the launcher without interpreting it;
+  the stock POSIX launcher refuses any profile it cannot apply rather than
+  ignoring it. Version 1 manifests keep working unchanged. Never put secrets
+  in `args` — argv is visible to `ps`, logs and crash reports;
+  `docs/manifest.md` names the alternatives.
+- **A stuck provider can no longer hold a connection slot hostage.**
+  `maelys_mcp_channel_destroy_detached` aborts the channel, returns
+  immediately when the bounded close misses its deadline, and hands the
+  final free to whichever in-flight operation finishes last — never freeing
+  under a live worker, and `maelys_mcp_runtime_destroy` drains detached
+  channels before tearing down. Groundwork for the HTTP transport's
+  channel-per-request lifecycle; plain `maelys_mcp_channel_destroy` is
+  byte-identical to before.
+- **A channel can now declare which protocol eras it serves.**
+  `maelys_mcp_channel_set_protocol_eras` restricts a channel to modern,
+  legacy, or both (the default — existing channels unchanged);
+  `server/discover` answers with that channel's real list, and a legacy
+  `initialize` on a modern-only channel is refused. Groundwork for HTTP,
+  which will be modern-only per channel while stdio keeps serving both.
+- **Fix: two spawn-failure paths could hang host startup forever.** They
+  sent SIGTERM and waited unboundedly; a child ignoring the signal parked
+  the host with no diagnostic. Both now kill outright, like every sibling
+  path already did.
+- **Fix: a spawn could hand the child a dead protocol descriptor.** `dup2`
+  with equal descriptors is a POSIX no-op that leaves close-on-exec set, so
+  a `socketpair` landing on fds 0/1 produced a provider whose protocol end
+  was closed by `execve` — dead before describe. The flag is now cleared
+  explicitly, and a forked test pins the exact scenario.
+- The 0.17 design cycle's documents ship in-tree: the process launch
+  contract (`docs/launch-contract-design.md`, implemented above through
+  M4.5) and the security model's new "process externality" section. The
+  HTTP transport and authenticated-principal designs remain under review.
+
 ## 0.16.0 - 2026-08-21
 
 - **Fix: a modern client can never receive a server-to-client request.** The

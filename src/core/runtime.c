@@ -81,6 +81,10 @@ maelys_mcp_result_t maelys_mcp_runtime_create(
     runtime->channel_create_gate_drained_initialized = 1;
     if (pthread_mutex_init(&runtime->channels_mutex, NULL) != 0) goto failed;
     runtime->channels_mutex_initialized = 1;
+    if (maelys_mcp_cond_init_monotonic(&runtime->detached_channels_drained) != 0) {
+        goto failed;
+    }
+    runtime->detached_channels_drained_initialized = 1;
     if (pthread_mutex_init(&runtime->provider_events_mutex, NULL) != 0) {
         goto failed;
     }
@@ -99,6 +103,9 @@ failed:
     }
     if (runtime->provider_events_mutex_initialized) {
         pthread_mutex_destroy(&runtime->provider_events_mutex);
+    }
+    if (runtime->detached_channels_drained_initialized) {
+        pthread_cond_destroy(&runtime->detached_channels_drained);
     }
     if (runtime->channels_mutex_initialized) {
         pthread_mutex_destroy(&runtime->channels_mutex);
@@ -133,12 +140,46 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     }
     pthread_mutex_unlock(&runtime->channel_create_gate_mutex);
 
+    /*
+     * Detached channels next, and before lifecycle_mutex, for the same reason
+     * the create gate is drained before it: this is an unbounded wait and it
+     * must not be taken with a lock the rest of the runtime needs.
+     *
+     * It exists because maelys_mcp_channel_destroy_detached *decrements*
+     * live_channel_count when it hands a channel off, so the refusal below
+     * would see a runtime with no channels and free one that a worker still
+     * holds a pointer into. The create gate is already closed and drained, so
+     * no new channel - and therefore no new detached channel - can appear from
+     * a creator that has not already been counted.
+     *
+     * Unbounded on purpose. The bound on a stuck in-process provider is the
+     * provider's, and the runtime has none to offer; what the detach bought
+     * was the *caller's* thread, not an escape from waiting somewhere. Waiting
+     * here, once, at shutdown, is where that cost belongs.
+     */
+    pthread_mutex_lock(&runtime->channels_mutex);
+    while (runtime->detached_channel_count != 0u) {
+        pthread_cond_wait(&runtime->detached_channels_drained,
+            &runtime->channels_mutex);
+    }
+    pthread_mutex_unlock(&runtime->channels_mutex);
+
     pthread_mutex_lock(&runtime->lifecycle_mutex);
     runtime->shutdown_requested = 1;
     runtime->lifecycle = MAELYS_MCP_RUNTIME_SHUTTING_DOWN;
     pthread_cond_broadcast(&runtime->lifecycle_changed);
     pthread_mutex_lock(&runtime->channels_mutex);
-    if (runtime->live_channel_count != 0u) {
+    /*
+     * The detached count is re-read here, not just drained above, because an
+     * embedder detaching a channel concurrently with this call could land one
+     * in the window between the two. That embedder is already outside the
+     * contract - it is destroying a runtime while still calling into it - and
+     * refusing is the answer this function already gives for "you still hold a
+     * channel", with the same remedy: nothing is freed, and calling again
+     * drains and succeeds.
+     */
+    if (runtime->live_channel_count != 0u ||
+        runtime->detached_channel_count != 0u) {
         pthread_mutex_unlock(&runtime->channels_mutex);
         pthread_mutex_unlock(&runtime->lifecycle_mutex);
         return MAELYS_MCP_ERR_STATE;
@@ -157,6 +198,7 @@ maelys_mcp_result_t maelys_mcp_runtime_destroy(maelys_mcp_runtime_t *runtime) {
     maelys_mcp_chain_destroy(runtime);
     pthread_cond_destroy(&runtime->provider_events_idle);
     pthread_mutex_destroy(&runtime->provider_events_mutex);
+    pthread_cond_destroy(&runtime->detached_channels_drained);
     pthread_mutex_destroy(&runtime->channels_mutex);
     pthread_cond_destroy(&runtime->channel_create_gate_drained);
     pthread_mutex_destroy(&runtime->channel_create_gate_mutex);
@@ -386,6 +428,21 @@ static json_t *initialize(
     json_t *params) {
     maelys_mcp_runtime_t *runtime = channel->runtime;
     pthread_mutex_lock(&channel->mutex);
+    /*
+     * -32600, next to the sibling refusal below and for the same reason: on a
+     * channel that does not serve the legacy era the request is not a bad
+     * handshake, it is a request that has no meaning here at all. -32602 would
+     * invite the client to retry with different params, -32022 would claim a
+     * version was negotiated and rejected when none was, and -32601 is what
+     * this runtime says about methods no module implements - which initialize
+     * is not. A transport in front of this may refuse the method earlier and
+     * more cheaply; this is where the guarantee itself lives.
+     */
+    if (!(channel->protocol_eras & (unsigned int)MAELYS_MCP_ERA_LEGACY)) {
+        pthread_mutex_unlock(&channel->mutex);
+        return maelys_mcp_error_response(id, JSONRPC_INVALID_REQUEST,
+            "Legacy protocol era is not served on this channel", NULL);
+    }
     if (channel->legacy_initialize_received) {
         pthread_mutex_unlock(&channel->mutex);
         return maelys_mcp_error_response(id, JSONRPC_INVALID_REQUEST,
@@ -440,13 +497,36 @@ static json_t *initialize(
     return maelys_mcp_success_response(id, result);
 }
 
-static json_t *discover(maelys_mcp_runtime_t *runtime, json_t *id) {
-    json_t *result = json_object();
+/*
+ * The versions a channel with this era mask announces, newest first. One
+ * function rather than two literals because `server/discover`'s
+ * `supportedVersions` and the `-32022` error's `data.supported` are the same
+ * claim made in two places, and a channel that announced one list while
+ * refusing against the other would be lying in whichever of them was stale.
+ */
+static json_t *supported_versions(unsigned int eras) {
     json_t *versions = json_array();
+    if (!versions) return NULL;
+    if (((eras & (unsigned int)MAELYS_MCP_ERA_MODERN) &&
+            json_array_append_new(versions,
+                json_string(MAELYS_MCP_PROTOCOL_MODERN)) != 0) ||
+        ((eras & (unsigned int)MAELYS_MCP_ERA_LEGACY) &&
+            json_array_append_new(versions,
+                json_string(MAELYS_MCP_PROTOCOL_LEGACY)) != 0)) {
+        json_decref(versions);
+        return NULL;
+    }
+    return versions;
+}
+
+static json_t *discover(
+    maelys_mcp_runtime_t *runtime,
+    json_t *id,
+    unsigned int eras) {
+    json_t *result = json_object();
+    json_t *versions = supported_versions(eras);
     json_t *caps = maelys_mcp_runtime_capabilities(runtime, 1);
     if (!result || !versions || !caps ||
-        json_array_append_new(versions, json_string(MAELYS_MCP_PROTOCOL_MODERN)) != 0 ||
-        json_array_append_new(versions, json_string(MAELYS_MCP_PROTOCOL_LEGACY)) != 0 ||
         json_object_set(result, "supportedVersions", versions) != 0 ||
         json_object_set(result, "capabilities", caps) != 0 ||
         json_object_set_new(result, "ttlMs", json_integer(0)) != 0 ||
@@ -465,17 +545,25 @@ static json_t *discover(maelys_mcp_runtime_t *runtime, json_t *id) {
     return maelys_mcp_success_response(id, result);
 }
 
-static json_t *unsupported_version(json_t *id, const char *requested) {
-    json_t *data = json_pack("{s:[s,s],s:s}", "supported",
-        MAELYS_MCP_PROTOCOL_MODERN, MAELYS_MCP_PROTOCOL_LEGACY,
-        "requested", requested ? requested : "");
+static json_t *unsupported_version(
+    json_t *id,
+    unsigned int eras,
+    const char *requested) {
+    json_t *supported = supported_versions(eras);
+    json_t *data = supported ? json_pack("{s:o,s:s}", "supported", supported,
+        "requested", requested ? requested : "") : NULL;
+    if (!data && supported) json_decref(supported);
     json_t *response = maelys_mcp_error_response(id, MCP_UNSUPPORTED_VERSION,
         "Unsupported protocol version", data);
     if (data) json_decref(data);
     return response;
 }
 
-static json_t *validate_modern_metadata(json_t *id, json_t *params, const char **out_version) {
+static json_t *validate_modern_metadata(
+    json_t *id,
+    json_t *params,
+    unsigned int eras,
+    const char **out_version) {
     json_t *meta = json_is_object(params) ? json_object_get(params, "_meta") : NULL;
     json_t *version = json_is_object(meta) ?
         json_object_get(meta, "io.modelcontextprotocol/protocolVersion") : NULL;
@@ -483,6 +571,17 @@ static json_t *validate_modern_metadata(json_t *id, json_t *params, const char *
         json_object_get(meta, "io.modelcontextprotocol/clientCapabilities") : NULL;
     json_t *client = json_is_object(meta) ?
         json_object_get(meta, "io.modelcontextprotocol/clientInfo") : NULL;
+    /*
+     * Ahead of the shape check, not after it: a channel that does not serve
+     * 2026-07-28 owes the client a version answer naming what it does serve,
+     * not a complaint about the shape of metadata it would refuse however well
+     * formed it was. Costs nothing on a channel that serves the era.
+     */
+    if (!(eras & (unsigned int)MAELYS_MCP_ERA_MODERN)) {
+        return unsupported_version(id, eras,
+            json_is_string(version) && !maelys_mcp_json_string_has_nul(version) ?
+                json_string_value(version) : NULL);
+    }
     if (!json_is_string(version) || maelys_mcp_json_string_has_nul(version) ||
         !json_is_object(capabilities)) {
         return maelys_mcp_error_response(id, JSONRPC_INVALID_PARAMS,
@@ -499,7 +598,7 @@ static json_t *validate_modern_metadata(json_t *id, json_t *params, const char *
     }
     *out_version = json_string_value(version);
     return maelys_mcp_json_string_equals(version, MAELYS_MCP_PROTOCOL_MODERN) ?
-        NULL : unsupported_version(id, *out_version);
+        NULL : unsupported_version(id, eras, *out_version);
 }
 
 json_t *maelys_mcp_runtime_dispatch(
@@ -557,6 +656,7 @@ json_t *maelys_mcp_runtime_dispatch(
      */
     json_t *legacy_capabilities = channel->legacy_capabilities;
     int nestable = channel->transport_demuxes;
+    unsigned int protocol_eras = channel->protocol_eras;
     pthread_mutex_unlock(&channel->mutex);
 
     /*
@@ -575,10 +675,13 @@ json_t *maelys_mcp_runtime_dispatch(
         json_object_get(meta, "io.modelcontextprotocol/protocolVersion") != NULL;
     const char *modern_version = NULL;
     if (meta_requests_negotiation || strcmp(method_name, "server/discover") == 0) {
-        json_t *metadata_error = validate_modern_metadata(id, params, &modern_version);
+        json_t *metadata_error = validate_modern_metadata(id, params,
+            protocol_eras, &modern_version);
         if (metadata_error) return metadata_error;
     }
-    if (strcmp(method_name, "server/discover") == 0) return discover(runtime, id);
+    if (strcmp(method_name, "server/discover") == 0) {
+        return discover(runtime, id, protocol_eras);
+    }
 
     int modern = modern_version != NULL;
     /*

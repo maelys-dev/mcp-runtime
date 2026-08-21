@@ -52,8 +52,16 @@
 - Stdio output writes have a bounded per-message deadline; a non-draining client closes
   the output bus and wakes blocked producers instead of freezing the runtime.
 - Every client channel has an independent bounded queue, subscription registry,
-  cancellation scope and legacy state. Identical JSON-RPC ids on different channels
-  cannot collide or receive each other's events.
+  cancellation scope, protocol-era policy and legacy state. Identical JSON-RPC ids on
+  different channels cannot collide or receive each other's events, and a channel
+  narrowed to one protocol era refuses the other one in the dispatcher rather than
+  relying on a transport to filter it out first.
+- A channel whose bounded close cannot finish is never freed at its deadline. It is
+  aborted, made untargetable and unlinked, and freed only once every operation that
+  had already retained it has finished, whether the caller waits for that
+  (`maelys_mcp_channel_destroy`) or hands it to the runtime and returns
+  (`maelys_mcp_channel_destroy_detached`). `maelys_mcp_runtime_destroy` refuses to
+  free a runtime that any such channel still points at.
 - Provider event fan-out retains each target channel while delivering outside the
   runtime registry lock. A slow or faulted channel cannot suspend or invalidate its
   peers.
@@ -76,8 +84,42 @@ Apple Silicon Homebrew locations, allowing portable `#!/usr/bin/env node` and Py
 launchers to resolve their interpreter. A later sandbox adapter may use OS facilities
 or containers.
 
-The runtime never accepts an executable path, argv, environment variable, or shell
-fragment from an MCP request.
+The runtime never accepts an executable path, an argument vector, an environment
+variable, an execution profile or a shell fragment from an MCP request. All of them
+come from host configuration — command-line flags or the manifest — read once at
+startup. This holds for every field the launch seam carries, including manifest v2's
+`args` and `executionProfile`: they are configuration, never protocol.
+
+### Process externality is the sandbox prerequisite
+
+A provider registered in-process through `maelys_mcp_provider_create` or the
+provider SDK runs **inside the runtime's trust boundary**, and no configuration
+changes that. It shares the runtime's address space, file descriptors, signal
+dispositions and heap. A segmentation fault, a stack overflow, an `abort()` or a
+heap corruption in such a provider takes the runtime down with it, and a
+memory-safety error in it can read or rewrite any runtime state, including another
+provider's. The only failure mode a native in-process provider can express *safely*
+is a controlled error return. This is not a defect to be fixed later; it is what
+in-process means. The mitigation is a design rule: **a provider whose code is not
+trusted at the same level as the runtime must not be in-process.**
+
+Sandboxing requires process externality. Every mechanism worth the name — seccomp,
+Seatbelt, Landlock, bubblewrap, containers, separate VMs — operates on a process or
+a process tree; none can confine code sharing the confiner's address space. The
+runtime therefore reaches sandboxed execution only through the process launch seam
+(`docs/launch-contract-design.md`), which starts every child through one vtable,
+for both external provider kinds — native `maelys-provider` children and
+`mcp-proxy` upstreams. The stock POSIX launcher applies no confinement and says
+so: it accepts only an absent `executionProfile` or `"trusted-local"` and refuses
+anything else rather than starting it unconfined. A launch path that bypassed the
+seam would bypass every future confinement with it, which is why the boundary
+audit forbids process-creation primitives outside `src/process/`.
+
+Stdout isolation is a separate and weaker guarantee: a native child can be handed
+the protocol on a non-standard descriptor with its stdout wired to stderr; an
+`mcp-proxy` upstream cannot, since a third-party MCP server speaks stdin/stdout by
+specification. Confinement covers both kinds; descriptor isolation covers only the
+kind whose protocol this project defines.
 
 The runtime remains a local stdio host. It does not expose HTTP, authenticate a
 network principal or apply per-principal effect policy. Those controls are mandatory

@@ -11,6 +11,14 @@ The runtime implements two protocol eras:
   `initialize` result. `2026-07-28` removed `initialize`; a client that sends it is by
   definition using the legacy era.
 
+A channel serves both eras unless the embedder narrows it with
+`maelys_mcp_channel_set_protocol_eras`, which is a per-channel decision rather than a
+per-runtime or per-transport one — one runtime can serve a dual-era stdio channel and
+a modern-only channel simultaneously. A narrowed channel announces only the eras it
+serves in `server/discover`, refuses `initialize` with `-32600` when the legacy era is
+cleared, and refuses modern `_meta` negotiation with `-32022` when the modern era is
+cleared.
+
 The modern implementation follows the final specification rather than its earlier
 release-candidate wire shape. Primary references:
 

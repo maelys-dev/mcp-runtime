@@ -45,10 +45,31 @@ typedef struct manifest_provider {
      * default. */
     unsigned int connect_timeout_ms;
 
+    /*
+     * native only. manifestVersion 2 only ("args", docs/manifest.md): EXTRA
+     * argv entries only, never the complete vector - the runtime always
+     * compiles argv[0] = path, argv[1] = "--provider", then these
+     * (docs/launch-contract-design.md, "Two layers of argv"). NULL-terminated;
+     * NULL (args_count 0) when the manifest did not set "args", which is the
+     * same thing as an empty array.
+     */
+    char **args;
+    size_t args_count;
+
     /* native only. 0 (absent) keeps maelys_mcp_provider_spawn_with_options's
      * own defaults. */
     unsigned int describe_timeout_ms;
     unsigned int shutdown_timeout_ms;
+
+    /*
+     * Both types. manifestVersion 2 only ("executionProfile",
+     * docs/manifest.md): opaque pass-through to the launch seam
+     * (maelys_mcp_process_spec_t.execution_profile), never interpreted by the
+     * host. NULL when the manifest did not set it - distinct from the string
+     * "trusted-local", which is an explicit request the stock POSIX launcher
+     * happens to satisfy.
+     */
+    char *execution_profile;
 
     /* Both types. 0 (absent) keeps the relevant spawn call's own default. */
     unsigned int call_timeout_ms;
@@ -56,6 +77,7 @@ typedef struct manifest_provider {
 } manifest_provider_t;
 
 typedef struct manifest {
+    /* 1 or 2 (docs/manifest.md). */
     int version;
     manifest_provider_t *providers;
     size_t provider_count;
@@ -72,6 +94,10 @@ typedef struct manifest {
  * each rejected with an error naming the offending key and its location
  * (e.g. "providers[1].path"). Nothing is constructed from a manifest that
  * does not fully validate: *out_manifest is left zeroed on any failure.
+ *
+ * manifestVersion selects the key table: "args" and "executionProfile" exist
+ * only under manifestVersion 2 and are unknown keys - rejected by name, like
+ * any other unknown key - under manifestVersion 1.
  *
  * On success, *out_manifest is populated and must be released with
  * manifest_clear. *out_error is untouched on success and, on failure, is set

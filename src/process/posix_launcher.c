@@ -27,10 +27,18 @@
 
 /*
  * The launcher's handle. Opaque above the seam - the runtime stores it and
- * hands it back, and must never dereference it - and reaped is the load-bearing
- * field: once the child has been reaped its pid may be recycled by the kernel,
- * so a later stop must not signal it. The ladder calls stop after a wait that
- * may have reaped, which is exactly when that matters.
+ * hands it back, and must never dereference it - and reaped is the field that
+ * keeps this launcher safe to call in any order: once a child has been reaped
+ * its pid belongs to the kernel again and may already name someone else, so a
+ * stop after a successful wait must not signal it.
+ *
+ * The ladder as written never does that - its second stop is reached only when
+ * the first wait did NOT observe an exit, so nothing was reaped - and no test
+ * can therefore distinguish this guard from its absence. It is kept anyway,
+ * because the ops are a public contract and the rung order is not the only
+ * legal way to call them: stop and wait are documented as idempotent, and a
+ * launcher that signalled a recycled pid would be a very bad way to discover
+ * that the documentation was aspirational.
  */
 typedef struct posix_child {
     pid_t pid;
