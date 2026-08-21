@@ -27,12 +27,22 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define VALID_BODY "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"
+/*
+ * A body that satisfies H2's MCP rules, because since H2 the adapter validates
+ * before it answers and a server-layer test that wanted to reach the adapter
+ * would otherwise be refused by a rule it is not testing. It carries the
+ * _meta protocol version the MCP-Protocol-Version header is compared against,
+ * and its method matches the Mcp-Method header in STD_HEADERS.
+ */
+#define VALID_BODY \
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"_meta\":" \
+    "{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}}}"
+#define VALID_BODY_LENGTH "116"
 /* The Content-Length in the table below is written out, so it has to be pinned
  * to the body rather than counted by hand: a body one byte longer than its
  * declared length is indistinguishable from a pipelined request, and the test
  * would fail for a reason that has nothing to do with what it is testing. */
-_Static_assert(sizeof(VALID_BODY) - 1u == 40u, "VALID_BODY is 40 bytes");
+_Static_assert(sizeof(VALID_BODY) - 1u == 116u, "VALID_BODY is 116 bytes");
 
 typedef struct fixture {
     maelys_mcp_authenticator_t authenticator;
@@ -65,6 +75,80 @@ static int fixture_start(
         .max_body_bytes = 1024u,
         /* Short enough that a timeout test does not stall the suite, and long
          * enough that a loopback round trip never trips it. */
+        .header_timeout_ms = 2000u,
+        .body_timeout_ms = 2000u,
+        .idle_timeout_ms = 2000u,
+        .write_timeout_ms = 2000u,
+        .authenticator = &fixture->authenticator,
+        .adapter = fixture->adapter
+    };
+    if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
+        maelys_mcp_http_adapter_destroy(fixture->adapter);
+        fixture->authenticator.destroy(fixture->authenticator.context);
+        return -1;
+    }
+    fixture->port = maelys_http_server_port(fixture->server);
+    return 0;
+}
+
+/*
+ * A counting authenticator, so that "authenticate runs once per POST" can be
+ * asserted as a NUMBER rather than inferred from two requests both being
+ * answered. It delegates to loopback-trust rather than reimplementing a
+ * principal, because what is under test is how often the server layer calls
+ * it, not what it decides.
+ */
+typedef struct counting_auth {
+    maelys_mcp_authenticator_t inner;
+    int calls;
+} counting_auth_t;
+
+static maelys_mcp_result_t counting_authenticate(
+    void *context,
+    const maelys_mcp_transport_credentials_t *credentials,
+    maelys_mcp_principal_t **out_principal) {
+    counting_auth_t *counter = context;
+    ++counter->calls;
+    return counter->inner.authenticate(
+        counter->inner.context, credentials, out_principal);
+}
+
+static void counting_retain(void *context, maelys_mcp_principal_t *principal) {
+    counting_auth_t *counter = context;
+    counter->inner.retain(counter->inner.context, principal);
+}
+
+static void counting_release(void *context, maelys_mcp_principal_t *principal) {
+    counting_auth_t *counter = context;
+    counter->inner.release(counter->inner.context, principal);
+}
+
+static void counting_destroy(void *context) {
+    counting_auth_t *counter = context;
+    counter->inner.destroy(counter->inner.context);
+}
+
+static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) {
+    memset(fixture, 0, sizeof(*fixture));
+    memset(counter, 0, sizeof(*counter));
+    if (maelys_http_auth_loopback_create(&counter->inner) != MAELYS_MCP_OK) return -1;
+    fixture->authenticator.name = "counting";
+    fixture->authenticator.context = counter;
+    fixture->authenticator.authenticate = counting_authenticate;
+    fixture->authenticator.retain = counting_retain;
+    fixture->authenticator.release = counting_release;
+    fixture->authenticator.destroy = counting_destroy;
+    if (maelys_mcp_http_adapter_create(
+        MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &fixture->adapter) != MAELYS_MCP_OK) {
+        fixture->authenticator.destroy(fixture->authenticator.context);
+        return -1;
+    }
+    maelys_http_server_options_t options = {
+        .bind_address = "127.0.0.1",
+        .port = 0,
+        .allowed_origins = NULL,
+        .allowed_origin_count = 0,
+        .max_body_bytes = 1024u,
         .header_timeout_ms = 2000u,
         .body_timeout_ms = 2000u,
         .idle_timeout_ms = 2000u,
@@ -190,10 +274,19 @@ static int exchange(unsigned short port, const char *request, size_t length,
     return got >= 0 ? status_of(response) : -1;
 }
 
-#define STD_HEADERS \
+/*
+ * The MCP routing headers ride along in STD_HEADERS since H2. A case that
+ * expects a server-layer refusal never reaches them, and a case that expects to
+ * reach the adapter needs them: leaving them out would make every 503 case fail
+ * on a -32020 that has nothing to do with the ladder being tested.
+ */
+#define BASE_HEADERS \
     "Host: 127.0.0.1\r\n" \
     "Content-Type: application/json\r\n" \
     "Accept: application/json, text/event-stream\r\n"
+#define STD_HEADERS BASE_HEADERS \
+    "MCP-Protocol-Version: 2026-07-28\r\n" \
+    "Mcp-Method: ping\r\n"
 
 typedef struct wire_case {
     const char *rule;
@@ -205,7 +298,7 @@ typedef struct wire_case {
 
 static const wire_case_t WIRE_CASES[] = {
     {"a well-formed POST reaches the adapter and gets its placeholder answer",
-        "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: 40\r\n\r\n" VALID_BODY,
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY,
         503, "-32600"},
     {"GET on the endpoint is 405 with Allow: POST",
         "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 405, "Allow: POST"},
@@ -261,7 +354,20 @@ static const wire_case_t WIRE_CASES[] = {
         "Content-Length: 2\r\n\r\n{}", 400, NULL},
     {"an absolute-form target matching Host is routed",
         "POST http://127.0.0.1/mcp HTTP/1.1\r\n" STD_HEADERS
-        "Content-Length: 2\r\n\r\n{}", 503, "-32600"}
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY, 503, "-32600"},
+    /*
+     * The two H2 rows the adapter owns, proven on the wire rather than only
+     * through the recording writer: the refusal has to survive the server
+     * layer's response path to be worth anything to a client.
+     */
+    {"a routing header that disagrees with the body is 400 with -32020",
+        "POST /mcp HTTP/1.1\r\n" BASE_HEADERS
+        "MCP-Protocol-Version: 2026-07-28\r\n"
+        "Mcp-Method: tools/list\r\n"
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY, 400, "-32020"},
+    {"a body that is not a JSON object is 400 with -32700",
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS
+        "Content-Length: 7\r\n\r\n[1,2,3]", 400, "-32700"}
 };
 
 static int wire_matrix(void) {
@@ -330,7 +436,8 @@ static int origin_is_refused_before_anything_else(void) {
     ASSERT_TRUE(fixture_start(&fixture, NULL, 0, origins, 1u) == 0);
     const char *allowed =
         "POST /mcp HTTP/1.1\r\n" STD_HEADERS
-        "Origin: https://app.example\r\nContent-Length: 2\r\n\r\n{}";
+        "Origin: https://app.example\r\n"
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     ASSERT_TRUE(exchange(fixture.port, allowed, strlen(allowed),
         response, sizeof(response)) == 503);
     const char *refused =
@@ -352,7 +459,8 @@ static int a_kept_alive_connection_serves_a_second_request(void) {
     int fd = connect_loopback(fixture.port);
     ASSERT_TRUE(fd >= 0);
     const char *request =
-        "POST /mcp HTTP/1.1\r\n" STD_HEADERS "Content-Length: 2\r\n\r\n{}";
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     char response[4096];
     for (int round = 0; round < 2; ++round) {
         ASSERT_TRUE(send_all(fd, request, strlen(request)) == 0);
@@ -362,6 +470,41 @@ static int a_kept_alive_connection_serves_a_second_request(void) {
         ASSERT_TRUE(strstr(response, "Connection: keep-alive") != NULL);
     }
     close(fd);
+    fixture_stop(&fixture);
+    return 0;
+}
+
+/*
+ * Authentication is repeated for every POST, so two requests on one kept-alive
+ * connection are two independent authentications and a revoked credential stops
+ * working on the next request rather than on the next connection. Asserted as a
+ * count, because "both were answered" is also what a cached verdict looks like.
+ */
+static int authenticate_runs_once_per_post(void) {
+    fixture_t fixture;
+    counting_auth_t counter;
+    ASSERT_TRUE(fixture_start_counting(&fixture, &counter) == 0);
+    const char *request =
+        "POST /mcp HTTP/1.1\r\n" STD_HEADERS
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
+    char response[4096];
+
+    /* One connection, one POST: exactly one authentication. */
+    ASSERT_TRUE(exchange(fixture.port, request, strlen(request),
+        response, sizeof(response)) == 503);
+    ASSERT_TRUE(counter.calls == 1);
+
+    /* One connection, two POSTs: exactly two more. */
+    int fd = connect_loopback(fixture.port);
+    ASSERT_TRUE(fd >= 0);
+    for (int round = 0; round < 2; ++round) {
+        ASSERT_TRUE(send_all(fd, request, strlen(request)) == 0);
+        ssize_t got = read_one_message(fd, response, sizeof(response), 3000);
+        ASSERT_TRUE(got > 0);
+        ASSERT_TRUE(status_of(response) == 503);
+    }
+    close(fd);
+    ASSERT_TRUE(counter.calls == 3);
     fixture_stop(&fixture);
     return 0;
 }
@@ -444,7 +587,8 @@ static int bearer_authentication_on_the_wire(void) {
 
     const char *right =
         "POST /mcp HTTP/1.1\r\n" STD_HEADERS
-        "Authorization: Bearer good-token\r\nContent-Length: 2\r\n\r\n{}";
+        "Authorization: Bearer good-token\r\n"
+        "Content-Length: " VALID_BODY_LENGTH "\r\n\r\n" VALID_BODY;
     ASSERT_TRUE(exchange(fixture.port, right, strlen(right),
         response, sizeof(response)) == 503);
     fixture_stop(&fixture);
@@ -720,7 +864,9 @@ int main(void) {
             peek_tells_a_fin_from_a_pipelined_byte},
         {"loopback-trust takes no material", loopback_trust_takes_no_material},
         {"static-bearer outcomes", static_bearer_outcomes},
-        {"principal refcounting", principal_refcounting}
+        {"principal refcounting", principal_refcounting},
+        {"authenticate runs once per POST, twice on a reused connection",
+            authenticate_runs_once_per_post}
     };
     return maelys_run_tests(cases, sizeof(cases) / sizeof(*cases));
 }

@@ -32,6 +32,17 @@
 #define MCP_POLICY_DENIED (-32003)
 #define MCP_MISSING_REQUIRED_CLIENT_CAPABILITY (-32021)
 #define MCP_UNSUPPORTED_VERSION (-32022)
+/*
+ * HeaderMismatch. The one protocol constant the HTTP transport introduces, and
+ * the only code in this list with no dispatch site: it is produced by
+ * src/transport/http_adapter.c when a routing header disagrees with the body it
+ * claims to describe, and never by a module
+ * (docs/http-transport-design.md, "Status and error mapping").
+ *
+ * It lives here rather than in the transport because the codes are one
+ * namespace and a second place to allocate them is how two of them collide.
+ */
+#define MCP_HEADER_MISMATCH (-32020)
 
 typedef struct maelys_mcp_owned_tool {
     char *name;

@@ -26,9 +26,12 @@ extern "C" {
  * already terminated TLS reuses the adapter verbatim behind its own listener;
  * and the fuzz targets get a seam that is a function rather than a socket.
  *
- * H1 STATUS. This header is the whole contract, but the adapter behind it does
- * not dispatch yet: see maelys_mcp_http_adapter_create. Validation of the MCP
- * routing headers is H2 and dispatch is H3.
+ * H2 STATUS. This header is the whole contract. The adapter behind it now
+ * validates the MCP routing headers against the body and refuses a
+ * disagreement with -32020, and it still does not dispatch: see
+ * maelys_mcp_http_adapter_create. channel_create, channel_accept, mode
+ * selection on the first frame, SSE framing, 202 for notifications and the
+ * cancellation chain are H3.
  */
 
 /* One in-flight exchange. Opaque; created by the adapter, valid from the moment
@@ -114,11 +117,11 @@ typedef struct maelys_mcp_http_response_writer {
 } maelys_mcp_http_response_writer_t;
 
 /*
- * The H1 placeholder answer. The adapter "answers from a table: it validates
- * nothing and dispatches nothing yet" (docs/http-transport-design.md, H1), and
- * this enum IS that table: it selects which canned answer every exchange gets,
- * so that a recording writer can drive both response modes with no socket
- * involved - which is H1's merge criterion for this side of the seam.
+ * The placeholder answer, unchanged by H2. The adapter now validates, but it
+ * still "dispatches nothing yet" - "Still no dispatch" is H2's own boundary in
+ * docs/http-transport-design.md - so this enum remains the table that selects
+ * which canned answer a request that PASSED validation gets, and it is what
+ * lets a recording writer drive both response modes with no socket involved.
  *
  * It exists only until H3 replaces the table with mode selection on the first
  * frame the channel produces, and disappears with it.

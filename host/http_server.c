@@ -766,7 +766,8 @@ static int serve_request(connection_t *connection, int is_first_request) {
         .body_length = body_length,
         .principal = principal,
         /*
-         * -1 in H1. The adapter answers from a table and never blocks, so
+         * -1 through H2. The adapter validates and answers from a table, and
+         * neither of those blocks, so
          * there is nothing for a cancellation source to interrupt; wiring a
          * per-request pipe with no consumer would be ceremony. The descriptor
          * becomes real in H3, when the adapter starts polling the outbox.
@@ -777,9 +778,13 @@ static int serve_request(connection_t *connection, int is_first_request) {
         server->adapter, &request, &writer, NULL);
 
     free(body);
-    /* The server layer owns the retain/release pair. H1 creates no channel, so
-     * the reference the authenticator handed over is given back here; H2 hands
-     * it to maelys_mcp_channel_config_t::context_release instead. */
+    /*
+     * The server layer owns the retain/release pair. H2 creates no channel
+     * either - it validates and stops - so the reference the authenticator
+     * handed over is still given back here. H3 hands it to
+     * maelys_mcp_channel_config_t::context_release instead, because that is the
+     * phase in which a channel exists to bind it to.
+     */
     server->authenticator->release(server->authenticator->context, principal);
     maelys_http_parser_clear(&parser);
 
