@@ -1,6 +1,13 @@
 # Authenticated transport principal — design
 
-> **Status: design only. Nothing here is implemented.** This document is the
+> **Status: the runtime half is shipped; the transport half is not.** The
+> ABI 4 channel config with `context_release`/`release_context` — the
+> mechanism this contract's principal lifetime rests on — shipped in 0.18.0,
+> and the authenticator seam with the `loopback-trust` and `static-bearer`
+> reference authenticators landed with the H1 server layer. What does NOT
+> exist yet is the consumption: no channel is created from an HTTP request
+> and no principal is bound to one until the transport's dispatch phase
+> lands. This document is the
 > contract `docs/http-transport-design.md` consumes; it is deliberately
 > separate, and reviewable alone, because it is not about HTTP. The principal
 > is a property of *a transport that has an authentication boundary*, and a
