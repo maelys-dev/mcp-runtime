@@ -34,3 +34,13 @@ runtime-wide dispatch/outbox attachment surface. ABI 2 embedders create one or m
 channels, enqueue requests through `maelys_mcp_channel_handle`, pump ordered output
 with `maelys_mcp_channel_next`, and destroy every channel before destroying its
 runtime. No ABI 1 compatibility wrappers are exported.
+
+ABI 3 was introduced by version 0.14.0. It removes `authorize`, `audit` and
+`policy_context` from `maelys_mcp_runtime_config_t`: the middleware chain
+(`maelys/mcp/middleware.h`) replaces those callbacks, and
+`maelys_mcp_runtime_add_compat_policy` wraps a legacy callback pair as a
+built-in middleware for one-call migration. Later additions within ABI 3
+(nested-request entry points, the transformation-hook descriptor fields)
+were additive: new structs and new entry points rather than changes to
+released layouts, which is this project's preferred idiom for evolving the
+API without an ABI break.
