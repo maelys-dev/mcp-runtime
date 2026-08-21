@@ -54,11 +54,14 @@ static void usage(FILE *stream) {
         "its providers are added after --provider's, in the manifest's order.\n"
         "Its \"allowEffects\" is OR-ed with --allow-effect rather than replacing it.\n"
         "\n"
-        "--http-listen starts the HTTP listener alongside stdio. It binds\n"
-        "127.0.0.1 unless told otherwise, and a non-loopback address refuses to\n"
-        "start unless --http-bearer-token supplies an authenticator other than\n"
-        "loopback trust. THE HTTP ENDPOINT DOES NOT SERVE MCP YET: it parses,\n"
-        "routes and authenticates, and answers 503 (see docs/protocol-support.md).\n");
+        "--http-listen starts the HTTP listener alongside stdio, on the same\n"
+        "runtime. It binds 127.0.0.1 unless told otherwise, and a non-loopback\n"
+        "address refuses to start unless --http-bearer-token supplies an\n"
+        "authenticator other than loopback trust.\n"
+        "\n"
+        "The HTTP endpoint serves MCP over 2026-07-28 ONLY; every older revision\n"
+        "stays on stdio. Streamable HTTP is not claimed until the official\n"
+        "conformance suite runs against this listener (docs/protocol-support.md).\n");
 }
 
 /*

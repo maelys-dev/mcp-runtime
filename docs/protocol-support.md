@@ -52,20 +52,43 @@ Process providers may originate resource updates and Tools/Resources list change
 through the private `maelys-provider` protocol. These events enter the same filtered,
 bounded subscription and Outbox path as native producers.
 
-Prompts, Tasks, Streamable HTTP,
-HTTP header routing, and authorization transports are not implemented. Resource *content blocks* returned
-by a tool remain distinct from the independently enabled MCP Resources capability.
+Prompts, Tasks and authorization transports are not implemented. Streamable
+HTTP is not claimed; HTTP header routing is validated but not claimed either —
+see the paragraph below for exactly what the HTTP endpoint does and does not
+do. Resource *content blocks* returned by a tool remain distinct from the
+independently enabled MCP Resources capability.
 
-**Streamable HTTP is still not implemented, and the HTTP listener that now
-exists does not change that.** `--http-listen` starts an HTTP/1.1 server that
-parses requests strictly, validates `Host` and `Origin`, routes `/mcp`, and
-authenticates the caller — and then answers `503` with a JSON-RPC `-32600`,
-because there is no MCP dispatch behind it. It creates no channel and reaches
-no provider. `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` are parsed as
-headers like any others and are not yet validated against the body. This is
-phase H1 of `docs/http-transport-design.md`; the endpoint begins serving MCP at
-H3, and "Streamable HTTP" is not claimed anywhere until the official
-conformance suite passes against the real binary at H4.
+**The HTTP endpoint now serves MCP — `2026-07-28` only — and "Streamable HTTP"
+is still not claimed.** Those two sentences are both true and the gap between
+them is the point of this paragraph.
+
+What works. `--http-listen` starts an HTTP/1.1 server that parses requests
+strictly, validates `Host` and `Origin`, routes `/mcp`, authenticates the
+caller, and checks `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` against
+the body. A request that survives all of that is dispatched: the listener
+creates a channel per `POST`, bound to that request's authenticated principal
+and to the modern era alone, and answers from the runtime. The reply is
+`application/json` when the request resolves to a single response and
+`text/event-stream` when it produces anything first — a `tools/call` with
+progress, or a `subscriptions/listen` stream. A notification is `202 Accepted`
+with an empty body. A client that disconnects mid-call cancels it.
+
+**The modern era only, and that is structural rather than a policy.** An HTTP
+channel is created with `MAELYS_MCP_ERA_MODERN` and cannot be talked out of it,
+so `initialize` is refused by the runtime rather than by a transport check, and
+a request naming an older version is refused with `-32022`. Legacy protocol
+support stays stdio-only. One process can serve both at once, on the same
+runtime.
+
+What is not proven. This is phase H3 of `docs/http-transport-design.md`. The
+official conformance suite still runs through the test-only HTTP-to-stdio
+adapter described below, not against this listener; until it passes against the
+real binary with no adapter in the path — phase H4, which also has to make the
+`server-sse-multiple-streams` and `dns-rebinding-protection` exclusions stale —
+"Streamable HTTP" is not claimed anywhere. Session management (`Mcp-Session-Id`)
+and resumable streams (`Last-Event-ID`) are ignored by design and are not
+planned for v1; TLS is out of scope and the listener is meant for loopback or a
+terminator in front of it.
 
 The upstream conformance runner currently requires an HTTP server and its complete
 2026-07-28 requirement set covers capabilities beyond this milestone. Its current
