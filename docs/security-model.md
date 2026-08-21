@@ -61,7 +61,12 @@
   had already retained it has finished, whether the caller waits for that
   (`maelys_mcp_channel_destroy`) or hands it to the runtime and returns
   (`maelys_mcp_channel_destroy_detached`). `maelys_mcp_runtime_destroy` refuses to
-  free a runtime that any such channel still points at.
+  free a runtime that any such channel still points at. A channel context that owns
+  something is handed back at that free through
+  `maelys_mcp_channel_config_t::context_release`, exactly once and whichever path
+  destruction took, so a detached channel's context — an authenticated principal, in
+  the case the callback was designed for — is released as soon as it stops being
+  reachable rather than being pinned for the runtime's remaining lifetime.
 - Provider event fan-out retains each target channel while delivering outside the
   runtime registry lock. A slow or faulted channel cannot suspend or invalidate its
   peers.

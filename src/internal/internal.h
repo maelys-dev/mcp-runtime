@@ -132,7 +132,8 @@ struct maelys_mcp_provider {
      * maelys_mcp_provider_set_nested_handlers). When one is set the module
      * prefers it and hands it the dispatch's relay; when it is not, the plain
      * callback above runs exactly as before. Adding them here rather than to
-     * maelys_mcp_provider_config_t is what keeps the ABI at 3.
+     * maelys_mcp_provider_config_t is what kept them out of the ABI: they
+     * predate ABI 4 and are not part of it.
      */
     maelys_mcp_provider_call_nested_fn call_nested;
     maelys_mcp_provider_read_resource_nested_fn read_resource_nested;
@@ -278,12 +279,17 @@ struct maelys_mcp_channel {
      */
     int detached;
     /*
-     * Which protocol eras this channel serves and announces. Opens at
-     * MAELYS_MCP_ERA_ALL so an untouched channel behaves exactly as it always
-     * did, and is narrowed by maelys_mcp_channel_set_protocol_eras. Written
-     * and read under channel->mutex, because a dispatch on a worker thread
-     * reads it while the transport that created the channel may still be
-     * setting it up.
+     * Which protocol eras this channel serves and announces:
+     * config.protocol_eras with zero normalized to MAELYS_MCP_ERA_ALL, so an
+     * embedder that never mentioned eras behaves exactly as it always did.
+     *
+     * Written once in initialize_channel, before the channel is published and
+     * therefore before any other thread can reach it, and read-only for the
+     * rest of its life - which is the whole benefit of a config field over
+     * the setter ABI 3 had: there is no window in which one thread narrows the
+     * mask while another dispatches against it. Reads that happen to sit
+     * inside a channel->mutex critical section are there for the mutable
+     * fields beside them, not for this one.
      */
     unsigned int protocol_eras;
     int legacy_initialize_received;

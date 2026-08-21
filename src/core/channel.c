@@ -25,7 +25,16 @@ static maelys_mcp_result_t initialize_channel(
         channel->config.admission_timeout_ms = 5000u;
     }
     if (!channel->config.close_timeout_ms) channel->config.close_timeout_ms = 5000u;
-    channel->protocol_eras = MAELYS_MCP_ERA_ALL;
+    /*
+     * Zero is the default and not an error, unlike every other bit pattern
+     * that names no era: a config that never mentions eras is what every
+     * caller written before the field existed passes, and it has to keep
+     * meaning "both". Normalized once, here, so nothing downstream has to
+     * remember that zero is special. An impossible non-zero mask never
+     * reaches this function - maelys_mcp_channel_create refuses it.
+     */
+    channel->protocol_eras = channel->config.protocol_eras ?
+        channel->config.protocol_eras : (unsigned int)MAELYS_MCP_ERA_ALL;
     channel->subscriptions = calloc(runtime->max_subscriptions,
         sizeof(*channel->subscriptions));
     if (!channel->subscriptions) goto failed;
@@ -71,6 +80,13 @@ failed:
     return status == MAELYS_MCP_OK ? MAELYS_MCP_ERR_IO : status;
 }
 
+/*
+ * A channel that was allocated and never published, so its config was copied
+ * but its context was never taken: maelys_mcp_channel_create is about to
+ * report a failure, and ownership of config.context transfers on success only.
+ * Deliberately not free_channel_storage - calling context_release here would
+ * hand back something the caller still owns and is entitled to free itself.
+ */
 static void free_unpublished_channel(maelys_mcp_channel_t *channel) {
     if (!channel) return;
     (void)maelys_mcp_outbox_close(channel->outbox, 1);
@@ -185,6 +201,16 @@ maelys_mcp_result_t maelys_mcp_channel_create(
     maelys_mcp_channel_t **out_channel) {
     if (!runtime || !out_channel) return MAELYS_MCP_ERR_ARGUMENT;
     *out_channel = NULL;
+    /*
+     * Before the create gate, because a mask naming an era this runtime has
+     * never heard of is the caller's mistake and not a runtime state: nothing
+     * is allocated, nothing is admitted, and the caller is told which of its
+     * arguments was impossible rather than being handed a channel that quietly
+     * serves something else.
+     */
+    if (config && (config->protocol_eras & ~(unsigned int)MAELYS_MCP_ERA_ALL)) {
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
     maelys_mcp_result_t status = begin_channel_create(runtime);
     if (status != MAELYS_MCP_OK) return status;
     maelys_mcp_channel_t *channel = NULL;
@@ -217,14 +243,24 @@ static maelys_mcp_result_t begin_operation(maelys_mcp_channel_t *channel) {
  * would drift.
  *
  * It is also the single point at which a channel's context stops being
- * reachable, and therefore the one place a context lifecycle callback belongs
- * when the channel grows one. An authenticated transport principal is the case
- * that needs it: the reaper carries a reference across the detach and releases
- * it at the real free, which is here and is emphatically not the return from
- * destroy. Keeping the free in one function is what makes that a one-line
- * addition instead of two that can disagree.
+ * reachable, and therefore the one place config.context_release belongs. An
+ * authenticated transport principal is the case that needs it: the reference
+ * the channel took is given back at the real free, which is here and is
+ * emphatically not the return from destroy. Because both destruction paths
+ * arrive here and nothing else does, "exactly once, whichever path" is a
+ * property of the call graph rather than of two call sites agreeing.
+ *
+ * The callback runs last, after free(channel), with no lock held: it is handed
+ * a context whose channel is already gone, so an embedder cannot be tempted to
+ * reach back through a handle the destroy already consumed. On the detached
+ * path that also puts it ahead of the retirement in free_detached_channel,
+ * which is what makes it run before maelys_mcp_runtime_destroy returns rather
+ * than racing it.
  */
 static void free_channel_storage(maelys_mcp_channel_t *channel) {
+    void (*context_release)(void *, void *) = channel->config.context_release;
+    void *release_context = channel->config.release_context;
+    void *context = channel->config.context;
     for (size_t index = 0; index < channel->subscription_count; ++index) {
         maelys_mcp_subscription_clear(&channel->subscriptions[index]);
     }
@@ -236,6 +272,7 @@ static void free_channel_storage(maelys_mcp_channel_t *channel) {
     pthread_cond_destroy(&channel->idle);
     pthread_mutex_destroy(&channel->mutex);
     free(channel);
+    if (context_release) context_release(release_context, context);
 }
 
 /*
@@ -774,36 +811,6 @@ maelys_mcp_result_t maelys_mcp_channel_accept(
 
 void *maelys_mcp_channel_context(const maelys_mcp_channel_t *channel) {
     return channel ? channel->config.context : NULL;
-}
-
-maelys_mcp_result_t maelys_mcp_channel_set_protocol_eras(
-    maelys_mcp_channel_t *channel,
-    unsigned int eras) {
-    if (!channel || !eras || (eras & ~(unsigned int)MAELYS_MCP_ERA_ALL)) {
-        return MAELYS_MCP_ERR_ARGUMENT;
-    }
-    pthread_mutex_lock(&channel->mutex);
-    if (channel->state != MAELYS_MCP_CHANNEL_ACTIVE) {
-        maelys_mcp_result_t status = channel->state == MAELYS_MCP_CHANNEL_CLOSED ?
-            MAELYS_MCP_ERR_CLOSED : MAELYS_MCP_ERR_STATE;
-        pthread_mutex_unlock(&channel->mutex);
-        return status;
-    }
-    /*
-     * A legacy session that has already been negotiated cannot be withdrawn
-     * underneath the client that negotiated it: every request it sends from
-     * here on is legal under a revision this channel agreed to serve, and
-     * answering them with -32002 afterwards would be the runtime breaking its
-     * own handshake. Narrowing before the first frame is the supported use.
-     */
-    if (channel->legacy_initialize_received &&
-        !(eras & (unsigned int)MAELYS_MCP_ERA_LEGACY)) {
-        pthread_mutex_unlock(&channel->mutex);
-        return MAELYS_MCP_ERR_STATE;
-    }
-    channel->protocol_eras = eras;
-    pthread_mutex_unlock(&channel->mutex);
-    return MAELYS_MCP_OK;
 }
 
 maelys_mcp_result_t maelys_mcp_channel_next(

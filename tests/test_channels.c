@@ -1385,6 +1385,68 @@ static int test_tools_list_shares_no_schema_across_channels(void) {
  * the failure maelys_mcp_channel_destroy_detached exists for: a bounded close
  * that cannot succeed, on a channel nobody can free yet.
  */
+/*
+ * Watches one maelys_mcp_channel_config_t::context_release: how often it ran,
+ * with what, on which thread, and - the two properties that are the whole
+ * point of the callback - whether it ran while a worker was still inside the
+ * provider, and whether it ran late enough that maelys_mcp_runtime_destroy had
+ * already returned. Every field is atomic because the callback is entitled to
+ * run on a thread the test never created.
+ */
+typedef struct release_probe {
+    atomic_int calls;
+    atomic_int wrong_arguments;
+    atomic_int saw_a_live_provider_call;
+    atomic_int ran_after_runtime_destroy;
+    atomic_int ran_off_the_creating_thread;
+    /* Raised by the stuck provider for as long as one of its calls is inside
+     * the dispatch this channel is carrying. */
+    atomic_int provider_inside;
+    atomic_int runtime_destroy_returned;
+    pthread_t creating_thread;
+    void *expected_context;
+    void *expected_release_context;
+} release_probe_t;
+
+static void release_probe_init(release_probe_t *probe, void *context) {
+    memset(probe, 0, sizeof(*probe));
+    atomic_store(&probe->calls, 0);
+    atomic_store(&probe->wrong_arguments, 0);
+    atomic_store(&probe->saw_a_live_provider_call, 0);
+    atomic_store(&probe->ran_after_runtime_destroy, 0);
+    atomic_store(&probe->ran_off_the_creating_thread, 0);
+    atomic_store(&probe->provider_inside, 0);
+    atomic_store(&probe->runtime_destroy_returned, 0);
+    probe->creating_thread = pthread_self();
+    probe->expected_context = context;
+    probe->expected_release_context = probe;
+}
+
+static void release_probe_callback(void *release_context, void *context) {
+    release_probe_t *probe = release_context;
+    if (!probe) return;
+    if (context != probe->expected_context ||
+        release_context != probe->expected_release_context) {
+        atomic_fetch_add(&probe->wrong_arguments, 1);
+    }
+    if (atomic_load(&probe->provider_inside) != 0) {
+        atomic_fetch_add(&probe->saw_a_live_provider_call, 1);
+    }
+    if (atomic_load(&probe->runtime_destroy_returned) != 0) {
+        atomic_fetch_add(&probe->ran_after_runtime_destroy, 1);
+    }
+    if (!pthread_equal(pthread_self(), probe->creating_thread)) {
+        atomic_fetch_add(&probe->ran_off_the_creating_thread, 1);
+    }
+    atomic_fetch_add(&probe->calls, 1);
+}
+
+static int release_probe_is_clean(const release_probe_t *probe) {
+    return atomic_load(&probe->wrong_arguments) == 0 &&
+        atomic_load(&probe->saw_a_live_provider_call) == 0 &&
+        atomic_load(&probe->ran_after_runtime_destroy) == 0;
+}
+
 typedef struct stuck_provider {
     pthread_mutex_t mutex;
     pthread_cond_t changed;
@@ -1394,6 +1456,10 @@ typedef struct stuck_provider {
      * ticket on entry and leaves once release_through has reached it. */
     int entered;
     int release_through;
+    /* Optional, and only the release tests set it: the probe that wants to
+     * know whether a context was handed back while this call was still
+     * running. */
+    release_probe_t *probe;
 } stuck_provider_t;
 
 static maelys_mcp_result_t stuck_call(
@@ -1404,6 +1470,7 @@ static maelys_mcp_result_t stuck_call(
     stuck_provider_t *stuck = context;
     (void)request;
     (void)out_error;
+    if (stuck->probe) atomic_fetch_add(&stuck->probe->provider_inside, 1);
     pthread_mutex_lock(&stuck->mutex);
     int ticket = ++stuck->entered;
     pthread_cond_broadcast(&stuck->changed);
@@ -1413,6 +1480,7 @@ static maelys_mcp_result_t stuck_call(
     pthread_mutex_unlock(&stuck->mutex);
     out_result->type = MAELYS_MCP_PROVIDER_RESULT_COMPLETE;
     out_result->structured_content = json_pack("{s:b}", "ok", 1);
+    if (stuck->probe) atomic_fetch_sub(&stuck->probe->provider_inside, 1);
     return out_result->structured_content ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
@@ -1421,6 +1489,7 @@ static void stuck_provider_init(stuck_provider_t *stuck) {
     pthread_cond_init(&stuck->changed, NULL);
     stuck->entered = 0;
     stuck->release_through = 0;
+    stuck->probe = NULL;
 }
 
 static void stuck_provider_clear(stuck_provider_t *stuck) {
@@ -1818,8 +1887,216 @@ static int test_detached_destroy_joins_a_finished_worker(void) {
     return 0;
 }
 
+/*
+ * context_release, the ABI 4 half of detachable destruction. The callback
+ * exists so that an embedder whose channel context owns something - an
+ * authenticated principal, in the case it was designed for - learns when that
+ * something stops being reachable, instead of having to wait for
+ * maelys_mcp_runtime_destroy. "Exactly once, whichever path destruction took"
+ * is the entire contract, so both paths are asserted, and the count is
+ * asserted to be zero at the points where a wrong implementation would already
+ * have called it.
+ */
+static maelys_mcp_channel_config_t release_config(
+    release_probe_t *probe,
+    void *context,
+    unsigned int close_timeout_ms) {
+    maelys_mcp_channel_config_t config = {
+        .max_messages = 8u,
+        .max_bytes = 1024u * 1024u,
+        .response_burst = 8u,
+        .admission_timeout_ms = 200u,
+        .close_timeout_ms = close_timeout_ms,
+        .context = context,
+        .context_release = release_probe_callback,
+        .release_context = probe
+    };
+    return config;
+}
+
+static int test_context_release_runs_once_on_the_synchronous_destroy(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    int principal = 0;
+    release_probe_t probe;
+    release_probe_init(&probe, &principal);
+    maelys_mcp_channel_config_t config = release_config(&probe, &principal,
+        2000u);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_context(channel) == &principal);
+
+    /* A channel that is being used is not a channel that is being released. */
+    ASSERT_TRUE(handle(channel, discover_request(1)) == MAELYS_MCP_OK);
+    json_t *response = next_message(channel, 1000u);
+    ASSERT_TRUE(response != NULL);
+    json_decref(response);
+    ASSERT_TRUE(atomic_load(&probe.calls) == 0);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy(channel) == MAELYS_MCP_OK);
+    ASSERT_TRUE(atomic_load(&probe.calls) == 1);
+    ASSERT_TRUE(release_probe_is_clean(&probe));
+    /* The synchronous path frees on the caller's own thread, so this one is
+     * not merely "some thread": it is this one. */
+    ASSERT_TRUE(atomic_load(&probe.ran_off_the_creating_thread) == 0);
+
+    /*
+     * The detaching destroy on a channel that closes cleanly frees inline
+     * through the very same function, and must therefore also release exactly
+     * once - the case a fix applied only to the deferred path would miss.
+     */
+    int second_principal = 0;
+    release_probe_t clean_probe;
+    release_probe_init(&clean_probe, &second_principal);
+    maelys_mcp_channel_config_t clean_config = release_config(&clean_probe,
+        &second_principal, 2000u);
+    maelys_mcp_channel_t *clean = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &clean_config, &clean) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(clean) == MAELYS_MCP_OK);
+    ASSERT_TRUE(atomic_load(&clean_probe.calls) == 1);
+    ASSERT_TRUE(release_probe_is_clean(&clean_probe));
+
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    /* Still one. A second call from the runtime teardown would be a double
+     * free in an embedder that took the contract at its word. */
+    ASSERT_TRUE(atomic_load(&probe.calls) == 1);
+    ASSERT_TRUE(atomic_load(&clean_probe.calls) == 1);
+    return 0;
+}
+
+/*
+ * Ownership transfers on success and only on success. A create that refuses
+ * its config never took the context, and a create that allocated a channel and
+ * then failed to publish it must not hand back a context its caller still
+ * owns - it would be releasing something on behalf of a channel that never
+ * existed.
+ */
+static int test_context_release_is_not_called_when_creation_fails(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(0);
+    ASSERT_TRUE(runtime != NULL);
+    int principal = 0;
+    release_probe_t probe;
+    release_probe_init(&probe, &principal);
+    maelys_mcp_channel_config_t config = release_config(&probe, &principal,
+        1000u);
+    config.protocol_eras = MAELYS_MCP_ERA_ALL | 1u << 7;
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
+        MAELYS_MCP_ERR_ARGUMENT);
+    ASSERT_TRUE(channel == NULL && atomic_load(&probe.calls) == 0);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    ASSERT_TRUE(atomic_load(&probe.calls) == 0);
+
+    /* The other failure shape: the config was copied into a real channel, and
+     * then provider activation refused to let it be published. */
+    activation_context_t activation;
+    activation_context_init(&activation, MAELYS_MCP_ERR_PROVIDER);
+    runtime = new_runtime(0);
+    maelys_mcp_provider_t *provider = activation_provider(&activation);
+    ASSERT_TRUE(runtime && provider);
+    ASSERT_TRUE(maelys_mcp_runtime_add_provider(runtime, provider, NULL) ==
+        MAELYS_MCP_OK);
+    release_probe_t unpublished;
+    release_probe_init(&unpublished, &principal);
+    maelys_mcp_channel_config_t publishable = release_config(&unpublished,
+        &principal, 1000u);
+    maelys_mcp_channel_t *never_published = NULL;
+    release_activation(&activation);
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &publishable,
+        &never_published) == MAELYS_MCP_ERR_PROVIDER);
+    ASSERT_TRUE(never_published == NULL);
+    ASSERT_TRUE(atomic_load(&unpublished.calls) == 0);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    ASSERT_TRUE(atomic_load(&unpublished.calls) == 0);
+    activation_context_clear(&activation);
+    return 0;
+}
+
+typedef struct probe_destroy_context {
+    maelys_mcp_runtime_t *runtime;
+    release_probe_t *probe;
+    maelys_mcp_result_t status;
+} probe_destroy_context_t;
+
+static void *probe_destroy_runtime_thread(void *opaque) {
+    probe_destroy_context_t *context = opaque;
+    context->status = maelys_mcp_runtime_destroy(context->runtime);
+    atomic_store(&context->probe->runtime_destroy_returned, 1);
+    return NULL;
+}
+
+/*
+ * The path the callback was designed for, and the only one where getting it
+ * wrong is not merely late but unsafe. The channel is detached with a provider
+ * call still parked inside it, so:
+ *
+ *   - the release must NOT have happened when destroy_detached returned, which
+ *     is the assertion that fails against the obvious wrong implementation
+ *     (releasing from destroy, where the embedder's connection is);
+ *   - it must happen on the worker's thread, not this one;
+ *   - it must not overlap the provider call that is still holding the channel;
+ *   - and it must have happened by the time maelys_mcp_runtime_destroy
+ *     returns, because that call drains the detached channels and the release
+ *     runs at the free, ahead of the retirement that wakes it.
+ */
+static int test_context_release_runs_once_on_the_detached_destroy(void) {
+    int principal = 0;
+    release_probe_t probe;
+    release_probe_init(&probe, &principal);
+    stuck_provider_t stuck;
+    stuck_provider_init(&stuck);
+    stuck.probe = &probe;
+    maelys_mcp_runtime_t *runtime = new_stuck_runtime(&stuck, NULL);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_channel_config_t config = release_config(&probe, &principal,
+        50u);
+    maelys_mcp_channel_t *channel = NULL;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
+        MAELYS_MCP_OK);
+    json_t *call = stuck_call_request(1);
+    ASSERT_TRUE(call != NULL);
+    ASSERT_TRUE(maelys_mcp_channel_accept(channel, call) == MAELYS_MCP_OK);
+    json_decref(call);
+    stuck_provider_await_entries(&stuck, 1);
+
+    ASSERT_TRUE(maelys_mcp_channel_destroy_detached(channel) ==
+        MAELYS_MCP_ERR_TIMEOUT);
+    /* The context is still reachable: a worker is holding the channel. */
+    ASSERT_TRUE(atomic_load(&probe.calls) == 0);
+
+    probe_destroy_context_t destroy = { .runtime = runtime, .probe = &probe,
+        .status = MAELYS_MCP_OK };
+    pthread_t thread;
+    ASSERT_TRUE(pthread_create(&thread, NULL, probe_destroy_runtime_thread,
+        &destroy) == 0);
+    for (int slept = 0; slept < 10; ++slept) {
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
+    /* Still nothing: runtime_destroy is waiting for the detached channel, and
+     * the detached channel is waiting for the provider. */
+    ASSERT_TRUE(atomic_load(&probe.calls) == 0);
+
+    stuck_provider_release(&stuck);
+    ASSERT_TRUE(pthread_join(thread, NULL) == 0);
+    ASSERT_TRUE(destroy.status == MAELYS_MCP_OK);
+    ASSERT_TRUE(atomic_load(&probe.calls) == 1);
+    ASSERT_TRUE(release_probe_is_clean(&probe));
+    ASSERT_TRUE(atomic_load(&probe.ran_off_the_creating_thread) == 1);
+    stuck_provider_clear(&stuck);
+    return 0;
+}
+
 int main(void) {
     static const maelys_test_case_t tests[] = {
+        {"context release runs once on the synchronous destroy",
+            test_context_release_runs_once_on_the_synchronous_destroy},
+        {"context release runs once on the detached destroy",
+            test_context_release_runs_once_on_the_detached_destroy},
+        {"context release is not called when creation fails",
+            test_context_release_is_not_called_when_creation_fails},
         {"detached destroy joins a finished worker and detaches a running one",
             test_detached_destroy_joins_a_finished_worker},
         {"detached destroy returns while a provider is stuck",

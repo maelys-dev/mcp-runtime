@@ -160,7 +160,10 @@ docs/                architecture, security and provider protocol
 
 ## Status
 
-Pre-1.0, native ABI 3. The 0.15 line adds nested (in-band) multi-round-trip
+Pre-1.0, native ABI 4. The 0.18 line moves the channel's protocol-era mask into
+`maelys_mcp_channel_config_t` and gives the channel context a destructor
+(migration is a recompile — see [the ABI policy](docs/abi-policy.md)). The 0.15
+line adds nested (in-band) multi-round-trip
 requests — a tool can ask the client a question mid-call, on both modern and
 legacy MCP — with concurrent calls on one connection, and ships a mutation
 testing runner ([docs](docs/mutation-testing.md)) whose first sweeps' 128

@@ -29,6 +29,21 @@ static maelys_mcp_runtime_t *new_runtime(maelys_mcp_channel_t **out_channel) {
     return runtime;
 }
 
+/*
+ * A channel whose era mask is chosen at creation, which since ABI 4 is the
+ * only way to choose it: maelys_mcp_channel_config_t::protocol_eras replaced
+ * maelys_mcp_channel_set_protocol_eras, so every mask below is fixed before
+ * the channel can carry a single frame.
+ */
+static maelys_mcp_channel_t *new_era_channel(
+    maelys_mcp_runtime_t *runtime,
+    unsigned int eras) {
+    maelys_mcp_channel_config_t config = { .protocol_eras = eras };
+    maelys_mcp_channel_t *channel = NULL;
+    return maelys_mcp_channel_create(runtime, &config, &channel) == MAELYS_MCP_OK ?
+        channel : NULL;
+}
+
 static json_t *modern_params(void) {
     return json_pack("{s:{s:s,s:{s:s,s:s},s:{}}}",
         "_meta",
@@ -366,8 +381,13 @@ static int array_holds(json_t *array, const char *value) {
     return 0;
 }
 
-/* The default has to be proven, not assumed: it is the whole reason this is an
- * additive setter rather than a behaviour change. */
+/*
+ * The default has to be proven, not assumed: zero means MAELYS_MCP_ERA_ALL,
+ * which is what keeps a config that predates the field - a NULL one, or a
+ * zero-initialized one that never mentions eras - behaving exactly as it did
+ * before ABI 4. Both spellings are checked, because the field is what a
+ * memset-and-fill embedder passes without knowing it exists.
+ */
 static int test_default_channel_announces_both_eras(void) {
     maelys_mcp_channel_t *channel = NULL;
     maelys_mcp_runtime_t *runtime = new_runtime(&channel);
@@ -377,6 +397,16 @@ static int test_default_channel_announces_both_eras(void) {
     ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_MODERN));
     ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_LEGACY));
     json_decref(versions);
+
+    /* An explicit zero in the field is the same channel as no config at all. */
+    maelys_mcp_channel_t *zeroed = new_era_channel(runtime, 0u);
+    ASSERT_TRUE(zeroed != NULL);
+    versions = announced_versions(zeroed);
+    ASSERT_TRUE(json_array_size(versions) == 2);
+    ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_MODERN));
+    ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_LEGACY));
+    json_decref(versions);
+    ASSERT_TRUE(maelys_mcp_channel_destroy(zeroed) == MAELYS_MCP_OK);
     /* And the legacy handshake still works on it. */
     json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
         "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
@@ -389,11 +419,11 @@ static int test_default_channel_announces_both_eras(void) {
 }
 
 static int test_modern_only_channel_announces_and_refuses(void) {
-    maelys_mcp_channel_t *channel = NULL;
-    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    maelys_mcp_runtime_t *runtime = new_runtime(NULL);
     ASSERT_TRUE(runtime != NULL);
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
-        MAELYS_MCP_ERA_MODERN) == MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = new_era_channel(runtime,
+        MAELYS_MCP_ERA_MODERN);
+    ASSERT_TRUE(channel != NULL);
     json_t *versions = announced_versions(channel);
     ASSERT_TRUE(json_array_size(versions) == 1);
     ASSERT_TRUE(array_holds(versions, MAELYS_MCP_PROTOCOL_MODERN));
@@ -425,11 +455,11 @@ static int test_modern_only_channel_announces_and_refuses(void) {
 }
 
 static int test_legacy_only_channel_refuses_modern_negotiation(void) {
-    maelys_mcp_channel_t *channel = NULL;
-    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+    maelys_mcp_runtime_t *runtime = new_runtime(NULL);
     ASSERT_TRUE(runtime != NULL);
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
-        MAELYS_MCP_ERA_LEGACY) == MAELYS_MCP_OK);
+    maelys_mcp_channel_t *channel = new_era_channel(runtime,
+        MAELYS_MCP_ERA_LEGACY);
+    ASSERT_TRUE(channel != NULL);
 
     /* server/discover is a modern entry point, so it is refused with the
      * version error and the error names what this channel does serve. */
@@ -465,45 +495,64 @@ static int test_legacy_only_channel_refuses_modern_negotiation(void) {
     return 0;
 }
 
-static int test_protocol_era_setter_rejects_impossible_masks(void) {
-    maelys_mcp_channel_t *channel = NULL;
-    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+/*
+ * An impossible mask is refused at creation, and refused loudly: zero is the
+ * one value that means "both eras", so the mistake the old setter caught by
+ * rejecting zero is now caught by rejecting bits that name no era at all. A
+ * refused config produces no channel, which is the property that stops a
+ * caller from proceeding with a channel it never asked for.
+ */
+static int test_protocol_era_config_rejects_impossible_masks(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(NULL);
     ASSERT_TRUE(runtime != NULL);
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(NULL,
-        MAELYS_MCP_ERA_ALL) == MAELYS_MCP_ERR_ARGUMENT);
-    /* Zero is not "every era": a channel serving none can answer nothing. */
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel, 0u) ==
+    maelys_mcp_channel_config_t config = { .protocol_eras = 1u << 7 };
+    maelys_mcp_channel_t *channel = (maelys_mcp_channel_t *)0x1;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
         MAELYS_MCP_ERR_ARGUMENT);
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
-        MAELYS_MCP_ERA_ALL | 1u << 7) == MAELYS_MCP_ERR_ARGUMENT);
-    /* A rejected call changes nothing. */
-    json_t *versions = announced_versions(channel);
+    ASSERT_TRUE(channel == NULL);
+    config.protocol_eras = MAELYS_MCP_ERA_ALL | 1u << 7;
+    ASSERT_TRUE(maelys_mcp_channel_create(runtime, &config, &channel) ==
+        MAELYS_MCP_ERR_ARGUMENT);
+    ASSERT_TRUE(channel == NULL);
+
+    /* And a refusal costs the runtime nothing: the next channel still works. */
+    maelys_mcp_channel_t *good = new_era_channel(runtime, MAELYS_MCP_ERA_ALL);
+    ASSERT_TRUE(good != NULL);
+    json_t *versions = announced_versions(good);
     ASSERT_TRUE(json_array_size(versions) == 2);
     json_decref(versions);
-
-    /* An era that a client has already negotiated cannot be withdrawn. */
-    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
-        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
-        "clientInfo", "name", "codex", "version", "1");
-    json_t *response = dispatch(channel, request(json_integer(2), "initialize", init));
-    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
-    json_decref(response);
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
-        MAELYS_MCP_ERA_MODERN) == MAELYS_MCP_ERR_STATE);
-    /* Re-asserting a superset of what is negotiated is still fine. */
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
-        MAELYS_MCP_ERA_ALL) == MAELYS_MCP_OK);
-    ASSERT_TRUE(cleanup(runtime, channel));
+    ASSERT_TRUE(cleanup(runtime, good));
     return 0;
 }
 
-static int test_protocol_era_setter_refuses_a_closed_channel(void) {
-    maelys_mcp_channel_t *channel = NULL;
-    maelys_mcp_runtime_t *runtime = new_runtime(&channel);
+/*
+ * The rule that died with the setter, asserted from the other side: a
+ * legacy-negotiated channel keeps serving legacy for the rest of its life,
+ * because nothing can narrow it mid-session any more. The old
+ * ERR_STATE-on-withdrawal case exists here as a channel that simply cannot be
+ * put into that position.
+ */
+static int test_negotiated_era_cannot_be_withdrawn_mid_session(void) {
+    maelys_mcp_runtime_t *runtime = new_runtime(NULL);
     ASSERT_TRUE(runtime != NULL);
-    ASSERT_TRUE(maelys_mcp_channel_close(channel, 1000u) == MAELYS_MCP_OK);
-    ASSERT_TRUE(maelys_mcp_channel_set_protocol_eras(channel,
-        MAELYS_MCP_ERA_MODERN) == MAELYS_MCP_ERR_CLOSED);
+    maelys_mcp_channel_t *channel = new_era_channel(runtime, MAELYS_MCP_ERA_ALL);
+    ASSERT_TRUE(channel != NULL);
+    json_t *init = json_pack("{s:s,s:{},s:{s:s,s:s}}",
+        "protocolVersion", MAELYS_MCP_PROTOCOL_LEGACY, "capabilities",
+        "clientInfo", "name", "codex", "version", "1");
+    json_t *response = dispatch(channel,
+        request(json_integer(1), "initialize", init));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *initialized = request(NULL, "notifications/initialized", json_object());
+    ASSERT_TRUE(maelys_mcp_channel_handle(channel, initialized) == MAELYS_MCP_OK);
+    json_decref(initialized);
+    response = dispatch(channel, request(json_integer(2), "tools/list", NULL));
+    ASSERT_TRUE(json_is_object(json_object_get(response, "result")));
+    json_decref(response);
+    json_t *versions = announced_versions(channel);
+    ASSERT_TRUE(json_array_size(versions) == 2);
+    json_decref(versions);
     ASSERT_TRUE(cleanup(runtime, channel));
     return 0;
 }
@@ -513,8 +562,8 @@ int main(void) {
         {"default channel announces both eras", test_default_channel_announces_both_eras},
         {"modern-only channel announces one era and refuses initialize", test_modern_only_channel_announces_and_refuses},
         {"legacy-only channel refuses modern negotiation", test_legacy_only_channel_refuses_modern_negotiation},
-        {"protocol era setter rejects impossible masks", test_protocol_era_setter_rejects_impossible_masks},
-        {"protocol era setter refuses a closed channel", test_protocol_era_setter_refuses_a_closed_channel},
+        {"protocol era config rejects impossible masks", test_protocol_era_config_rejects_impossible_masks},
+        {"a negotiated era cannot be withdrawn mid-session", test_negotiated_era_cannot_be_withdrawn_mid_session},
         {"invalid JSON-RPC envelopes and id types", test_invalid_envelopes_and_ids},
         {"notifications do not produce responses", test_notifications_have_no_response_or_side_effect},
         {"modern metadata and version contract", test_modern_metadata_contract},
