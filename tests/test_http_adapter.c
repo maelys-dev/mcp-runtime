@@ -359,6 +359,11 @@ typedef struct matrix_case {
     /* 1 when the refusal must echo the request's id (2), 0 when it must be
      * null. Ignored on a 503. */
     int expect_id;
+    /* A substring of the refusal message, or NULL. Two rows of the status
+     * table share 400 and -32600 - a JSON-RPC response body and everything
+     * else - so the code alone cannot tell them apart and the message is what
+     * keeps them separate rows rather than one. */
+    const char *expect_message;
 } matrix_case_t;
 
 #define META "\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"}"
@@ -375,6 +380,16 @@ static const char *const H_VERSION_LEGACY_AGREEING[] = {
     "MCP-Protocol-Version", "2025-11-25", "Mcp-Method", "tools/list", NULL};
 static const char *const H_VERSION_AND_METHOD[] = {
     "MCP-Protocol-Version", "2026-07-28", "Mcp-Method", "tools/list", NULL};
+/*
+ * Header sets that isolate ONE rule: the version rule cannot be the reason a
+ * request is refused if a second rule is also firing, and a matrix whose cases
+ * all trip two rules at once cannot tell which one is load-bearing. Each of
+ * these carries a matching Mcp-Method so the version rule is the only thing
+ * left that can refuse.
+ */
+static const char *const H_METHOD_ONLY[] = {"Mcp-Method", "tools/list", NULL};
+static const char *const H_VERSION_WRONG_WITH_METHOD[] = {
+    "MCP-Protocol-Version", "2025-11-25", "Mcp-Method", "tools/list", NULL};
 static const char *const H_METHOD_WRONG[] = {
     "MCP-Protocol-Version", "2026-07-28", "Mcp-Method", "tools/call", NULL};
 static const char *const H_METHOD_CASE[] = {
@@ -406,6 +421,10 @@ static const char *const H_CALL_NAME_SHORT_PATTERN[] = CALL_HEADERS("=?base64?="
 static const char *const H_CALL_NAME_COLLISION_RAW[] = CALL_HEADERS("=?base64?QQ==?=");
 static const char *const H_CALL_NAME_COLLISION_ENCODED[] =
     CALL_HEADERS("=?base64?PT9iYXNlNjQ/UVE9PT89?=");
+/* Prefix without suffix: not a sentinel, so it is compared literally. */
+static const char *const H_CALL_NAME_PREFIX_ONLY[] = CALL_HEADERS("=?base64?c2VhcmNo");
+/* The URL-safe spelling of "fn5+", which is base64 for "~~~". */
+static const char *const H_CALL_NAME_URLSAFE_DECODABLE[] = CALL_HEADERS("=?base64?fn5-?=");
 
 static const char *const H_READ_NO_NAME[] = {
     "MCP-Protocol-Version", "2026-07-28", "Mcp-Method", "resources/read", NULL};
@@ -427,149 +446,192 @@ static const char *const H_LIST_WITH_NAME[] = {
 static const matrix_case_t MATRIX[] = {
     /* --- body parse and classification (the -32700 / -32600 adapter rows) --- */
     {"body not valid JSON -> 400 -32700",
-     "truncated json", H_VERSION_ONLY, "{\"jsonrpc\":", 400, -32700, 0},
+     "truncated json", H_VERSION_ONLY, "{\"jsonrpc\":", 400, -32700, 0, NULL},
     {"body valid JSON but not an object -> 400 -32700",
-     "array body", H_VERSION_ONLY, "[1,2,3]", 400, -32700, 0},
+     "array body", H_VERSION_ONLY, "[1,2,3]", 400, -32700, 0, NULL},
     {"body valid JSON but not an object -> 400 -32700",
-     "bare string body", H_VERSION_ONLY, "\"hello\"", 400, -32700, 0},
+     "bare string body", H_VERSION_ONLY, "\"hello\"", 400, -32700, 0, NULL},
     {"body valid JSON but not an object -> 400 -32700",
-     "empty body", H_VERSION_ONLY, "", 400, -32700, 0},
+     "empty body", H_VERSION_ONLY, "", 400, -32700, 0, NULL},
     {"body is a JSON-RPC response (has id, no method) -> 400 -32600 no id",
      "response carrying a result", H_VERSION_ONLY,
-     "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}", 400, -32600, 0},
+     "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}", 400, -32600, 0,
+     "JSON-RPC response"},
     {"body is a JSON-RPC response (has id, no method) -> 400 -32600 no id",
      "response carrying an error", H_VERSION_ONLY,
      "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-1,\"message\":\"x\"}}",
-     400, -32600, 0},
+     400, -32600, 0, "JSON-RPC response"},
     {"anything else -> 400",
-     "neither method nor id", H_VERSION_ONLY, "{\"jsonrpc\":\"2.0\"}", 400, -32600, 0},
+     "neither method nor id", H_VERSION_ONLY, "{\"jsonrpc\":\"2.0\"}", 400, -32600, 0,
+     "not a JSON-RPC request or notification"},
     {"anything else -> 400",
      "method is not a string", H_VERSION_ONLY,
-     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":7}", 400, -32600, 0},
+     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":7}", 400, -32600, 0, NULL},
     {"a notification is a request WITHOUT an id, so an explicit null id is neither",
      "method with a null id", H_VERSION_ONLY,
-     "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/list\"}", 400, -32600, 0},
+     "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"tools/list\"}", 400, -32600, 0, NULL},
 
     /* --- MCP-Protocol-Version --- */
     {"MCP-Protocol-Version required, exactly once -> 400 -32020",
-     "version header absent", H_NONE, REQ("tools/list", META), 400, -32020, 1},
+     "version header absent", H_NONE, REQ("tools/list", META), 400, -32020, 1, NULL},
     {"a repeated protocol header is reported absent and refused, never merged",
      "version header duplicated", H_VERSION_DUPLICATED,
-     REQ("tools/list", META), 400, -32020, 1},
+     REQ("tools/list", META), 400, -32020, 1, NULL},
     {"the header must equal the body's _meta version -> 400 -32020",
      "body carries no _meta version", H_VERSION_ONLY,
-     REQ("tools/list", "\"a\":1"), 400, -32020, 1},
+     REQ("tools/list", "\"a\":1"), 400, -32020, 1, NULL},
     {"the header must equal the body's _meta version -> 400 -32020",
      "header and _meta disagree", H_VERSION_WRONG,
-     REQ("tools/list", META), 400, -32020, 1},
+     REQ("tools/list", META), 400, -32020, 1, NULL},
     {"an agreeing pair naming an unserved version is NOT the adapter's refusal: "
      "-32022 is the runtime's row and stays there",
      "legacy version agreeing with the body", H_VERSION_LEGACY_AGREEING,
      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":"
-     "{\"io.modelcontextprotocol/protocolVersion\":\"2025-11-25\"}}}", 503, 0, 0},
+     "{\"io.modelcontextprotocol/protocolVersion\":\"2025-11-25\"}}}", 503, 0, 0, NULL},
 
     /* --- Mcp-Method --- */
     {"Mcp-Method required on requests -> 400 -32020",
      "method header absent on a request", H_VERSION_ONLY,
-     REQ("tools/list", META), 400, -32020, 1},
+     REQ("tools/list", META), 400, -32020, 1, NULL},
     {"a repeated protocol header is reported absent and refused",
      "method header duplicated", H_METHOD_DUPLICATED,
-     REQ("tools/list", META), 400, -32020, 1},
+     REQ("tools/list", META), 400, -32020, 1, NULL},
     {"Mcp-Method must equal the body's method byte for byte -> 400 -32020",
      "method header names another method", H_METHOD_WRONG,
-     REQ("tools/list", META), 400, -32020, 1},
+     REQ("tools/list", META), 400, -32020, 1, NULL},
     {"header VALUES are compared case-sensitively",
      "method header differs only in case", H_METHOD_CASE,
-     REQ("tools/list", META), 400, -32020, 1},
+     REQ("tools/list", META), 400, -32020, 1, NULL},
     {"Mcp-Method is required on requests, so a notification without one passes",
      "notification with no method header", H_VERSION_ONLY,
-     NOTE("notifications/cancelled", META), 503, 0, 0},
+     NOTE("notifications/cancelled", META), 503, 0, 0, NULL},
     {"present-but-wrong is a mismatch whatever the body kind",
      "notification with a mismatched method header", H_METHOD_WRONG,
-     NOTE("notifications/cancelled", META), 400, -32020, 0},
+     NOTE("notifications/cancelled", META), 400, -32020, 0, NULL},
 
     /* --- Mcp-Name --- */
     {"Mcp-Name required on tools/call -> 400 -32020",
      "name header absent on tools/call", H_CALL_NO_NAME,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"Mcp-Name required on resources/read -> 400 -32020",
      "name header absent on resources/read", H_READ_NO_NAME,
-     REQ("resources/read", "\"uri\":\"file:///tmp/a\"," META), 400, -32020, 1},
+     REQ("resources/read", "\"uri\":\"file:///tmp/a\"," META), 400, -32020, 1, NULL},
     {"Mcp-Name must equal params.name -> 400 -32020",
      "name header names another tool", H_CALL_NAME_WRONG,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"Mcp-Name must equal params.name",
      "literal name matches", H_CALL_NAME_OK,
-     REQ("tools/call", "\"name\":\"search\"," META), 503, 0, 0},
+     REQ("tools/call", "\"name\":\"search\"," META), 503, 0, 0, NULL},
     {"Mcp-Name is required only where the spec requires it; elsewhere there is "
      "no body field to compare against",
      "name header on tools/list is ignored", H_LIST_WITH_NAME,
-     REQ("tools/list", META), 503, 0, 0},
+     REQ("tools/list", META), 503, 0, 0, NULL},
 
     /* --- the Base64 sentinel --- */
     {"a value with the prefix AND the suffix is decoded before comparison",
      "sentinel decodes and matches", H_CALL_NAME_SENTINEL_OK,
-     REQ("tools/call", "\"name\":\"search\"," META), 503, 0, 0},
+     REQ("tools/call", "\"name\":\"search\"," META), 503, 0, 0, NULL},
     {"decoding happens before comparison, so a decoded mismatch is still a mismatch",
      "sentinel decodes and mismatches", H_CALL_NAME_SENTINEL_WRONG,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"the decoded bytes must be valid UTF-8; a multibyte name round-trips",
      "sentinel carrying multibyte UTF-8", H_CALL_NAME_SENTINEL_UTF8,
-     REQ("tools/call", "\"name\":\"s\\u00e9curit\\u00e9\"," META), 503, 0, 0},
+     REQ("tools/call", "\"name\":\"s\\u00e9curit\\u00e9\"," META), 503, 0, 0, NULL},
     {"non-alphabet characters are a rejection",
      "sentinel with a non-alphabet byte", H_CALL_NAME_BAD_ALPHABET,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"there is no URL-safe alphabet",
      "sentinel using - and _", H_CALL_NAME_URLSAFE,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"wrong padding length is a rejection",
      "sentinel payload not a multiple of four", H_CALL_NAME_BAD_LENGTH,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"non-zero bits in the padding are a rejection",
      "sentinel with non-zero bits under two pad bytes", H_CALL_NAME_BAD_PADBITS,
-     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1, NULL},
     {"non-zero bits in the padding are a rejection",
      "sentinel with non-zero bits under one pad byte", H_CALL_NAME_BAD_PADBITS_ONE,
-     REQ("tools/call", "\"name\":\"ab\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"ab\"," META), 400, -32020, 1, NULL},
     {"padding appears only at the tail",
      "sentinel with padding in the middle", H_CALL_NAME_INNER_PAD,
-     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1, NULL},
+    /*
+     * The next two, and the UTF-8 rules generally, are DEFENCE IN DEPTH and
+     * cannot be killed by a behavioural test - a mutation that deletes any of
+     * them survives this matrix, correctly. The body value is produced by
+     * jansson, which refuses to parse a string that is not valid UTF-8 or that
+     * carries \u0000, so a decoded value violating one of those rules can never
+     * equal the body value and the comparison refuses it anyway. The design
+     * says as much for the NUL case: accepting one "could only produce a
+     * comparison that can never succeed". The rules stay because rejecting at
+     * the decoder is clearer than rejecting at the comparison, and because the
+     * http-headers fuzz target covers the memory safety the comparison does
+     * not.
+     */
     {"the decoded bytes must be valid UTF-8",
      "sentinel decoding to invalid UTF-8", H_CALL_NAME_INVALID_UTF8,
-     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"search\"," META), 400, -32020, 1, NULL},
     {"the decoded bytes must contain no NUL",
      "sentinel decoding to an embedded NUL", H_CALL_NAME_EMBEDDED_NUL,
-     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"a\"," META), 400, -32020, 1, NULL},
     {"prefix and suffix must not overlap: below 11 bytes the value is literal",
      "the 10-byte pattern is taken literally", H_CALL_NAME_SHORT_PATTERN,
-     REQ("tools/call", "\"name\":\"=?base64?=\"," META), 503, 0, 0},
+     REQ("tools/call", "\"name\":\"=?base64?=\"," META), 503, 0, 0, NULL},
     {"a literal value matching the pattern must have been encoded by the client; "
      "the mismatch that results is a genuine HeaderMismatch",
      "raw sentinel-looking name is decoded, not taken literally",
      H_CALL_NAME_COLLISION_RAW,
-     REQ("tools/call", "\"name\":\"=?base64?QQ==?=\"," META), 400, -32020, 1},
+     REQ("tools/call", "\"name\":\"=?base64?QQ==?=\"," META), 400, -32020, 1, NULL},
     {"the same collision, encoded as the client should have encoded it, passes",
      "encoded sentinel-looking name", H_CALL_NAME_COLLISION_ENCODED,
-     REQ("tools/call", "\"name\":\"=?base64?QQ==?=\"," META), 503, 0, 0},
+     REQ("tools/call", "\"name\":\"=?base64?QQ==?=\"," META), 503, 0, 0, NULL},
 
     /* --- resources/read compares the RAW uri --- */
     {"resources/read compares against the raw params.uri, never the "
      "canonicalized form",
      "raw percent-encoded uri matches the raw body value", H_READ_NAME_RAW,
-     REQ("resources/read", "\"uri\":\"file:///tmp/a%20b\"," META), 503, 0, 0},
+     REQ("resources/read", "\"uri\":\"file:///tmp/a%20b\"," META), 503, 0, 0, NULL},
     {"normalizing before comparing would let two header values both pass",
      "canonicalized uri does not match the raw body value", H_READ_NAME_CANONICAL,
-     REQ("resources/read", "\"uri\":\"file:///tmp/a%20b\"," META), 400, -32020, 1},
+     REQ("resources/read", "\"uri\":\"file:///tmp/a%20b\"," META), 400, -32020, 1, NULL},
 
     /* --- ordering --- */
     {"parse precedes compare: a body with no fields has nothing to disagree with",
      "unparseable body with mismatched headers too", H_METHOD_WRONG,
-     "{not json", 400, -32700, 0},
+     "{not json", 400, -32700, 0, NULL},
+
+    /*
+     * --- one rule at a time ---
+     *
+     * Each of these was added because a mutation of the rule it names SURVIVED
+     * the matrix: the case that was supposed to cover the rule was also
+     * tripping a second rule, so removing the first changed nothing observable.
+     */
+    {"MCP-Protocol-Version required, exactly once -> 400 -32020",
+     "version absent while every other rule is satisfied", H_METHOD_ONLY,
+     REQ("tools/list", META), 400, -32020, 1, NULL},
+    {"the header must equal the body's _meta version -> 400 -32020",
+     "no _meta version while every other rule is satisfied", H_VERSION_AND_METHOD,
+     REQ("tools/list", "\"a\":1"), 400, -32020, 1, NULL},
+    {"the header must equal the body's _meta version -> 400 -32020",
+     "version disagrees while every other rule is satisfied",
+     H_VERSION_WRONG_WITH_METHOD, REQ("tools/list", META), 400, -32020, 1, NULL},
+    {"a value carrying the prefix but NOT the suffix is not a sentinel and is "
+     "taken literally",
+     "prefix without suffix is compared literally", H_CALL_NAME_PREFIX_ONLY,
+     REQ("tools/call", "\"name\":\"=?base64?c2VhcmNo\"," META), 503, 0, 0, NULL},
+    {"a malformed sentinel is a rejection, never a fallback to a literal compare",
+     "malformed payload is not retried as a literal", H_CALL_NAME_BAD_ALPHABET,
+     REQ("tools/call", "\"name\":\"=?base64?c2Vh*mNo?=\"," META), 400, -32020, 1, NULL},
+    {"there is no URL-safe alphabet",
+     "URL-safe spelling that would otherwise decode to the body's name",
+     H_CALL_NAME_URLSAFE_DECODABLE,
+     REQ("tools/call", "\"name\":\"~~~\"," META), 400, -32020, 1, NULL},
 
     /* --- the happy path --- */
     {"a request that satisfies every rule reaches the placeholder",
      "valid tools/list request", H_VERSION_AND_METHOD,
-     REQ("tools/list", META), 503, 0, 0}
+     REQ("tools/list", META), 503, 0, 0, NULL}
 };
 
 static int check_matrix_case(const matrix_case_t *test_case) {
@@ -632,6 +694,12 @@ static int check_matrix_case(const matrix_case_t *test_case) {
     } else if (!json_is_null(id)) {
         fprintf(stderr, "  [%s] expected a null id, got %s\n",
             test_case->name, state.body);
+        failed = 1;
+    }
+    if (test_case->expect_message &&
+        !strstr(state.body, test_case->expect_message)) {
+        fprintf(stderr, "  [%s] expected the message to carry \"%s\", got %s\n",
+            test_case->name, test_case->expect_message, state.body);
         failed = 1;
     }
     json_decref(body);
