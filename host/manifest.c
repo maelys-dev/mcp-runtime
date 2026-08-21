@@ -40,16 +40,41 @@ static void manifest_errorf(char **out_error, const char *format, ...) {
  * calloc deep inside a spawn call. */
 #define MANIFEST_MAX_BYTES ((json_int_t)(16LL * 1024 * 1024 * 1024))
 
+/*
+ * Bounds on manifestVersion 2's "args" (docs/manifest.md, "Bounds on args" in
+ * docs/launch-contract-design.md). Policy, not derivation: without a bound, an
+ * oversized args becomes execve's E2BIG *after* the fork, where the only
+ * signal available is a generic child-launch failure; a bound turns that into
+ * a precise load-time error naming the offending key instead.
+ */
+#define MANIFEST_MAX_ARGS 64u
+#define MANIFEST_MAX_ARGS_BYTES (8u * 1024u)
+
 static const char *const TOP_LEVEL_KEYS[] = {
     "manifestVersion", "providers", "allowEffects", NULL
 };
-static const char *const NATIVE_KEYS[] = {
+/*
+ * Selected by manifestVersion (docs/manifest.md): "args" and
+ * "executionProfile" exist only under version 2, so under version 1 they are
+ * simply absent from the allowed set and reject_unknown_keys names them as
+ * unknown, exactly like any other key that does not belong - not a special
+ * case, the ordinary one.
+ */
+static const char *const NATIVE_KEYS_V1[] = {
     "type", "path", "describeTimeoutMs", "callTimeoutMs", "shutdownTimeoutMs",
     "maxMessageBytes", NULL
 };
-static const char *const PROXY_KEYS[] = {
+static const char *const NATIVE_KEYS_V2[] = {
+    "type", "path", "describeTimeoutMs", "callTimeoutMs", "shutdownTimeoutMs",
+    "maxMessageBytes", "args", "executionProfile", NULL
+};
+static const char *const PROXY_KEYS_V1[] = {
     "type", "path", "argv", "toolPrefix", "defaultEffect", "schemaPolicy",
     "connectTimeoutMs", "callTimeoutMs", "maxMessageBytes", NULL
+};
+static const char *const PROXY_KEYS_V2[] = {
+    "type", "path", "argv", "toolPrefix", "defaultEffect", "schemaPolicy",
+    "connectTimeoutMs", "callTimeoutMs", "maxMessageBytes", "executionProfile", NULL
 };
 
 static int key_known(const char *key, const char *const *allowed) {
@@ -127,6 +152,7 @@ static maelys_mcp_result_t validate_effect_string(
 static maelys_mcp_result_t validate_provider(
     json_t *provider,
     const char *location,
+    int version,
     char **out_error) {
     if (!json_is_object(provider)) {
         manifest_errorf(out_error, "%s must be an object", location);
@@ -149,8 +175,11 @@ static maelys_mcp_result_t validate_provider(
             location, json_string_value(type));
         return MAELYS_MCP_ERR_ARGUMENT;
     }
+    const char *const *allowed_keys = is_native ?
+        (version == 2 ? NATIVE_KEYS_V2 : NATIVE_KEYS_V1) :
+        (version == 2 ? PROXY_KEYS_V2 : PROXY_KEYS_V1);
     maelys_mcp_result_t status = reject_unknown_keys(
-        provider, is_native ? NATIVE_KEYS : PROXY_KEYS, location, out_error);
+        provider, allowed_keys, location, out_error);
     if (status != MAELYS_MCP_OK) return status;
 
     json_t *path = json_object_get(provider, "path");
@@ -177,6 +206,45 @@ static maelys_mcp_result_t validate_provider(
             UINT_MAX, location, out_error)) != MAELYS_MCP_OK) return status;
         if ((status = validate_optional_uint(provider, "maxMessageBytes",
             MANIFEST_MAX_BYTES, location, out_error)) != MAELYS_MCP_OK) return status;
+        json_t *args = json_object_get(provider, "args");
+        if (args) {
+            if (!json_is_array(args)) {
+                manifest_errorf(out_error, "%s.args must be an array of strings", location);
+                return MAELYS_MCP_ERR_ARGUMENT;
+            }
+            size_t count = json_array_size(args);
+            if (count > MANIFEST_MAX_ARGS) {
+                manifest_errorf(out_error,
+                    "%s.args must have at most %u entries, found %zu",
+                    location, MANIFEST_MAX_ARGS, count);
+                return MAELYS_MCP_ERR_ARGUMENT;
+            }
+            size_t total_bytes = 0u;
+            for (size_t index = 0; index < count; ++index) {
+                json_t *entry = json_array_get(args, index);
+                if (!clean_string(entry)) {
+                    manifest_errorf(out_error, "%s.args[%zu] must be a string",
+                        location, index);
+                    return MAELYS_MCP_ERR_ARGUMENT;
+                }
+                /* +1 per entry for the separator (a NUL) real argv memory
+                 * needs between entries - "including separators" in the
+                 * design's bound. */
+                total_bytes += (size_t)json_string_length(entry) + 1u;
+            }
+            if (total_bytes > MANIFEST_MAX_ARGS_BYTES) {
+                manifest_errorf(out_error,
+                    "%s.args must be at most %u bytes total (including separators), found %zu",
+                    location, MANIFEST_MAX_ARGS_BYTES, total_bytes);
+                return MAELYS_MCP_ERR_ARGUMENT;
+            }
+        }
+        json_t *profile = json_object_get(provider, "executionProfile");
+        if (profile && (!clean_string(profile) || json_string_length(profile) == 0u)) {
+            manifest_errorf(out_error, "%s.executionProfile must be a non-empty string",
+                location);
+            return MAELYS_MCP_ERR_ARGUMENT;
+        }
         return MAELYS_MCP_OK;
     }
 
@@ -229,6 +297,11 @@ static maelys_mcp_result_t validate_provider(
             return MAELYS_MCP_ERR_ARGUMENT;
         }
     }
+    json_t *profile = json_object_get(provider, "executionProfile");
+    if (profile && (!clean_string(profile) || json_string_length(profile) == 0u)) {
+        manifest_errorf(out_error, "%s.executionProfile must be a non-empty string", location);
+        return MAELYS_MCP_ERR_ARGUMENT;
+    }
     return MAELYS_MCP_OK;
 }
 
@@ -240,15 +313,18 @@ static maelys_mcp_result_t validate_manifest(json_t *root, char **out_error) {
     maelys_mcp_result_t status = reject_unknown_keys(root, TOP_LEVEL_KEYS, "manifest", out_error);
     if (status != MAELYS_MCP_OK) return status;
 
-    json_t *version = json_object_get(root, "manifestVersion");
-    if (!version) {
+    json_t *version_json = json_object_get(root, "manifestVersion");
+    if (!version_json) {
         manifest_errorf(out_error, "manifest is missing required key \"manifestVersion\"");
         return MAELYS_MCP_ERR_ARGUMENT;
     }
-    if (!json_is_integer(version) || json_integer_value(version) != 1) {
-        manifest_errorf(out_error, "manifestVersion must be 1");
+    json_int_t version_value = json_is_integer(version_json) ?
+        json_integer_value(version_json) : -1;
+    if (version_value != 1 && version_value != 2) {
+        manifest_errorf(out_error, "manifestVersion must be 1 or 2");
         return MAELYS_MCP_ERR_ARGUMENT;
     }
+    int version = (int)version_value;
 
     json_t *providers = json_object_get(root, "providers");
     if (!providers) {
@@ -263,7 +339,7 @@ static maelys_mcp_result_t validate_manifest(json_t *root, char **out_error) {
     for (size_t index = 0; index < count; ++index) {
         char location[64];
         (void)snprintf(location, sizeof(location), "providers[%zu]", index);
-        status = validate_provider(json_array_get(providers, index), location, out_error);
+        status = validate_provider(json_array_get(providers, index), location, version, out_error);
         if (status != MAELYS_MCP_OK) return status;
     }
 
@@ -315,6 +391,25 @@ static maelys_mcp_result_t build_provider(json_t *provider, manifest_provider_t 
     if (target->type == MANIFEST_PROVIDER_NATIVE) {
         target->describe_timeout_ms = uint_field(provider, "describeTimeoutMs");
         target->shutdown_timeout_ms = uint_field(provider, "shutdownTimeoutMs");
+        json_t *args = json_object_get(provider, "args");
+        if (args) {
+            size_t count = json_array_size(args);
+            target->args = calloc(count + 1u, sizeof(*target->args));
+            if (!target->args) return MAELYS_MCP_ERR_MEMORY;
+            for (size_t index = 0; index < count; ++index) {
+                target->args[index] = maelys_mcp_strdup(
+                    json_string_value(json_array_get(args, index)));
+                if (!target->args[index]) return MAELYS_MCP_ERR_MEMORY;
+            }
+            target->args[count] = NULL;
+            target->args_count = count;
+        }
+        json_t *native_profile = json_object_get(provider, "executionProfile");
+        if (native_profile) {
+            target->execution_profile = maelys_mcp_strdup(
+                json_string_value(native_profile));
+            if (!target->execution_profile) return MAELYS_MCP_ERR_MEMORY;
+        }
         return MAELYS_MCP_OK;
     }
 
@@ -351,6 +446,11 @@ static maelys_mcp_result_t build_provider(json_t *provider, manifest_provider_t 
         target->schema_policy = strcmp(value, "skip") == 0 ?
             MAELYS_MCP_PROXY_SCHEMA_SKIP : strcmp(value, "passthrough") == 0 ?
             MAELYS_MCP_PROXY_SCHEMA_PASSTHROUGH : MAELYS_MCP_PROXY_SCHEMA_STRICT;
+    }
+    json_t *proxy_profile = json_object_get(provider, "executionProfile");
+    if (proxy_profile) {
+        target->execution_profile = maelys_mcp_strdup(json_string_value(proxy_profile));
+        if (!target->execution_profile) return MAELYS_MCP_ERR_MEMORY;
     }
     return MAELYS_MCP_OK;
 }
@@ -428,6 +528,11 @@ void manifest_clear(manifest_t *manifest) {
             free(provider->argv[arg]);
         }
         free(provider->argv);
+        for (size_t arg = 0; arg < provider->args_count; ++arg) {
+            free(provider->args[arg]);
+        }
+        free(provider->args);
+        free(provider->execution_profile);
     }
     free(manifest->providers);
     memset(manifest, 0, sizeof(*manifest));

@@ -962,28 +962,44 @@ static void process_destroy(void *context) {
  * docs/launch-contract-design.md explains why that matters more than the
  * duplication it removes - a second fork/exec site is a second bypass of any
  * confinement the launcher applies.
+ *
+ * `extra_args` is manifest v2's "args" (docs/manifest.md): a NULL-terminated
+ * vector of EXTRA arguments only, NULL for the v1 callers that carry none.
+ * `execution_profile` is manifest v2's "executionProfile", opaque pass-through
+ * to the launcher; NULL for those same callers.
  */
 static maelys_mcp_result_t spawn_process(
     const maelys_mcp_provider_process_options_t *options,
+    char *const *extra_args,
+    const char *execution_profile,
     const maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_process_context_t **out_process,
     char **out_error) {
     /*
      * The COMPLETE vector, argv[0] included: nothing below the seam ever
-     * receives "extra arguments". --provider is what puts a maelys-provider
+     * receives "extra arguments" - --provider is what puts a maelys-provider
      * binary into provider mode, and the runtime compiles it rather than
-     * letting configuration write argv[1] - which would turn a provider
-     * declaration into an arbitrary invocation of a trusted binary.
+     * letting configuration write argv[1], which would turn a provider
+     * declaration into an arbitrary invocation of a trusted binary. Manifest
+     * v2's "args" (docs/launch-contract-design.md, "Two layers of argv") is
+     * appended after it, never in front of it.
      */
-    char *const argv[] = {
-        (char *)options->executable_path, (char *)"--provider", NULL
-    };
+    size_t extra_count = 0u;
+    if (extra_args) {
+        while (extra_args[extra_count]) ++extra_count;
+    }
+    char **argv = calloc(extra_count + 3u, sizeof(*argv));
+    if (!argv) return MAELYS_MCP_ERR_MEMORY;
+    argv[0] = (char *)options->executable_path;
+    argv[1] = (char *)"--provider";
+    for (size_t index = 0; index < extra_count; ++index) {
+        argv[2u + index] = extra_args[index];
+    }
+    argv[2u + extra_count] = NULL;
     maelys_mcp_process_spec_t spec = {
         .executable_path = options->executable_path,
         .argv = argv,
-        /* Manifest v2's executionProfile is what will fill this in; until then
-         * every native provider takes the launcher's own default. */
-        .execution_profile = NULL,
+        .execution_profile = execution_profile,
         .max_message_bytes = options->max_message_bytes,
         /* The enclosing budget this launch has to complete inside - a provider
          * that is not up in time to answer describe is not up. Carried rather
@@ -1000,6 +1016,9 @@ static maelys_mcp_result_t spawn_process(
     maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
     maelys_mcp_result_t status = maelys_mcp_process_launch(launcher, &spec,
         &instance, out_error);
+    /* Every spec field is read before spawn returns (process_launcher.h); the
+     * vector this compiled has no life beyond that call. */
+    free(argv);
     if (status != MAELYS_MCP_OK) return status;
     int fd = instance.protocol_fd;
     maelys_mcp_process_context_t *process = calloc(1u, sizeof(*process));
@@ -1189,8 +1208,16 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
         maelys_mcp_posix_launcher(), out_provider, out_error);
 }
 
-maelys_mcp_result_t maelys_mcp_provider_spawn_with_launcher(
+/*
+ * The shared body behind every native spawn entry point. `extra_args` and
+ * `execution_profile` are manifest v2's "args" and "executionProfile"
+ * (docs/manifest.md); the pre-v2 entry points pass NULL for both, which
+ * reproduces their exact pre-v2 behaviour through spawn_process.
+ */
+static maelys_mcp_result_t provider_spawn_with_launcher_and_args(
     const maelys_mcp_provider_process_options_t *options,
+    char *const *extra_args,
+    const char *execution_profile,
     const maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_provider_t **out_provider,
     char **out_error) {
@@ -1219,7 +1246,7 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_launcher(
     *out_provider = NULL;
     maelys_mcp_process_context_t *process = NULL;
     maelys_mcp_result_t status = spawn_process(
-        &normalized, launcher, &process, out_error);
+        &normalized, extra_args, execution_profile, launcher, &process, out_error);
     if (status != MAELYS_MCP_OK) return status;
 
     json_t *description = NULL;
@@ -1352,4 +1379,28 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_launcher(
         pthread_mutex_unlock(&process->state_mutex);
     }
     return status;
+}
+
+maelys_mcp_result_t maelys_mcp_provider_spawn_with_launcher(
+    const maelys_mcp_provider_process_options_t *options,
+    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error) {
+    /* No manifest v2 data: byte-identical to what this entry point always
+     * did. */
+    return provider_spawn_with_launcher_and_args(
+        options, NULL, NULL, launcher, out_provider, out_error);
+}
+
+maelys_mcp_result_t maelys_mcp_provider_spawn_with_args(
+    const maelys_mcp_provider_process_options_t *options,
+    char *const *args,
+    const char *execution_profile,
+    maelys_mcp_provider_t **out_provider,
+    char **out_error) {
+    /* Always the POSIX launcher, like maelys_mcp_provider_spawn_with_options:
+     * this entry point exists to carry manifest v2 data, not to name a
+     * launcher. */
+    return provider_spawn_with_launcher_and_args(options, args,
+        execution_profile, maelys_mcp_posix_launcher(), out_provider, out_error);
 }

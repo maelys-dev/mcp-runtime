@@ -255,7 +255,7 @@ static int mcp_upstream(mcp_upstream_mode_t mode) {
 }
 
 int main(int argc, char **argv) {
-    (void)argc;
+    /* argc is unused by every mode except argv-echo, below. */
     char request[4096];
     if (strstr(argv[0], "legacy-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_LEGACY);
     if (strstr(argv[0], "erroring-mcp-upstream")) return mcp_upstream(MCP_UPSTREAM_ERRORING);
@@ -301,6 +301,51 @@ int main(int argc, char **argv) {
                     "\"name\":\"environment\",\"version\":\"1\",\"tools\":[]}}");
             } else if (strstr(request, "provider/shutdown")) {
                 puts("{\"protocol\":\"maelys-provider/3\",\"id\":2,\"result\":{}}");
+                return fflush(stdout) == 0 ? 0 : 3;
+            } else {
+                return 5;
+            }
+            if (fflush(stdout) != 0) return 3;
+        }
+        return 0;
+    }
+    if (strstr(argv[0], "argv-echo")) {
+        /*
+         * Manifest v2 end-to-end proof (docs/launch-contract-design.md, "Two
+         * layers of argv"): reports argv[1..argc-1] back to the caller,
+         * joined by commas, so a test can assert the exact vector a real
+         * execve produced - argv[0] is "--provider" plus whatever the
+         * runtime compiled from manifest "args" - rather than trusting that
+         * parsing alone means wiring.
+         */
+        char joined[8192];
+        size_t used = 0u;
+        for (int index = 1; index < argc; ++index) {
+            size_t piece_length = strlen(argv[index]);
+            if (used + piece_length + 2u > sizeof(joined)) return 7;
+            if (index > 1) joined[used++] = ',';
+            memcpy(joined + used, argv[index], piece_length);
+            used += piece_length;
+        }
+        joined[used] = '\0';
+        while (fgets(request, sizeof(request), stdin)) {
+            long id = provider_request_id(request);
+            if (strstr(request, "provider/describe")) {
+                /*
+                 * The joined vector travels in a tool's description, not the
+                 * provider name: descriptions are free text, so nothing here
+                 * has to survive whatever identifier rules a tool NAME is
+                 * held to.
+                 */
+                printf("{\"protocol\":\"maelys-provider/3\",\"id\":%ld,\"result\":{"
+                    "\"name\":\"argv-echo\",\"version\":\"1\",\"tools\":[{"
+                    "\"name\":\"argv.echo\",\"description\":\"%s\","
+                    "\"inputSchema\":{\"type\":\"object\"},\"effect\":\"read\"}]}}\n",
+                    id, joined);
+            } else if (strstr(request, "provider/activate")) {
+                printf("{\"protocol\":\"maelys-provider/3\",\"id\":%ld,\"result\":{}}\n", id);
+            } else if (strstr(request, "provider/shutdown")) {
+                printf("{\"protocol\":\"maelys-provider/3\",\"id\":%ld,\"result\":{}}\n", id);
                 return fflush(stdout) == 0 ? 0 : 3;
             } else {
                 return 5;
