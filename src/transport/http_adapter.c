@@ -91,7 +91,11 @@ static int base64_value(unsigned char c) {
     if (c == '+') return 62;
     if (c == '/') return 63;
     /* No URL-safe alphabet: '-' and '_' are not accepted, and neither is any
-     * whitespace, so there is no line wrapping either. */
+     * whitespace, so there is no line wrapping either.
+     *
+     * -1 rather than 0, and the distinction is not stylistic: 0 is 'A'. A
+     * rejection that returns an in-range index does not reject, it substitutes,
+     * and every unrecognised byte would decode as 'A'. */
     return -1;
 }
 
@@ -104,6 +108,23 @@ static int base64_value(unsigned char c) {
  * a client produce a header that survives comparison in more than one form.
  *
  * Returns 1 on success, with *out malloc'd and *out_length set.
+ *
+ * TWO OF THESE RULES SURVIVE MUTATION, and the reason is worth stating rather
+ * than leaving for the next reader to rediscover.
+ *
+ * Deleting the length check, or the padding-position check, changes nothing
+ * observable THROUGH THE ONLY CALLER THIS FILE HAS. decode_mcp_name always
+ * hands over a slice whose next byte is the sentinel's '?', and '?' is not in
+ * the alphabet - so a group that runs past the payload is refused by the
+ * alphabet test before it can write anything, and an '=' in the interior is
+ * refused the same way. Both checks are therefore redundant here and
+ * load-bearing for any second caller, which is why they stay: a decoder whose
+ * safety depends on its caller's framing is a decoder that breaks the first
+ * time it is reused.
+ *
+ * The alphabet test they lean on must return a value that is not a valid
+ * index. `-0` is `0`, which is 'A', so folding an unrecognised byte to zero
+ * would silently decode it - see base64_value.
  */
 static int base64_decode_strict(
     const char *in, size_t length, unsigned char **out, size_t *out_length) {

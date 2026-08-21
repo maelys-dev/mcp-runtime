@@ -436,6 +436,20 @@ static const char *const H_CALL_NAME_COLLISION_ENCODED[] =
 static const char *const H_CALL_NAME_ALPHABET[] =
     CALL_HEADERS("=?base64?" ALPHABET_B64 "?=");
 
+/*
+ * "YWFA" is Base64 for "aa@". This is the same payload with its 'A' - alphabet
+ * index 0 - replaced by '*', which is not in the alphabet at all.
+ *
+ * It exists because mutating base64_value's rejection from `return -1` to
+ * `return -0` SURVIVED: -0 is 0, which is a perfectly good alphabet index, so
+ * every unrecognised byte would silently decode as 'A'. Every other rejection
+ * case in this matrix would still be refused under that mutant - by the
+ * comparison rather than by the decoder - so only a payload whose non-alphabet
+ * byte decodes, under the mutant, to EXACTLY the body's name can tell the two
+ * apart. A correct decoder refuses this; the mutant accepts it.
+ */
+static const char *const H_CALL_NAME_ZERO_INDEX[] = CALL_HEADERS("=?base64?YWF*?=");
+
 /* Prefix without suffix: not a sentinel, so it is compared literally. */
 static const char *const H_CALL_NAME_PREFIX_ONLY[] = CALL_HEADERS("=?base64?c2VhcmNo");
 /* The URL-safe spelling of "fn5+", which is base64 for "~~~". */
@@ -649,6 +663,10 @@ static const matrix_case_t MATRIX[] = {
     {"one wrong byte out of that payload is still a mismatch",
      "alphabet payload against a different name", H_CALL_NAME_ALPHABET,
      REQ("tools/call", "\"name\":\"" ALPHABET_NAME "x\"," META), 400, -32020, 1, NULL},
+
+    {"a non-alphabet byte is REJECTED, not folded to alphabet index 0",
+     "payload whose bad byte would decode to the body's name", H_CALL_NAME_ZERO_INDEX,
+     REQ("tools/call", "\"name\":\"aa@\"," META), 400, -32020, 1, NULL},
 
     /* --- the happy path --- */
     {"a request that satisfies every rule reaches the placeholder",
