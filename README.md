@@ -172,11 +172,14 @@ completed the seven-hook middleware chain, replacing the former
 `authorize`/`audit` config callbacks (migration is one call — see the
 [CHANGELOG](CHANGELOG.md)). The `maelys-provider` wire protocol is negotiated
 (`/3` floor, `/4` progress, `/5` nested requests; every version in the range
-is accepted), so existing providers keep working across host upgrades. The
-bundled SDKs do not yet expose nesting; that is the next increment.
+is accepted), so existing providers keep working across host upgrades. All
+three bundled SDKs expose nested requests since 0.16, declaring `/5` only
+once a provider actually nests so a non-nesting provider stays byte-identical
+on the wire.
 
-Not implemented yet: SDK-side nested requests, streamable HTTP transport,
-prompts, Tasks, dynamic provider reload, full JSON Schema 2020-12, Windows.
+Not implemented yet: streamable HTTP transport (in progress — the server
+layer ships, MCP dispatch does not yet), prompts, Tasks, dynamic provider
+reload, full JSON Schema 2020-12, Windows.
 The pre-1.0 ABI policy is documented and versioned; same-major ABI stability
 begins with 1.0.
 
