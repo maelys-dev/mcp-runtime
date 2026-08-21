@@ -9,7 +9,7 @@ extern "C" {
  * MAJOR/MINOR/PATCH by hand — edit VERSION and regenerate.
  */
 #define MAELYS_MCP_VERSION_MAJOR 0u
-#define MAELYS_MCP_VERSION_MINOR 15u
+#define MAELYS_MCP_VERSION_MINOR 16u
 #define MAELYS_MCP_VERSION_PATCH 0u
 
 /*
