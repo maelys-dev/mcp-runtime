@@ -1748,6 +1748,79 @@ static int an_out_of_band_cancel_works_without_a_readable_descriptor(void) {
 }
 
 /*
+ * Shutdown is BOUNDED, and a stream that cannot finish inside the bound is cut
+ * rather than waited on.
+ *
+ * The design's phase 2 says a stream whose close misses its deadline is
+ * detached rather than waited for, which is what stops a shutdown from taking
+ * as long as the slowest provider. The disposition is the visible half of that:
+ * the exchange never produced its response, so the body it already wrote is
+ * truncated and must say so. Telling the client COMPLETE here would be the same
+ * lie as telling it COMPLETE after a cancellation.
+ *
+ * This case exists because scripts/mutate.py showed the bound was never
+ * exercised at all, and it is worth being exact about what it does and does not
+ * pin. It pins the CONTRACT: a shutdown the exchange cannot satisfy ends the
+ * body truncated. It does NOT kill the mutation that deletes the drain's
+ * deadline test, and the reason is that on this path the bound is enforced
+ * twice - maelys_mcp_channel_next is given the remaining time and its own
+ * timeout ends the loop first. The explicit test only becomes load-bearing for
+ * a stream still producing frames faster than the deadline, which nothing here
+ * produces. It stays as the bound it claims to be rather than as one that
+ * happens to be redundant on the paths that exist today.
+ */
+static maelys_mcp_result_t shutdown_on_the_first_event(
+    void *context, const char *json, size_t length) {
+    shutdown_writer_t *writer = context;
+    maelys_mcp_result_t status = record_event(&writer->recording, json, length);
+    if (writer->recording.event_count == 1) {
+        maelys_mcp_http_exchange_shutdown(*writer->exchange);
+    }
+    return status;
+}
+
+static int a_shutdown_that_misses_its_deadline_truncates(void) {
+    int hold[2] = {-1, -1};
+    ASSERT_TRUE(pipe(hold) == 0);
+    tool_state_t tools = {.entered_write = -1, .hold_read = hold[0]};
+    maelys_mcp_runtime_t *runtime = serving_runtime(&tools);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_http_adapter_config_t config = {
+        .runtime = runtime,
+        /* Short on purpose: the graceful drain is meant to MISS this, because
+         * the provider will not answer inside it. */
+        .close_timeout_ms = 100u,
+        .keepalive_interval_ms = 20u
+    };
+    maelys_mcp_http_adapter_t *adapter = NULL;
+    ASSERT_TRUE(maelys_mcp_http_adapter_create(&config, &adapter) == MAELYS_MCP_OK);
+    slice_headers_t headers = {.pairs = STREAMING_HEADERS};
+    maelys_mcp_http_request_t request = make_request(&headers, STREAMING_BODY);
+    maelys_mcp_http_exchange_t *exchange = NULL;
+    shutdown_writer_t state = {.recording = {0}, .exchange = &exchange};
+    maelys_mcp_http_response_writer_t writer = make_writer(&state.recording);
+    writer.context = &state;
+    writer.write_event = shutdown_on_the_first_event;
+    ASSERT_TRUE(maelys_mcp_http_adapter_handle(adapter, &request, &writer, &exchange) ==
+        MAELYS_MCP_OK);
+    ASSERT_TRUE(state.recording.begin_stream_calls == 1);
+    ASSERT_TRUE(state.recording.end_stream_calls == 1);
+    /* Cut, because the answer never came inside the bound. */
+    ASSERT_TRUE(state.recording.disposition == MAELYS_MCP_HTTP_STREAM_ABORTED);
+    /* And the response really is absent rather than merely late. */
+    for (int index = 0; index < state.recording.event_count; ++index) {
+        ASSERT_TRUE(!event_is_response_with_id(&state.recording, index, 1));
+    }
+    ssize_t written = write(hold[1], "x", 1u);
+    (void)written;
+    maelys_mcp_http_adapter_destroy(adapter);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    close(hold[0]);
+    close(hold[1]);
+    return 0;
+}
+
+/*
  * The keep-alive comment, which is the one thing an idle stream costs. It is
  * written only once a stream exists - there is nothing to keep alive before the
  * reply's mode is chosen, and a JSON reply has nowhere to put one - and it is
@@ -1839,6 +1912,8 @@ int main(void) {
             a_listen_stream_completes_on_shutdown},
         {"a listen stream is truncated without a terminal chunk on cancel",
             a_listen_stream_is_truncated_on_cancel},
+        {"a shutdown that misses its deadline truncates rather than waits",
+            a_shutdown_that_misses_its_deadline_truncates},
         {"an idle stream is kept alive and never before it exists",
             an_idle_stream_is_kept_alive}
     };
