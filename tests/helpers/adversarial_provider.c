@@ -280,6 +280,15 @@ int main(int argc, char **argv) {
     if (strstr(argv[0], "stubborn")) {
         return describe_and_shutdown("stubborn", 1);
     }
+    /*
+     * Nothing to say, and one thing to prove: that the exit status a launcher
+     * reports is the child's own. 7 rather than 0 or 1 because it has to be
+     * distinguishable from a success, from /usr/bin/false, and above all from
+     * the 126 and 127 the POSIX launcher's own child branch exits with when a
+     * descriptor or an execve fails - a fixture reporting one of those would
+     * be indistinguishable from the launcher failing to start it at all.
+     */
+    if (strstr(argv[0], "exit-seven")) return 7;
     if (strstr(argv[0], "slow-describe")) {
         if (!fgets(request, sizeof(request), stdin)) return 1;
         struct timespec delay = {.tv_sec = 1, .tv_nsec = 0};
