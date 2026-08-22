@@ -63,9 +63,10 @@ typedef struct manifest_provider {
 
     /*
      * Both types. manifestVersion 2 only ("executionProfile",
-     * docs/manifest.md): opaque pass-through to the launch seam
-     * (maelys_mcp_process_spec_t.execution_profile), never interpreted by the
-     * host. NULL when the manifest did not set it - distinct from the string
+     * docs/manifest.md): opaque pass-through to the launch seam, read back by
+     * a launcher through maelys_mcp_process_request_execution_profile and
+     * never interpreted by the host. NULL when the manifest did not set it -
+     * distinct from the string
      * "trusted-local", which is an explicit request the stock POSIX launcher
      * happens to satisfy.
      */

@@ -14,16 +14,18 @@
 > consumers, the boundary rule, the public API and the conformance suite are
 > in the tree (`src/process/`, `include/maelys/mcp/process_launcher.h`,
 > `tests/test_process_launcher.c`). Manifest v2 — `args` and
-> `executionProfile` — is not, so `execution_profile` is carried by the spec
-> and enforced by the POSIX launcher but has no manifest key feeding it yet.
+> `executionProfile` — is not, so `execution_profile` is carried across the
+> seam and enforced by the POSIX launcher but has no manifest key feeding it
+> yet. (Under ABI 5 it is carried by the request rather than by the spec
+> struct this section was written against; the fact is unchanged.)
 > `MAELYS_MCP_PROCESS_FD_ISOLATED` (native providers only; `mcp-proxy` stays
 > `STDIO` structurally, as designed) is now declared and implemented by the
 > POSIX launcher exactly as specified in "The child's descriptors" below, and
 > all three first-party SDKs adopt `MAELYS_PROVIDER_FD` when it is set. What
-> remains exactly as this document specified: selection is via the public
-> spec only this release, nothing in `host/` or the manifest chooses it, and
-> `STDIO` stays the native default through M4 - the transition plan's first
-> step, not a change to it.
+> remains exactly as this document specified: selection is by driving the
+> seam directly this release, nothing in `host/` or the manifest chooses it,
+> and `STDIO` stays the native default through M4 - the transition plan's
+> first step, not a change to it.
 >
 > **Two deviations from the phasing table below, both deliberate.**
 > M4.2's row says `MAELYS_MCP_ABI_VERSION` → 4; it stayed at 3, because
@@ -1334,14 +1336,13 @@ should be checked against, and it can only be checked by building one.
 
 ## ABI 5 — the launcher contract
 
-> **Status: addendum, written after M4 shipped and before any of ABI 5 is
-> implemented.** The header
-> (`include/maelys/mcp/process_launcher.h`) is frozen on
-> `feat/abi5-launcher-contract` and `MAELYS_MCP_ABI_VERSION` is `5u` there;
-> nothing else of ABI 5 exists. That branch does not build, and is not
-> supposed to: the ABI 4 header has been replaced without its implementation,
-> and the runtime's own `src/process/` still speaks ABI 4. See "Delivery
-> plan" for why the header is frozen ahead of the code rather than with it.
+> **Status: implemented (M2).** The header
+> (`include/maelys/mcp/process_launcher.h`) was frozen first, on
+> `feat/abi5-launcher-contract`, and is byte-identical to that freeze; the
+> implementation behind it is now in the tree and the branch builds. What
+> follows is therefore a record of decisions that have been carried out
+> rather than a plan, and "Where the implementation landed" at the end of the
+> section says which file each part of it is in.
 >
 > Everything above this section is the ABI 4 design as approved, unedited.
 > This section extends it; where the two disagree, this one is later and
@@ -1734,10 +1735,10 @@ the shape of the M-track is a consequence of what the E-track needs and when.
 |---|---|---|
 | **E1** | Executor | Its API goes opaque: `maelys_execution_spec_t` becomes an opaque `maelys_execution_request_t`, full exit status is kept (`exited`, `exit_code`, `term_signal`), and `maelys_execution_release()` is added. |
 | **E2** | Executor | The POSIX and bubblewrap backends migrate to that API. |
-| **M1** | **here** | **The contractual ABI 5 header, frozen on an unmerged branch.** No implementation. |
+| **M1** | **here** | **The contractual ABI 5 header, frozen on an unmerged branch.** No implementation. **Done.** |
 | **E3** | Executor | `libmaelys-mcp-executor-adapter` — the only component that knows both APIs — is compiled against M1's frozen header. |
 | **E4** | Executor | The Seatbelt backend. |
-| **M2** | here | The full ABI 5 implementation lands. |
+| **M2** | here | The full ABI 5 implementation lands. **Done**, with the header unchanged from M1. |
 | **E5** | Executor | The launcher conformance suite runs against the adapter (the criteria below). |
 | **E6** | Executor | Executor tags 0.2.0. |
 | **M3** | here | Integration in `mcp-runtime` 0.20: the public sandbox backends are written against ABI 5. |
@@ -1842,3 +1843,60 @@ entitled to know which lines were decided and which were inferred.
    list would make every new protocol variable a cross-platform refusal until
    every launcher shipped, which turns a mechanism for catching disagreement
    into a release coordination problem.
+
+### Where the implementation landed
+
+M2, with the header byte-identical to its M1 freeze. Recorded because the
+next person to read this section will want to know which file to open, and
+because two of the choices below are *not* stated in the header and are
+therefore only discoverable here.
+
+| Part of the contract | File |
+|---|---|
+| The opaque request's getters | `src/process/request.c` |
+| The request struct, the runtime's private slot, the launcher struct | `src/process/launcher.h` |
+| `launcher_create` / `retain` / `release` / `name`, the ABI check, the compiled environment, the bounded ladder | `src/process/launcher.c` |
+| The four POSIX ops and `maelys_mcp_posix_launcher_create` | `src/process/posix_launcher.c` |
+| Both provider kinds on the seam | `src/provider/process_provider.c`, `src/provider/mcp_proxy.c` |
+| Conformance | `tests/test_process_launcher.c` |
+
+Three implementation choices are worth stating, because none of them is
+forced by the header and each could reasonably have gone another way.
+
+**The request lives on `maelys_mcp_process_launch`'s stack.** The header's
+lifetime rule — every getter pointer is valid only for the duration of the
+`spawn` call — is therefore a property of the code rather than a warning in a
+comment: the request is built in that frame, passed to `spawn`, and gone when
+the frame returns, on the success path and the failure path alike. There is
+no request in this runtime that outlives its spawn, so there is nothing for a
+launcher to retain even in error. The alternative — a heap request the runtime
+frees "at the right moment" — would have made the rule true only as long as
+every future call site remembered it.
+
+**ABI 4's `instance_live` became the private `maelys_mcp_process_slot_t.live`.**
+The flag did not disappear; it moved out of the launcher's reach, which is
+what the defect table asked for. The slot also carries the provider's own
+launcher reference, so the two terminal operations — `maelys_mcp_process_shutdown`
+and `maelys_mcp_process_abandon` — each call `release` exactly once *and* drop
+that reference exactly once, and both are no-ops on a slot that is not live.
+That is what lets `mcp_proxy.c`'s failure path abandon an upstream and then
+let `proxy_destroy` run the full ladder over the same slot, as it always did.
+
+**The POSIX launcher reads the request through the public getters**, builds
+its own `execve`-shaped `argv` and `envp` from them, and applies the
+environment under the platform rule like any other launcher. It could have
+reached around them — it ships inside the library that defines the struct —
+and deliberately does not: a stock launcher that took the shortcut would leave
+the getters untested by anything that ships, and the Executor adapter would be
+the first code to find out whether they work. It refuses a non-`"local"`
+platform for the same reason it already refused an unknown `executionProfile`:
+it forks on the machine it is running on, so every other token names a target
+it cannot reach.
+
+One consequence of the environment moving into the request is worth naming:
+the platform-specific `PATH` `#ifdef` moved with it, from
+`src/process/posix_launcher.c` to `src/process/launcher.h`, and
+`MAELYS_MCP_PROVIDER_FD`'s descriptor number is now one definition
+(`MAELYS_MCP_PROCESS_ISOLATED_FD`) used by both halves — the runtime writes
+the variable, the launcher chooses the descriptor, and they agree by
+construction rather than by coincidence.
