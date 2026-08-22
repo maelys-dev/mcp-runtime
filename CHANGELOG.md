@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.20.0 - 2026-08-22
+
+- **Custom process launchers now plug in behind a stable, versioned contract
+  (ABI 5).** A launcher is an opaque, reference-counted object built from a
+  four-operation vtable whose first member declares the ABI it was compiled
+  against; `maelys_mcp_process_launcher_create` checks it for exact equality
+  and refuses a mismatch naming both numbers — an out-of-tree adapter built
+  against the wrong headers is rejected whole, never partially loaded. The
+  runtime retains the launcher for every provider spawned with it, so the
+  caller no longer has to outlive its providers. `maelys_mcp_posix_launcher_create`
+  exposes the built-in POSIX behaviour through the same door.
+- **A launcher reads the spawn request through getters, never a struct.**
+  `maelys_mcp_process_request_t` is opaque: program path, exact argv, fd
+  layout, execution profile and the environment are read through accessors
+  whose pointers are valid only during the spawn call. The environment a
+  launcher sees is closed and runtime-normalized, with an explicit platform
+  rule: launching on the local platform copies it exactly; launching
+  anywhere else copies protocol and locale variables only, takes PATH from
+  the target profile, and refuses anything unclassifiable by name — an
+  environment variable is never silently translated.
+- **A launcher reports how the process really ended.** `wait` fills
+  `maelys_mcp_process_exit_status_t` — a normal exit carries the exit code,
+  a killed process carries the terminating signal, exactly one of the two —
+  and both `wait` and `stop` can return a diagnostic string. The stop ladder
+  keeps going past a failed rung, keeping the best diagnostic. `release`
+  replaces `destroy`: local-only, no signal, no wait, exactly once.
+- **Nothing changes for existing callers.** `maelys_mcp_provider_spawn`,
+  `spawn_with_options`, `spawn_with_args` and `proxy_spawn` keep their
+  signatures and behaviour — each binds a POSIX launcher of its own. This is
+  an ABI break (4 → 5) for launcher implementations only: relink, and if you
+  implemented the old launcher vtable, port to the new contract, documented
+  in `docs/launch-contract-design.md`.
+
 ## 0.19.0 - 2026-08-22
 
 - **`maelys-mcp` now serves MCP over HTTP.** Start it with
