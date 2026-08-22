@@ -287,9 +287,14 @@ int maelys_mcp_process_request_environment_at(
  *             layout's descriptor number - is the only one today.
  *   LOCALE    LANG, LC_ALL, and any other LC_* variable.
  *
- * Adding a variable to either class is a change to both sides. The refusal
- * above is what makes such a disagreement surface on the first launch, as a
- * message naming the variable, instead of as behaviour.
+ * Both classes are defined by the SHAPE OF THE NAME rather than by an
+ * enumerated list, deliberately. A launcher can then classify a variable it
+ * has never heard of, so a protocol variable this runtime adds later reaches
+ * a cross-platform target without every launcher needing a release first -
+ * which is sound precisely because a protocol variable's value is computed by
+ * this runtime and means the same thing on any target. What is left over is
+ * a name of neither shape: the case on which nobody has agreed anything, and
+ * therefore the case that gets refused.
  */
 const char *maelys_mcp_process_request_environment_platform(
     const maelys_mcp_process_request_t *request);

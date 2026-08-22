@@ -1,5 +1,14 @@
 # Process launch contract — design
 
+> **The seam has been revised. See "ABI 5 — the launcher contract" at the end
+> of this document**, which is the current contract and supersedes the
+> structures described below wherever the two differ: the spec and instance
+> structs are gone, the launcher is opaque and refcounted, `wait` reports a
+> full exit status, and the child's environment travels through the seam
+> under an explicit platform rule. The semantics this document argues for —
+> the bounded ladder, the ownership table, handle opacity, the derived fd
+> layout — are unchanged, which is why everything below stands as written.
+
 > **Status: M4.1 to M4.4 are implemented, plus the `ISOLATED` descriptor
 > layout; M4.5 and M4.6 are not.** The seam, the POSIX launcher, both
 > consumers, the boundary rule, the public API and the conformance suite are
@@ -1322,3 +1331,514 @@ reasoning is worth keeping.
 No open questions remain. The falsifiable claim in "M4.6, elsewhere" — that a
 real Executor adapter needs no fifth operation — is the next thing this design
 should be checked against, and it can only be checked by building one.
+
+## ABI 5 — the launcher contract
+
+> **Status: addendum, written after M4 shipped and before any of ABI 5 is
+> implemented.** The header
+> (`include/maelys/mcp/process_launcher.h`) is frozen on
+> `feat/abi5-launcher-contract` and `MAELYS_MCP_ABI_VERSION` is `5u` there;
+> nothing else of ABI 5 exists. That branch does not build, and is not
+> supposed to: the ABI 4 header has been replaced without its implementation,
+> and the runtime's own `src/process/` still speaks ABI 4. See "Delivery
+> plan" for why the header is frozen ahead of the code rather than with it.
+>
+> Everything above this section is the ABI 4 design as approved, unedited.
+> This section extends it; where the two disagree, this one is later and
+> wins, and each disagreement is named rather than left to be inferred.
+
+### What was wrong with ABI 4
+
+The falsifiable claim in "M4.6, elsewhere" was that a real adapter would need
+no fifth operation. It does not. **Four ops survived contact with an
+implementation**, which is the part of the design that was right, and the
+argument for ABI 5 is not that the seam is the wrong shape but that five
+things around it are.
+
+| Defect | Where ABI 4 has it | What it costs |
+|---|---|---|
+| **Public spec struct churn** | `maelys_mcp_process_spec_t` is a released plain-data layout | Every new launch fact is an ABI break. The predictable consequence is not careful evolution, it is that facts stop being added and each launcher re-derives them privately — which is how the environment defect below came to exist. |
+| **Leaked `instance_live`** | `maelys_mcp_process_instance_t.instance_live`, "owned and maintained by the RUNTIME, not by the launcher, which must leave it alone" | Runtime bookkeeping in a structure the launcher is handed and can write. The exactly-once guarantee for `release` rests on a flag whose integrity is a comment. |
+| **Lost diagnostics** | `wait` reports `int *out_exited` and takes no `out_error`; `stop` takes none either | "The provider died" and "the provider was killed after ignoring a polite request" reach an operator as the same sentence. A launcher that knows exactly why it could not answer has nowhere to say it, so the ladder invents a message from a result code. |
+| **Borrowed-launcher lifetime** | "`launcher` must be non-NULL, and must outlive the provider" | A written obligation with no mechanism. An embedder that spawns three providers from one launcher and frees it gets a use-after-free at the first teardown, and every entry point taking a launcher is one more place to get it right by hand. |
+| **Per-launcher environment duplication** | The child environment is not in the seam at all; `src/process/posix_launcher.c` compiles its own closed allowlist, twice | The allowlist is a *runtime* decision — `docs/security-model.md` is what makes it a closed set — enforced independently by each launcher. Two launchers are two implementations of one rule, and the one that drifts is the one nobody tested. |
+
+Note what is *not* in that table. The ladder, the ownership rules, handle
+opacity, the derivation of the fd layout, the refusal of an unknown
+`executionProfile`, and the decision to carry no `struct_size` are all
+unchanged. ABI 5 is a revision of the *shapes*, not of the semantics.
+
+### The seam in ABI 5
+
+```c
+/* include/maelys/mcp/process_launcher.h — declarations only; the header
+ * carries the contract in its comments and is the authority. */
+
+typedef enum maelys_mcp_process_fd_layout { STDIO = 0, ISOLATED = 1 } ...;
+typedef enum maelys_mcp_process_stop { GRACEFUL = 0, FORCED = 1 } ...;
+
+typedef struct maelys_mcp_process_exit_status {
+    int exited;
+    int exit_code;
+    int term_signal;
+} maelys_mcp_process_exit_status_t;
+
+#define MAELYS_MCP_PROCESS_ENVIRONMENT_PLATFORM_LOCAL "local"
+
+typedef struct maelys_mcp_process_request maelys_mcp_process_request_t;
+
+const char *maelys_mcp_process_request_executable(const R *);
+size_t      maelys_mcp_process_request_arg_count(const R *);
+const char *maelys_mcp_process_request_arg_at(const R *, size_t index);
+const char *maelys_mcp_process_request_execution_profile(const R *);
+maelys_mcp_process_fd_layout_t
+            maelys_mcp_process_request_fd_layout(const R *);
+unsigned int maelys_mcp_process_request_spawn_timeout_ms(const R *);
+unsigned int maelys_mcp_process_request_grace_timeout_ms(const R *);
+unsigned int maelys_mcp_process_request_force_timeout_ms(const R *);
+size_t      maelys_mcp_process_request_environment_count(const R *);
+int         maelys_mcp_process_request_environment_at(
+                const R *, size_t index,
+                const char **out_name, const char **out_value);
+const char *maelys_mcp_process_request_environment_platform(const R *);
+
+typedef struct maelys_mcp_process_ops {
+    unsigned int abi_version;
+    maelys_mcp_result_t (*spawn)(void *context,
+        const maelys_mcp_process_request_t *request,
+        void **out_handle, int *out_protocol_fd, char **out_error);
+    maelys_mcp_result_t (*wait)(void *context, void *handle,
+        unsigned int timeout_ms,
+        maelys_mcp_process_exit_status_t *out_status, char **out_error);
+    maelys_mcp_result_t (*stop)(void *context, void *handle,
+        maelys_mcp_process_stop_t mode, char **out_error);
+    void (*release)(void *context, void *handle);
+} maelys_mcp_process_ops_t;
+
+typedef struct maelys_mcp_process_launcher maelys_mcp_process_launcher_t;
+
+maelys_mcp_result_t maelys_mcp_process_launcher_create(
+    const char *name, const maelys_mcp_process_ops_t *ops, void *context,
+    void (*release_context)(void *context),
+    maelys_mcp_process_launcher_t **out_launcher, char **out_error);
+void        maelys_mcp_process_launcher_retain(L *);
+void        maelys_mcp_process_launcher_release(L *);
+const char *maelys_mcp_process_launcher_name(const L *);
+
+maelys_mcp_result_t maelys_mcp_posix_launcher_create(L **, char **out_error);
+```
+
+### The opaque request, and the one rule that matters
+
+`maelys_mcp_process_request_t` is built by the runtime and consulted through
+getters. The point is not encapsulation for its own sake: it is that **adding
+a getter is a new entry point**, which `docs/abi-policy.md` already names as
+this project's idiom for compatible extension, whereas adding a field to
+`maelys_mcp_process_spec_t` was an ABI break. A launcher built against an
+older getter set keeps compiling, keeps linking and keeps working.
+
+The rule that has to be got right is lifetime, and it is stated once at the
+type rather than at each getter:
+
+> **Every pointer a getter returns is valid only for the duration of the
+> `spawn` call in which it was obtained.** The request is not refcounted,
+> cannot be retained, and may cease to exist the instant `spawn` returns — on
+> the success path and the failure path alike. A launcher that keeps anything
+> past that point copies it.
+
+This is the same rule ABI 4 stated for the spec ("every field is read before
+spawn returns; a launcher must copy anything it needs afterwards"), narrowed
+to a single sentence and moved to the place a reader looks first. A launcher
+that holds a container id, a policy handle or a log line built from the
+request's strings must own its own copies, because the runtime frees the
+request when the launch is done with it and no reference counting will save a
+launcher that assumed otherwise.
+
+One consequence is worth naming rather than discovering: **there is no
+`char *const *` argv to borrow any more.** A launcher that wants an
+`execve`-shaped vector builds one. That is a real cost paid by exactly one
+kind of launcher — the local fork-and-exec one — and it is work every other
+kind was already doing, since a vector destined for another host or another
+platform has to be re-encoded regardless.
+
+### The environment, and the platform rule
+
+The child's environment moves into the request: an ordered, duplicate-free
+list of name/value pairs, read through `environment_count` and
+`environment_at`. It is a **closed allowlist compiled by the runtime**, not a
+filtered inheritance and not extensible by a manifest — `docs/security-model.md`
+is unchanged and this is what keeps it true. Today the list is `PATH`, `LANG`,
+`LC_ALL`, and `MAELYS_PROVIDER_FD` under the `ISOLATED` layout, which is
+exactly what `src/process/posix_launcher.c` compiles for itself today.
+
+`environment_platform` says what the launcher must do with that list, and it
+is the one genuinely new rule in ABI 5:
+
+| Platform | The environment |
+|---|---|
+| `"local"` | **Copied exactly**, entry for entry, in order. Same platform, same meaning for every variable; there is nothing to decide. |
+| anything else | **Protocol and locale variables only.** `PATH` is *produced by the target profile*, never carried across. Any variable the launcher cannot place in one of those two classes is an **explicit refusal**: `MAELYS_MCP_ERR_ARGUMENT`, with `*out_error` naming the variable and the platform token. |
+
+The classes are frozen in the header so that both sides classify identically:
+**protocol** is variables whose value the runtime computes and whose meaning
+is this project's private provider protocol — spelled `MAELYS_*`, with
+`MAELYS_PROVIDER_FD` the only one today; **locale** is `LANG`, `LC_ALL` and
+any other `LC_*`. Both are defined **by the shape of the name, not by an
+enumerated list**, so that a launcher can classify a variable it has never
+heard of.
+
+Three clauses in that table are load-bearing and each is a decision.
+
+**`PATH` is produced, not translated.** A `PATH` is a claim about *this*
+machine's filesystem. Carrying `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin`
+into a Linux target is not a conversion with a small error, it is a sentence
+in the wrong language that happens to parse. The target profile is the only
+thing that knows where the target's binaries live, so the target profile is
+what produces it — and the entry the request carries is *ignored* rather than
+adapted, which is a stronger and much more checkable statement than "adapted
+carefully".
+
+**An unforeseen incompatibility is a refusal, never a silent translation.**
+This is the clause the whole rule exists for. A silent translation starts a
+child in an environment nobody wrote and nobody can reproduce, and the failure
+it causes surfaces arbitrarily far from the decision that produced it —
+usually as a provider that answers wrongly rather than one that fails to
+start. A refusal is one message, at the launch, naming the one variable that
+has no agreed meaning on the target. The runtime has no standing to guess what
+a variable means on a platform it is not running on, so it is not permitted
+to, and neither is the launcher.
+
+It is the same argument this document already made twice, once for
+`executionProfile` ("a runtime with no Executor installed that starts the
+provider anyway has answered a security request with an unsandboxed process
+and no diagnostic") and once against heuristic secret detection ("a heuristic
+that catches most secrets teaches operators that the ones it misses were
+checked"). Refusing loudly on the unclassifiable case is this project's
+existing answer to under-specification, applied to a third place.
+
+**The classes are name shapes, not lists.** A launcher classifies
+`MAELYS_SOMETHING_NEW` correctly without having heard of it, which is what
+lets this runtime add a protocol variable without a release of every launcher
+first — and it is sound only because a protocol variable's value is computed
+by this runtime and means the same thing on every target. The residue is a
+name of neither shape: the case on which the two sides have agreed nothing,
+which is exactly the case that must not be guessed at. An enumerated list
+would have made every addition a refusal until both sides shipped, and turned
+the mechanism that exists to catch genuine disagreement into a release
+coordination problem.
+
+### Choosing the platform representation
+
+The sketch offered two shapes — an enum of known platforms plus a string form,
+or a canonical string token. **It is a canonical string token**, never `NULL`,
+never empty, lowercase ASCII letters, digits, `-`, `.` and `_`, with exactly
+one value whose meaning is frozen in the ABI:
+`MAELYS_MCP_PROCESS_ENVIRONMENT_PLATFORM_LOCAL`, which is `"local"`. The
+runtime produces it, recognizes `"local"`, and interprets nothing else.
+
+The argument, in the order the objections arrive:
+
+1. **The set of targets is open and lives outside this repository.** The
+   backends that will consume this — POSIX, bubblewrap, Seatbelt, an OCI
+   target, Apple Container — are Executor's, and they arrive on Executor's
+   schedule. With an enum, every new target is an `mcp-runtime` ABI event: the
+   E-track becomes gated on an M-track release, for a value this library never
+   reads. That is precisely the coupling the seam exists to prevent, and it
+   would be a strange place to reintroduce it.
+2. **A pinned adapter can print a token; it cannot print an enumerator it does
+   not have.** The contract *requires* an explicit refusal on anything the
+   launcher does not understand, and a refusal that cannot name what it
+   refused is a much worse refusal. `launcher "x" does not implement
+   environment platform "linux-musl-aarch64"` is actionable;
+   `... platform 7` is a bug report.
+3. **It is the same shape as `execution_profile`, and for the same reason.**
+   This document already got that decision right: an opaque pass-through
+   string the runtime never parses, refused by the launcher when unknown. Two
+   adjacent facts with identical semantics should have identical types.
+   Making one an enum is an invitation for the runtime to start branching on
+   it, which is the failure mode `executionProfile` is written to prevent.
+4. **Exactly one value has meaning to the runtime, so exactly one is frozen.**
+   `"local"` is the only platform under which "copy the environment exactly"
+   is even expressible, because it is the only one where the runtime's own
+   platform is the target's. Everything else is a fact about a target the
+   runtime cannot see, and belongs to the launcher.
+5. **Extensibility with zero ABI churn** falls out: a new target is a new
+   string, agreed between the host that configures it and the launcher that
+   implements it, invisible to this library and to every launcher that does
+   not implement it — which refuses it, by rule 2.
+
+The costs, stated rather than skipped: a string comparison per spawn (once per
+provider, against a token whose length is single digits — irrelevant), and the
+loss of compile-time exhaustiveness in a `switch`, which an open set never had
+to give. The token's grammar is constrained to printable lowercase ASCII
+precisely so that the one thing a launcher *will* do with an unknown value —
+put it in a diagnostic — is always safe.
+
+Recommended token shapes, as guidance and explicitly **not** as a closed set:
+`local`, then `<os>-<libc>-<arch>` or `<os>-<arch>` for a cross-platform
+target. The runtime does not parse them and will not start.
+
+Where the token comes from is M2/M3 business, and only one thing about it is
+fixed here: like `executionProfile`, it is **host configuration, never
+protocol**, and its absence is `"local"`. A deployment that configures nothing
+gets today's behaviour, which is the same defaulting discipline that makes
+`STDIO` the zero value of the layout enum.
+
+### Full exit status
+
+```c
+typedef struct maelys_mcp_process_exit_status {
+    int exited;       /* 1 if termination was OBSERVED within the budget */
+    int exit_code;    /* the exit status, when it exited normally */
+    int term_signal;  /* the signal, when one ended it and the substrate
+                       * has signals */
+} maelys_mcp_process_exit_status_t;
+```
+
+`exited` keeps ABI 4's exact meaning, including its weakness: 0 is "the
+launcher looked, inside the budget, and did not see an end", not "still
+running" in any stronger sense. `exit_code` and `term_signal` are meaningless
+unless `exited` is 1, and **exactly one of them carries the outcome** — a
+launcher never reports both, and a substrate with no notion of signals leaves
+`term_signal` at 0 and says everything it has to say in `exit_code`.
+
+This is a plain public struct with no `struct_size`, which is the same
+decision the rest of the seam makes, for the same reason: this project wants a
+checkable ABI version and a refusal, not silent tolerance of mismatched
+builds. Should the status ever need a fourth field, it gets a new struct and a
+new op, and `MAELYS_MCP_ABI_VERSION` moves — exactly as it moved for this.
+
+### The vtable, and the check that is the point of it
+
+`abi_version` is the first member, set by the adapter to
+`MAELYS_MCP_ABI_VERSION` and **never to a literal**.
+`maelys_mcp_process_launcher_create` compares it against the value the library
+itself was built with, requires **exact equality**, and refuses anything else
+with `MAELYS_MCP_ERR_ARGUMENT` and an `*out_error` naming both numbers. No
+launcher is created, no context is taken over, no op is ever called.
+
+Not `>=`, and not "near enough", in either direction. **The ops table is the
+one structure in this header that crosses a build boundary.** Everything else
+is built and consumed on one side or the other; a vtable is compiled by a
+launcher that links this library and may have been compiled against a
+different release of this header entirely. A mismatch there is a call through
+a function pointer at a wrong offset with a wrong signature, which no later
+check catches and no sanitizer report explains. There is no version pair for
+which proceeding beats refusing at create time.
+
+It is the first member so that it stays readable at a fixed offset whatever
+the rest of the table comes to look like — the one field a future ABI must be
+able to read out of a table it does not otherwise understand.
+
+This is the mechanism `docs/abi-policy.md` prefers, applied at the only place
+in this library where a link error cannot do the job: the policy's stated
+answer to mismatched builds is "a checkable ABI version and a link error", and
+a function-pointer table populated at run time links perfectly and then
+crashes. The check restores the link error's guarantee at the only moment it
+can be restored.
+
+### The refcounted launcher
+
+`maelys_mcp_process_launcher_t` becomes opaque and refcounted, and the
+lifetime rule becomes a mechanism instead of a sentence:
+
+> **The runtime retains per provider.** Each provider spawned with a launcher
+> takes its own reference and releases it exactly once when it is destroyed.
+> The caller's reference is independent of all of them, so releasing it
+> immediately after spawning is correct, and no ordering between the caller's
+> release and any provider's teardown can be wrong.
+
+`create` copies `name` (so a literal or a temporary is fine) and **borrows**
+`ops`, which must outlive the launcher — that is what lets an ops table live
+in `.rodata` and be shared by every launcher an embedder creates.
+`release_context`, when non-NULL, runs exactly once when the last reference
+goes away, on whichever thread dropped it; the refcount is therefore
+thread-safe by requirement, not by accident, because the last reference is
+dropped by whichever provider teardown finished last.
+
+`maelys_mcp_process_launcher_name` exists because the launcher is opaque and
+the diagnostics are contractual: the ladder's containment failure names the
+launcher that could not terminate what it started, and ABI 4 read
+`launcher->name` to do it. With an opaque handle, an accessor is the only way
+to keep a promise the design already made.
+
+`maelys_mcp_posix_launcher()` becomes `maelys_mcp_posix_launcher_create()`,
+returning a new reference like any other launcher. The ABI 4 shape — a
+statically allocated, process-lifetime singleton — would have needed an
+exception to the refcount rules ("this one you don't release"), and a lifetime
+rule with one exception is a lifetime rule people get wrong. One rule that
+always holds is worth an allocation per host.
+
+### What carries over unchanged
+
+Stated explicitly, because "unchanged" is a claim a reader should be able to
+check rather than infer:
+
+- **The ladder**, and the fact that it is bounded at every rung:
+  `stop(GRACEFUL)` → `wait(grace_timeout_ms)` → `stop(FORCED)` →
+  `wait(force_timeout_ms)` → `release`. `release` is the ABI 4 `destroy`
+  renamed to say what it does; it is still local release only, still may not
+  wait or signal, still takes no timeout because it is not allowed to need
+  one, and is still called exactly once per `spawn` that returned OK.
+- **The ladder continues past a failed `stop`**, keeping the best diagnostic
+  it has seen rather than letting a later, blander failure overwrite an
+  earlier, sharper one. A `stop` that could not be delivered is exactly when
+  the next rung matters most.
+- **Containment failure surfaces from `wait`**: `MAELYS_MCP_OK` with
+  `.exited == 0` after a forced stop becomes `MAELYS_MCP_ERR_STATE` naming the
+  launcher, propagated rather than swallowed. The contract still chooses the
+  visible leak over the hung teardown, and still requires it to be reported.
+- **The ownership table**: `protocol_fd` is the runtime's from the moment
+  `spawn` returns OK; the handle is the launcher's; a failed `spawn` leaves
+  nothing and forbids `release`; `NULL` is a valid handle and never a liveness
+  marker.
+- **The fd obligations**: `>= 0`, blocking, close-on-exec in the runtime's
+  process, and an arrangement on which the runtime's writes cannot raise
+  SIGPIPE — `SO_NOSIGPIPE` where it exists, otherwise a socket the
+  `MSG_NOSIGNAL` write path can use, not a pipe.
+- **Error strings**: the caller passes `NULL` or a pointer to an initialized
+  `char *`; the callee writes only on non-OK; whatever is there afterwards is
+  the caller's to `free()` exactly once; `NULL` is always legal to pass.
+- **The fd layout is derived from the child's protocol type**, `STDIO` is the
+  zero value, and `ISOLATED` remains structurally unreachable for an
+  `mcp-proxy` upstream.
+- **No `struct_size`, anywhere, ever.**
+
+### What ABI 5 deliberately does not carry
+
+- **`max_message_bytes` has no getter.** ABI 4 carried it "so a launcher can
+  size a buffer or refuse an absurd value", with the runtime enforcing the
+  bound regardless of what the launcher did with it. The contract as decided
+  does not include it, and it is left out rather than added back, because the
+  omission is the reversible direction: the request is opaque, so
+  `maelys_mcp_process_request_max_message_bytes` can be added later as a new
+  entry point without an ABI event, whereas a getter shipped in a frozen
+  contract cannot be withdrawn from a consumer already compiled against it.
+  Every launcher that would use it is one that copies frames, and none exists
+  yet.
+- **No fifth op.** The claim in "M4.6, elsewhere" stands and is now tested by
+  a real adapter, which is the only way it could be tested.
+- **No `struct_size`, no compatibility shim, no ABI 4 wrappers.** ABI 4's
+  types are gone rather than deprecated. There are no external users; the
+  migration is a recompile, which is the same trade `docs/abi-policy.md`
+  records for ABI 3 and ABI 4.
+
+### Delivery plan
+
+Two tracks. **M** is `mcp-runtime`, in this repository. **E** is Maelys
+Executor — the sandboxing policy enforcement point — which is a separate
+library with **no dependency on `mcp-runtime`**, and appears here only because
+the shape of the M-track is a consequence of what the E-track needs and when.
+
+| Step | Track | What |
+|---|---|---|
+| **E1** | Executor | Its API goes opaque: `maelys_execution_spec_t` becomes an opaque `maelys_execution_request_t`, full exit status is kept (`exited`, `exit_code`, `term_signal`), and `maelys_execution_release()` is added. |
+| **E2** | Executor | The POSIX and bubblewrap backends migrate to that API. |
+| **M1** | **here** | **The contractual ABI 5 header, frozen on an unmerged branch.** No implementation. |
+| **E3** | Executor | `libmaelys-mcp-executor-adapter` — the only component that knows both APIs — is compiled against M1's frozen header. |
+| **E4** | Executor | The Seatbelt backend. |
+| **M2** | here | The full ABI 5 implementation lands. |
+| **E5** | Executor | The launcher conformance suite runs against the adapter (the criteria below). |
+| **E6** | Executor | Executor tags 0.2.0. |
+| **M3** | here | Integration in `mcp-runtime` 0.20: the public sandbox backends are written against ABI 5. |
+| **E7** | Executor | The OCI target, then Apple Container. |
+
+**This is why the header is frozen before its implementation.** E3 compiles
+against M1 while M2 does not exist, so the header is the entire agreement
+between the two libraries for the whole of E3–E4. A correction to it after E3
+is not an edit, it is a coordinated change to two repositories and a rebuild
+of everything pinned to the branch — which is why every rule above is stated
+in the header itself rather than only here, and why the M1 branch is expected
+to be red in CI. Red CI on `feat/abi5-launcher-contract` means exactly one
+thing: the ABI 4 header was replaced without its implementation, on purpose.
+It is not evidence about the contract.
+
+The convergence point is M3. Between M1 and M2 the two libraries agree on a
+header that only one of them can compile against; after M2 they agree on a
+header both implement; at M3 the runtime ships sandbox backends written
+against ABI 5, and the E-track's own targets (E7) extend it without either
+side moving again — which is the property the platform token and the opaque
+request were chosen for.
+
+### Adapter validation criteria
+
+What E5 has to demonstrate, against the adapter rather than against a fake.
+These are conformance criteria for the *consumer* of the seam; the thirteen
+M4.4 cases remain the conformance suite for the *runtime's* half, and both
+run.
+
+1. **Exact argv copy.** The complete vector reaches the substrate as given,
+   `argv[0]` included, in order, with nothing reordered, prepended,
+   interpreted or dropped.
+2. **Unique `executionProfile` resolution.** Each profile resolves to exactly
+   one policy, and an unknown profile is refused — loudly, naming the profile
+   and the launcher — rather than started unconfined.
+3. **Closed-env correctness.** The environment the child receives is exactly
+   what the platform rule prescribes: copied entry for entry under `"local"`;
+   protocol and locale only, `PATH` from the target profile, and an explicit
+   refusal on anything unclassifiable, otherwise. Verified by inspecting the
+   child's environment, not by inspecting the adapter's intent.
+4. **`STDIO` / `ISOLATED` mapping.** Both layouts are implemented exactly as
+   "The child's descriptors" specifies, including `MAELYS_PROVIDER_FD=3` and
+   the unconditional `FD_CLOEXEC` clear after `dup2` on the `oldfd == newfd`
+   path.
+5. **Unique `protocol_fd` transfer.** Exactly one descriptor crosses, the
+   launcher retains no second copy of it (which would defeat the runtime's
+   EOF-based death detection), and it satisfies the fd obligations: `>= 0`,
+   blocking, close-on-exec in the runtime's process, no SIGPIPE on the
+   runtime's writes.
+6. **Exit code and signal preservation.** A child that exits 3 reports
+   `exited = 1, exit_code = 3, term_signal = 0`; a child killed by SIGKILL
+   reports `exited = 1, exit_code = 0, term_signal = SIGKILL`. Through a
+   confinement layer, not only through a bare fork.
+7. **`wait` and `stop` error propagation.** A failure in either op produces a
+   result and an `*out_error` the runtime can print, and the ladder keeps the
+   sharpest diagnostic rather than the last one.
+8. **Bounded stop ladder.** Teardown of a child that ignores the graceful stop
+   completes in roughly `grace + force` milliseconds, and teardown of a child
+   that survives the forced stop still returns, reporting the containment
+   failure.
+9. **`release` exactly once.** Per successful spawn, never after a failed one,
+   never twice — including for a launcher whose handle is legitimately `NULL`,
+   and for one whose handle is not a dereferenceable pointer at all.
+10. **Zero Executor dependency in `libmaelys_mcp`.** The runtime links nothing
+    of Executor's, names nothing of it, and its boundary audit still forbids
+    process primitives outside `src/process/`. The adapter is the only
+    component that knows both APIs, and this is the criterion that fails the
+    day that stops being true.
+
+### Points the sketch left open, and what was chosen
+
+Recorded in the style of "Decisions taken on the first draft's open
+questions", because the header is frozen and someone pinning a build to it is
+entitled to know which lines were decided and which were inferred.
+
+1. **`max_message_bytes` is not carried.** Not in the decided getter list, and
+   omitted rather than restored; see "What ABI 5 deliberately does not carry"
+   for why omission is the reversible direction.
+2. **`maelys_mcp_process_launcher_name` was added.** Not in the decided list,
+   but the launcher is opaque and the containment diagnostic names the
+   launcher, so an accessor follows from two rules the design already has.
+3. **`maelys_mcp_posix_launcher()` became
+   `maelys_mcp_posix_launcher_create()`.** The stock launcher had to acquire
+   *some* shape under refcounting; a permanently retained singleton was
+   rejected because it is an exception to the one lifetime rule.
+4. **The two `*_with_launcher` provider entry points are kept**, with the
+   launcher parameter no longer `const` (the runtime retains it). They were
+   not mentioned in the decision, and deleting public API nobody asked to
+   delete would have been the larger liberty.
+5. **`environment_at` returns `int` (1 found / 0 out of range)**, matching
+   `maelys_mcp_http_header_lookup_fn`, rather than `maelys_mcp_result_t`. It
+   has one failure mode and no diagnostic to carry.
+6. **`retain` returns `void`**, matching `maelys_mcp_authenticator_t.retain`,
+   rather than returning the launcher for chaining.
+7. **The refusal on an unclassifiable variable is
+   `MAELYS_MCP_ERR_ARGUMENT`**, matching the POSIX launcher's existing refusal
+   of an unknown `executionProfile`. It is a fact about the request, decided
+   before anything is started.
+8. **Both environment classes are defined by name shape** — the `MAELYS_`
+   prefix, and `LANG`/`LC_*` — rather than by an enumerated list. The decided
+   contract named the classes but not how a launcher recognizes a member; a
+   list would make every new protocol variable a cross-platform refusal until
+   every launcher shipped, which turns a mechanism for catching disagreement
+   into a release coordination problem.
