@@ -220,6 +220,14 @@ typedef struct status_row {
 } status_row_t;
 
 static const status_row_t STATUS_ROWS[] = {
+    /*
+     * The one success row, and it is here for its REASON PHRASE rather than for
+     * a body it never carries. writer_status_only reads this table to name the
+     * status it is writing, and a 202 that was not in it went onto the wire as
+     * "HTTP/1.1 202 Error" - syntactically legal, since a reason phrase is
+     * advisory, and a lie to every human reading a capture.
+     */
+    {202, "Accepted", 0, NULL, NULL},
     {400, "Bad Request", 0, NULL, NULL},
     {401, "Unauthorized", -32600, "Authentication required.", "WWW-Authenticate: Bearer"},
     {403, "Forbidden", -32600, "Origin not allowed.", NULL},

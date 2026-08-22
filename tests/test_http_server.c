@@ -1341,6 +1341,13 @@ static int a_notification_is_202_and_keeps_the_connection(void) {
     ASSERT_TRUE(send_all(fd, note, sizeof(note) - 1u) == 0);
     ASSERT_TRUE(read_one_message(fd, response, sizeof(response), 3000) > 0);
     ASSERT_TRUE(status_of(response) == 202);
+    /*
+     * The reason phrase, not only the code. A status this suite reads back with
+     * strtol is a status whose phrase nothing checks, and the first 202 on the
+     * wire read "HTTP/1.1 202 Error" because the writer's table had no row to
+     * name it. Advisory to a parser; a lie to everyone reading a capture.
+     */
+    ASSERT_TRUE(strncmp(response, "HTTP/1.1 202 Accepted\r\n", 23u) == 0);
     ASSERT_TRUE(strstr(response, "Content-Length: 0") != NULL);
     ASSERT_TRUE(strstr(response, "Connection: keep-alive") != NULL);
     /* No MCP body of any kind: not a result, not an error. */
