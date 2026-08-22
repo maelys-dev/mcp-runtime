@@ -1570,9 +1570,31 @@ after it.
 
 ## Security model delta
 
-The section below is drafted for `docs/security-model.md` as it will read once
-this ships. Under **Defaults**, after the existing stdio-write bullet at
-`docs/security-model.md:52`:
+> **As built: every bullet below has landed**, across H1–H4, under **Defaults**
+> in `docs/security-model.md:79`–`:130`. The drafted text is kept as written
+> because it is the record of what the transport was *required* to guarantee
+> before it existed, and the shipped bullets can be read against it.
+>
+> **One paragraph of `docs/security-model.md` is now stale, and it is not this
+> document's to fix.** Its trust-boundary section still says "The runtime
+> serves MCP over stdio only … it does not dispatch, so no MCP request has yet
+> reached a provider over HTTP", and names "phases H2 and H3" as the remaining
+> work (`docs/security-model.md:185`). H2 (#69) and H3 (#70) shipped; the
+> listener dispatches. That paragraph was accurate when H1 landed and was
+> overtaken twice since. It is flagged rather than edited here because this
+> change is scoped to one file and a security statement deserves its own
+> reviewed commit — but it is a security document currently asserting something
+> false about network exposure, which is the most expensive kind of staleness
+> this tree can carry.
+>
+> Its *substance* still needs carrying over when it is rewritten: the effect
+> policy remains runtime-wide rather than per-principal, and no middleware in
+> this repository reads the channel-bound principal yet
+> (`docs/security-model.md:193`). "The listener serves MCP" is done; "the policy
+> decides on the principal" is not.
+
+The section below was drafted for `docs/security-model.md` as it would read
+once this shipped. Under **Defaults**, after the existing stdio-write bullet:
 
 > - The HTTP transport serves `2026-07-28` only. Legacy protocol support stays
 >   stdio-only, and a channel exists for exactly one request, so no legacy

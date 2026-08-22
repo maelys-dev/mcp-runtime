@@ -182,17 +182,26 @@ the protocol on a non-standard descriptor with its stdout wired to stderr; an
 specification. Confinement covers both kinds; descriptor isolation covers only the
 kind whose protocol this project defines.
 
-The runtime serves MCP over stdio only. It can now open an HTTP listener, and that
-listener authenticates a network principal — but it does not dispatch, so no MCP
-request has yet reached a provider over HTTP and the effect policy is still
-runtime-wide rather than per-principal. Both remaining controls are mandatory before
-a network transport can safely expose providers that run with host privileges: the
-listener must serve MCP (`docs/http-transport-design.md`, phases H2 and H3) and the
-policy must decide on the principal rather than on the process. The mechanism for
-the second exists — the middleware chain's per-channel context is where a
-transport-established principal binds, and ABI 4's `context_release` is what lets a
-per-request transport own one safely — and no middleware in this repository reads it
-yet.
+The runtime serves MCP over stdio and over HTTP. The listener authenticates a
+network principal, binds it to the channel that serves the request, and dispatches;
+the official conformance runner drives that endpoint directly
+(`docs/official-conformance.md`). Of the two controls this paragraph named as
+mandatory before a network transport can safely expose providers that run with host
+privileges, **one is done and one is not**.
+
+Done: the listener serves MCP, and every request is attributed to a principal the
+transport itself authenticated rather than to anything the payload asserted.
+
+Not done: **the effect policy is still runtime-wide rather than per-principal.**
+`--allow-effect` enables an effect for the process, not for a caller, so every
+authenticated principal that reaches a tool gets the same effect set. The mechanism
+for fixing that exists and is unused — the middleware chain's per-channel context is
+where a transport-established principal binds, and ABI 4's `context_release` is what
+lets a per-request transport own one safely — but no middleware in this repository
+reads it yet. Until one does, an HTTP deployment that enables `apply`, `commit` or
+`execute` grants those effects to **every** principal the authenticator admits, and
+a single shared bearer token is therefore a single shared privilege level. That is
+the control to build before exposing this listener to more than one caller.
 
 ## Required provider practices
 
