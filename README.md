@@ -182,15 +182,17 @@ only.** `--http-listen` dispatches: a channel per `POST` bound to that request's
 authenticated principal, `application/json` for a request that resolves to one
 response and `text/event-stream` for one that streams, `202` for a
 notification, and cancellation when the client disconnects. Legacy protocol
-support stays stdio-only, and one process serves both at once. What is not
-claimed yet is **Streamable HTTP**: the official conformance suite still runs
-through a test-only adapter rather than against this listener, and the claim
-waits until it does — see
-[protocol support](docs/protocol-support.md).
+support stays stdio-only, and one process serves both at once. The official
+conformance suite's modern pass now exercises this endpoint directly, with no
+adapter in the path — see [protocol support](docs/protocol-support.md) for
+exactly what that pass covers and does not, and
+[Official MCP conformance](docs/official-conformance.md) for the two passes'
+transports.
 
-Not implemented yet: Streamable HTTP conformance (the transport ships; the
-claim does not), prompts, Tasks, dynamic provider reload, full JSON Schema
-2020-12, Windows.
+Not implemented yet: full Streamable HTTP conformance (this milestone's pinned
+scenario subset runs directly against the real listener; the upstream
+requirement set is larger), prompts, Tasks, dynamic provider reload, full JSON
+Schema 2020-12, Windows.
 The pre-1.0 ABI policy is documented and versioned; same-major ABI stability
 begins with 1.0.
 

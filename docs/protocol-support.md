@@ -52,15 +52,22 @@ Process providers may originate resource updates and Tools/Resources list change
 through the private `maelys-provider` protocol. These events enter the same filtered,
 bounded subscription and Outbox path as native producers.
 
-Prompts, Tasks and authorization transports are not implemented. Streamable
-HTTP is not claimed; HTTP header routing is validated but not claimed either —
-see the paragraph below for exactly what the HTTP endpoint does and does not
-do. Resource *content blocks* returned by a tool remain distinct from the
-independently enabled MCP Resources capability.
+Prompts, Tasks and authorization transports are not implemented. HTTP header
+routing is validated and, as of H4, the official conformance runner exercises
+it directly — see the paragraph below for exactly what the HTTP endpoint does
+and does not do. Resource *content blocks* returned by a tool remain distinct
+from the independently enabled MCP Resources capability.
 
-**The HTTP endpoint now serves MCP — `2026-07-28` only — and "Streamable HTTP"
-is still not claimed.** Those two sentences are both true and the gap between
-them is the point of this paragraph.
+**The HTTP endpoint serves MCP — `2026-07-28` only.** The official MCP
+conformance runner now drives this endpoint directly, with no adapter in the
+path, for that era's requirement subset this repository runs
+(`MODERN_SCENARIOS` in `conformance/run_official_mcp.py`) — see
+[Official MCP conformance](official-conformance.md) for what that subset does
+and does not cover. That is a conformance result for the scenarios actually
+run, not a claim of complete Streamable HTTP conformance: `Mcp-Session-Id`
+session management and `Last-Event-ID` resumable streams are unimplemented
+(see below), and the upstream requirement set is larger than the subset this
+milestone exercises.
 
 What works. `--http-listen` starts an HTTP/1.1 server that parses requests
 strictly, validates `Host` and `Origin`, routes `/mcp`, authenticates the
@@ -80,19 +87,24 @@ a request naming an older version is refused with `-32022`. Legacy protocol
 support stays stdio-only. One process can serve both at once, on the same
 runtime.
 
-What is not proven. This is phase H3 of `docs/http-transport-design.md`. The
-official conformance suite still runs through the test-only HTTP-to-stdio
-adapter described below, not against this listener; until it passes against the
-real binary with no adapter in the path — phase H4, which also has to make the
-`server-sse-multiple-streams` and `dns-rebinding-protection` exclusions stale —
-"Streamable HTTP" is not claimed anywhere. Session management (`Mcp-Session-Id`)
-and resumable streams (`Last-Event-ID`) are ignored by design and are not
-planned for v1; TLS is out of scope and the listener is meant for loopback or a
-terminator in front of it.
+What H4 proved, and what is still outstanding. Phase H4 of
+`docs/http-transport-design.md` pointed the official conformance runner's
+modern pass directly at this listener — no `StdioBridge`, no adapter — which is
+also what made the `server-sse-multiple-streams` and `dns-rebinding-protection`
+exclusions stale for that pass: both scenarios now run, and pass, against the
+real listener's SSE framing and Host/Origin validation respectively (they
+remain excluded from the *legacy* pass only, which still runs over the bridge
+because the HTTP transport does not serve that era at all — see
+[Official MCP conformance](official-conformance.md)). `Mcp-Session-Id` session
+management and `Last-Event-ID` resumable streams are ignored by design and are
+not planned for v1; TLS is out of scope and the listener is meant for loopback
+or a terminator in front of it.
 
-The upstream conformance runner currently requires an HTTP server and its complete
-2026-07-28 requirement set covers capabilities beyond this milestone. Its current
-HTTP request/response adapter cannot model a long-lived subscription stream. The repository
-therefore runs a documented, pinned subset through a test-only HTTP-to-stdio adapter;
-see [Official MCP conformance](official-conformance.md). This validates the supported
-wire surface without claiming complete protocol conformance.
+The upstream conformance runner's complete 2026-07-28 requirement set covers
+capabilities beyond this milestone (prompts, logging, completion, and several
+`input-required-result-*` depth scenarios). The repository therefore runs a
+documented, pinned subset directly against the real HTTP listener for the
+modern era, and a second, separately pinned subset against a stdio-only
+bridge for the legacy era; see [Official MCP conformance](official-conformance.md).
+This validates the supported wire surface without claiming complete protocol
+conformance.

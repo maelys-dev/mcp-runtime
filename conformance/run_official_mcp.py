@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Run the official MCP suite against the local stdio facade, for both eras.
+"""Run the official MCP suite against mcp-runtime, for both eras - and, since
+H4, over two DIFFERENT transports, on purpose:
 
-The HTTP listener is a test adapter, not a supported runtime transport. It forwards
-one JSON-RPC object per POST to the stdio host and returns its single response.
-
-Two passes run, because the two eras have incompatible session models:
-
-- 2026-07-28 (modern): stateless, no `initialize` handshake, every request is
-  self-contained via per-request `_meta`. One runtime subprocess is shared across
-  every scenario in MODERN_SCENARIOS — there is no session state to leak between
-  scenario runs, so reuse is both safe and much cheaper.
-- 2025-11-25 (legacy): stateful, one `initialize`/`notifications/initialized`
-  handshake per session, exactly like a real legacy MCP client. Each scenario in
-  LEGACY_SCENARIOS therefore gets its OWN fresh runtime subprocess (and thus its
-  own channel) — reusing one process across scenarios makes the second scenario's
-  `initialize` fail with "-32600 Initialize already received", since mcp-runtime
-  correctly rejects re-initializing an already-initialized channel.
+- 2026-07-28 (modern) runs directly against the real HTTP listener
+  (`--http-listen`), the actual Streamable HTTP transport this binary ships.
+  No adapter sits in the path: the official runner's HTTP client talks
+  straight to `maelys-mcp`'s socket. One runtime subprocess is shared across
+  every scenario in MODERN_SCENARIOS - 2026-07-28 is stateless, no
+  `initialize` handshake, every request is self-contained via per-request
+  `_meta` - so there is no session state that could leak between scenario
+  runs, and reuse is both safe and much cheaper.
+- 2025-11-25 (legacy) still runs over `StdioBridge`, a test adapter that
+  forwards one JSON-RPC object per POST to a stdio-hosted runtime and returns
+  its response. This is not a leftover: legacy stays stdio-only BY DESIGN
+  (`maelys-mcp --help` - the HTTP listener serves 2026-07-28 ONLY), so a
+  bridge is the only way to point the official runner's HTTP-only client at
+  it at all. The two passes are therefore asymmetric on purpose, not by
+  omission: modern dropped the bridge because it finally has a real HTTP
+  transport to test; legacy keeps it because it has no HTTP transport to
+  test. Each scenario in LEGACY_SCENARIOS gets its OWN fresh runtime
+  subprocess (and thus its own channel) - reusing one process across
+  scenarios makes the second scenario's `initialize` fail with "-32600
+  Initialize already received", since mcp-runtime correctly rejects
+  re-initializing an already-initialized channel.
 
 The legacy pass's scenario list is NOT hardcoded: `legacy_scenarios()` below
 asks the official CLI itself (`list --server --requirements 2025-11-25`) for
@@ -34,20 +41,30 @@ than left to rot as a comment:
   appears in the upstream list at all (renamed or removed upstream) — a dead
   exclusion is otherwise invisible since removing it changes nothing.
 
-The "architectural mismatch" and "transport-specific" reasons in
-LEGACY_EXCLUDED (see the dict below) can't be checked live the same way —
-they're about *how* a supported method is used, not *whether* the method
-exists — so they stay as comments backed by the mcp-runtime source facts and
-the official scenario source (`src/scenarios/server/tools.ts` upstream) they
-were verified against.
+The "architectural mismatch" reason in LEGACY_EXCLUDED (see the dict below)
+can't be checked live the same way — it's about *how* a supported method is
+used, not *whether* the method exists — so it stays as a comment backed by
+the mcp-runtime source facts and the official scenario source
+(`src/scenarios/server/tools.ts` upstream) it was verified against.
 
-MODERN_SCENARIOS, by contrast, is still hardcoded and does NOT cover the full
-2026-07-28 requirement set (36 required, 14 run here) - the same
-dynamic-list-minus-exclusions treatment applies there too in principle, since
-the draft spec changes more often than a frozen one, but working out which of
-the missing `input-required-result-*` depth scenarios are genuinely
-achievable with the current mock provider is a separate, larger piece of work
-than what this pass covers today.
+`server-sse-multiple-streams` and `dns-rebinding-protection` used to be
+excluded from BOTH passes as "transport-specific, N/A to this test adapter":
+the bridge implemented neither SSE transport semantics nor Host/Origin header
+validation. That reasoning is now stale for the modern pass specifically,
+because the modern pass no longer has a bridge in the path at all - the real
+HTTP listener implements both (`docs/http-transport-design.md`'s "SSE
+framing" and "Inbound headers" sections), so both scenarios now run directly
+against it in MODERN_SCENARIOS. They remain excluded from LEGACY_EXCLUDED,
+unchanged, because the legacy pass still goes over the bridge, which still
+implements neither.
+
+MODERN_SCENARIOS is still hardcoded and does NOT cover the full 2026-07-28
+requirement set (69 required, 17 run here) - the same dynamic-list-minus-
+exclusions treatment applies there too in principle, since the draft spec
+changes more often than a frozen one, but working out which of the missing
+`input-required-result-*` depth scenarios are genuinely achievable with the
+current mock provider is a separate, larger piece of work than what this pass
+covers today.
 """
 
 from __future__ import annotations
@@ -55,10 +72,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import BinaryIO
@@ -73,11 +92,18 @@ MODERN_SCENARIOS = (
     "tools-call-mixed-content",
     "tools-call-error",
     "tools-call-with-progress",
+    # H4: runs directly against the real HTTP listener's chunked SSE framing -
+    # the bridge could not implement this (see LEGACY_EXCLUDED and the module
+    # docstring), which is why it stayed out of this tuple until now.
+    "server-sse-multiple-streams",
     "resources-list",
     "resources-read-text",
     "resources-read-binary",
     "resources-templates-read",
     "sep-2164-resource-not-found",
+    # H4: runs directly against the real HTTP listener's Host/Origin
+    # validation - same story as server-sse-multiple-streams above.
+    "dns-rebinding-protection",
     "input-required-result-basic-elicitation",
     "input-required-result-capability-check",
 )
@@ -139,17 +165,23 @@ LEGACY_EXCLUDED = {
     # methods this scenario pair specifically tests are not planned.
     "resources-subscribe": "mcp-runtime exposes subscriptions/listen, not the legacy resources/subscribe method",
     "resources-unsubscribe": "mcp-runtime exposes subscriptions/listen, not the legacy resources/unsubscribe method",
-    # Transport-specific, N/A to this test adapter: this bridge is a
+    # Transport-specific, N/A to THIS PASS'S test adapter: StdioBridge is a
     # single-response-per-POST test adapter (see module docstring), not an
     # implementation of the Streamable HTTP transport's SSE semantics, nor of
     # the Host/Origin header validation a real network-facing HTTP listener
-    # needs (this one only ever binds 127.0.0.1 for the duration of one
-    # scenario run - it is not a production transport, see the module
-    # docstring). Confirmed live: dns-rebinding-protection fails both its
-    # checks against this bridge for exactly that reason (ECONNREFUSED /
-    # missing Host-header rejection), not because of anything mcp-runtime did.
-    "server-sse-multiple-streams": "this bridge does not implement SSE transport semantics",
-    "dns-rebinding-protection": "this bridge does not implement Host/Origin header validation",
+    # needs (it only ever binds 127.0.0.1 for the duration of one scenario
+    # run - it is not a production transport, see the module docstring).
+    # Confirmed live: dns-rebinding-protection fails both its checks against
+    # this bridge for exactly that reason (ECONNREFUSED / missing Host-header
+    # rejection), not because of anything mcp-runtime did.
+    #
+    # This exclusion is legacy-only as of H4. Both scenarios now run in
+    # MODERN_SCENARIOS instead, directly against the real HTTP listener,
+    # which does implement SSE framing and Host/Origin validation - that
+    # listener serves 2026-07-28 ONLY (`maelys-mcp --help`), so the legacy
+    # pass has no such listener to point at and keeps using this bridge.
+    "server-sse-multiple-streams": "this bridge does not implement SSE transport semantics (legacy-only exclusion - see MODERN_SCENARIOS)",
+    "dns-rebinding-protection": "this bridge does not implement Host/Origin header validation (legacy-only exclusion - see MODERN_SCENARIOS)",
 }
 
 MAX_BODY_BYTES = 4 * 1024 * 1024
@@ -316,6 +348,9 @@ class StdioBridge:
 
 
 def handler_for(bridge: StdioBridge) -> type[BaseHTTPRequestHandler]:
+    # Legacy-pass-only as of H4 (see the module docstring): the modern pass
+    # no longer wraps a bridge in an HTTP handler at all - HttpDirect points
+    # the official runner straight at the real listener instead.
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -416,6 +451,100 @@ def _teardown(server: ThreadingHTTPServer, thread: threading.Thread, bridge: Std
     bridge.close()
 
 
+def _find_free_port() -> int:
+    """Picks a currently-unused loopback port for `--http-listen` to bind.
+
+    There is a TOCTOU race between closing this probe socket and the runtime
+    binary binding the same port a moment later. That is an accepted
+    trade-off, not an oversight: `maelys-mcp` has no "bind port 0, tell me
+    what you got" mode to remove the race outright (`--http-listen` takes a
+    literal `ADDRESS:PORT`, see `host/main.c`'s `parse_listen`), and a
+    collision on this single-process, single-run test harness fails loudly -
+    `HttpDirect._wait_ready` below turns "the runtime never came up" into a
+    clear `RuntimeError`/`TimeoutError` rather than a silent false pass.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+
+
+class HttpDirect:
+    """Runs the real `maelys-mcp` binary with its HTTP listener enabled and
+    nothing else in front of it - the H4 replacement for `StdioBridge` on the
+    modern pass. `maelys-mcp` serves stdio alongside HTTP unconditionally
+    (there is no flag to turn stdio off) and exits the moment its stdin
+    reaches EOF, so this class holds `stdin` open on a pipe it never writes
+    to, for the same reason `StdioBridge` holds a write lock across its own
+    process's lifetime: closing that pipe is the deliberate shutdown signal
+    (see `close()`), not an accident of `Popen`'s defaults.
+
+    `--http-allow-origin` is set to this run's own URL, confirmed live to be
+    exactly the Origin the official runner's HTTP client sends (see H4's red
+    evidence in the PR description) - `dns-rebinding-protection` fails with
+    403 without it, because a loopback bind still requires an explicit
+    allowlist entry for any Origin it actually receives (only a REQUEST WITH
+    NO Origin header is accepted on loopback by default -
+    `maelys_http_origin_allowed`, `host/http_parser.c`). This narrows nothing
+    the shipped binary defaults to: the allowlist is still empty unless a
+    caller of `maelys-mcp` opts in, exactly as it does in production.
+    """
+
+    def __init__(self, runtime: Path, provider: Path) -> None:
+        self.port = _find_free_port()
+        self.origin = f"http://127.0.0.1:{self.port}"
+        self.url = f"{self.origin}/mcp"
+        self._process = subprocess.Popen(
+            [
+                str(runtime), "--provider", str(provider),
+                "--http-listen", f"127.0.0.1:{self.port}",
+                "--http-path", "/mcp",
+                "--http-allow-origin", self.origin,
+            ],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self._wait_ready()
+
+    def _wait_ready(self, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                stderr = (self._process.stderr.read().decode(errors="replace")
+                    if self._process.stderr else "")
+                raise RuntimeError(
+                    "maelys-mcp exited before its HTTP listener came up "
+                    f"(status {self._process.returncode}): {stderr}"
+                )
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                if probe.connect_ex(("127.0.0.1", self.port)) == 0:
+                    return
+            finally:
+                probe.close()
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"maelys-mcp's HTTP listener never accepted a connection on port {self.port}"
+        )
+
+    def close(self) -> None:
+        process = getattr(self, "_process", None)
+        if process is None:
+            return
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
 def _run_scenario(
     package: str, url: str, scenario: str, spec_version: str, output_dir: Path
 ) -> bool:
@@ -432,17 +561,18 @@ def _run_scenario(
 
 
 def run_modern_pass(runtime: Path, provider: Path, package: str, output_root: Path) -> list[str]:
-    """One shared runtime subprocess for the whole pass: 2026-07-28 is stateless,
-    so there is no session state that could leak between scenario runs."""
-    bridge = StdioBridge([str(runtime), "--provider", str(provider)])
-    server, thread, url = _serve(bridge)
+    """One shared runtime subprocess for the whole pass, its real HTTP
+    listener driven directly with no adapter in the path: 2026-07-28 is
+    stateless, so there is no session state that could leak between scenario
+    runs."""
+    direct = HttpDirect(runtime, provider)
     failures: list[str] = []
     try:
         for scenario in MODERN_SCENARIOS:
-            if not _run_scenario(package, url, scenario, "2026-07-28", output_root):
+            if not _run_scenario(package, direct.url, scenario, "2026-07-28", output_root):
                 failures.append(f"2026-07-28/{scenario}")
     finally:
-        _teardown(server, thread, bridge)
+        direct.close()
     return failures
 
 
