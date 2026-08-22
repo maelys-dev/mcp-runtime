@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.19.0 - 2026-08-22
+
+- **`maelys-mcp` now serves MCP over HTTP.** Start it with
+  `--http-listen 127.0.0.1:PORT` and any modern (`2026-07-28`) MCP client
+  can `POST /mcp` — a single response comes back as `application/json`, a
+  call that streams progress or a `subscriptions/listen` comes back as
+  `text/event-stream`, and a notification is answered `202`. Modern era
+  only, structurally: each request gets its own channel created with the
+  modern era mask, so `initialize` is refused by the runtime itself and no
+  request can negotiate a legacy revision. Legacy support stays stdio-only.
+- **Every POST is authenticated, every POST gets its own principal.** A
+  kept-alive connection is a transport optimisation, never a session: the
+  credential is re-checked per request, the principal is bound to that
+  request's channel through the ABI 4 context destructor, and released
+  exactly once when the channel is really freed — including when a wedged
+  provider forced a detached teardown after the connection was already let
+  go. Two reference authenticators ship (`loopback-trust`, a static bearer
+  via `--http-bearer-token`) behind a public authenticator seam.
+- **Closing the connection is the cancellation.** A client that disconnects
+  mid-call gets the full chain: the in-flight provider call is cancelled, an
+  aborted SSE stream is closed without its terminal chunk (distinguishable
+  on the wire from a completed one), no further bytes are written, and the
+  connection slot is freed immediately even if the provider is stuck.
+- **The listener is hostile-input hardened, and refuses to be misused.** It
+  binds loopback by default and refuses to start on any other address
+  without a real authenticator — before the socket exists. `Origin` is
+  validated first on every request (empty allowlist by default — the
+  DNS-rebinding control), `Host` must be single and valid, request framing
+  is unambiguous by refusal (any `Transfer-Encoding`, TE+CL combinations,
+  duplicate or malformed `Content-Length`, header NUL/CR/LF, oversized
+  anything — all rejected, connection closed, no resynchronization).
+  Authentication happens before the body is read. Five new libFuzzer
+  targets fuzz the boundary, one with a grammar biased toward
+  request-smuggling ambiguity.
+- **The official conformance runner now drives the real HTTP endpoint —
+  no adapter.** The modern requirement set runs direct against the binary:
+  17/17 scenarios, including two that had been excluded for as long as the
+  suite existed (`server-sse-multiple-streams`, `dns-rebinding-protection`).
+  Legacy stays green over its stdio bridge: 18/18, 35 scenarios total, zero
+  regressions.
+- The HTTP transport and authenticated-principal designs ship in-tree,
+  reconciled with what was actually built — divergences recorded as
+  as-built notes with the argument for each, not silently folded in.
+
 ## 0.18.0 - 2026-08-21
 
 - **API break (ABI 3 → 4): the channel config now owns eras and context
