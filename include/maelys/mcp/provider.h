@@ -265,9 +265,9 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
  * extra arguments and reproduces maelys_mcp_provider_spawn_with_options
  * byte-identically.
  *
- * `execution_profile` is opaque pass-through to the launcher
- * (maelys_mcp_process_spec_t.execution_profile); NULL means "the launcher's
- * own default", matching maelys_mcp_provider_spawn_with_options.
+ * `execution_profile` is opaque pass-through to the launcher, which reads it
+ * back through maelys_mcp_process_request_execution_profile; NULL means "the
+ * launcher's own default", matching maelys_mcp_provider_spawn_with_options.
  *
  * This is a new entry point rather than new fields on the released
  * maelys_mcp_provider_process_options_t, per docs/abi-policy.md: adding

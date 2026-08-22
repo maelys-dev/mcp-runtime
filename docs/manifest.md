@@ -157,8 +157,9 @@ the failure stays legible.
 
 `executionProfile` is a non-empty string, validated for shape only - the
 host never interprets it, compares it to a list, or branches on it. It is
-carried through to `maelys_mcp_process_spec_t.execution_profile`
-(docs/launch-contract-design.md) and handed to whatever process launcher the
+carried through the launch seam, read back by a launcher through
+`maelys_mcp_process_request_execution_profile`
+(docs/launch-contract-design.md), and handed to whatever process launcher the
 embedder installed.
 
 **Absence and the literal string `"trusted-local"` are distinct.** `NULL`

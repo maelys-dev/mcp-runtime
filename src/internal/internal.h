@@ -446,14 +446,18 @@ typedef struct maelys_mcp_module_descriptor {
 
 typedef struct maelys_mcp_process_context {
     /*
-     * The child, seen only through the seam: a launcher and the opaque
-     * instance it handed back. No pid, deliberately - the runtime's sole
-     * liveness signal is EOF on fd, which is what lets a container or an
-     * executord handle stand in for a local process without a line changing
-     * here (docs/launch-contract-design.md, "Provider death through the seam").
+     * The child, seen only through the seam: the runtime's private record of
+     * one launch - a retained launcher and the opaque handle it gave back. No
+     * pid, deliberately - the runtime's sole liveness signal is EOF on fd,
+     * which is what lets a container or an executord handle stand in for a
+     * local process without a line changing here
+     * (docs/launch-contract-design.md, "Provider death through the seam").
+     *
+     * The launcher reference in it is this provider's OWN, released exactly
+     * once when the provider is destroyed, so the caller that named the
+     * launcher may drop its reference the moment the spawn returns.
      */
-    const maelys_mcp_process_launcher_t *launcher;
-    maelys_mcp_process_instance_t instance;
+    maelys_mcp_process_slot_t slot;
     int fd;
     size_t max_message_bytes;
     unsigned long long next_id;

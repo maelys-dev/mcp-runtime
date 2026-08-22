@@ -36,10 +36,11 @@ with `maelys_mcp_channel_next`, and destroy every channel before destroying its
 runtime. No ABI 1 compatibility wrappers are exported.
 
 The process launch seam (`maelys/mcp/process_launcher.h`,
-`maelys_mcp_provider_spawn_with_launcher` and its proxy twin) is the most recent
-addition made that way: new structures reached by new entry points, with every
-existing entry point preserved as a wrapper that binds the POSIX launcher, so no
-released layout changed and `MAELYS_MCP_ABI_VERSION` did not move. None of its
+`maelys_mcp_provider_spawn_with_launcher` and its proxy twin) was *introduced*
+that way: new structures reached by new entry points, with every existing entry
+point preserved as a wrapper that binds the POSIX launcher, so no released
+layout changed and `MAELYS_MCP_ABI_VERSION` did not move. Revising it later did
+move the constant — see ABI 5 below, which is the case where the idiom ran out. None of its
 structures carries a `struct_size` field, and none will: this policy's answer to
 extension is a new structure or a new versioned constructor, and a second mechanism
 would buy silent tolerance of mismatched builds in place of the link error this
@@ -75,6 +76,45 @@ and this removal. The structural changes an ABI bump would otherwise be saved
 for (typed identity, cancellation policy, transport options) are not in it and
 remain on the 1.0 runway. See `docs/authenticated-principal-design.md` for the
 ownership argument behind `context_release`.
+
+ABI 5 revises the process launch seam, and is the first change to it that could
+not use the new-structure-and-new-entry-point idiom: `maelys_mcp_process_spec_t`
+and `maelys_mcp_process_instance_t` are removed rather than extended, and
+`maelys_mcp_process_ops_t` changes shape, so the constant moves. The spec
+becomes the opaque `maelys_mcp_process_request_t` read through getters — which
+restores the idiom for everything after this, since a getter is a new entry
+point — the instance struct is replaced by `spawn` out-parameters, `wait`
+reports a full `maelys_mcp_process_exit_status_t`, the launcher becomes an
+opaque refcounted handle created by `maelys_mcp_process_launcher_create`, and
+the child environment travels through the seam under an explicit
+platform rule. `maelys_mcp_process_ops_t` leads with an `abi_version` field
+that `maelys_mcp_process_launcher_create` checks for exact equality against
+`MAELYS_MCP_ABI_VERSION`, refusing any mismatch — with both numbers in the
+message, because "ABI mismatch" says something is wrong where "built against 4,
+this library implements 5" says which binary to rebuild. An ops table is
+populated at run time by a separately compiled launcher, so it links cleanly and
+then calls through a function pointer at the wrong offset, and the check is what
+restores the link error this policy prefers at the one place a link error cannot
+occur. It is checked before the four function pointers are looked at, not after:
+if the version disagrees then every offset past the first member is a guess, and
+"are the pointers non-NULL" is a question asked of the wrong bytes.
+
+Still no `struct_size`, for the reason stated above.
+
+The migration is a recompile, and for the two public entry points that take a
+launcher it is also a lifetime *simplification*: `maelys_mcp_posix_launcher()`
+becomes `maelys_mcp_posix_launcher_create()`, which returns a reference like any
+other launcher, and ABI 4's written obligation that the launcher outlive the
+provider is replaced by the runtime retaining one reference per provider. A
+caller may therefore release its own reference the moment the spawn returns, and
+no ordering between that release and any provider's teardown can be wrong.
+`launcher` also loses its `const`, because retaining is a write.
+
+`docs/launch-contract-design.md`, "ABI 5 — the launcher contract", carries the
+full contract and the argument for each part of it; the header itself is the
+authority, and was frozen and consumed by an out-of-tree launcher before the
+implementation existed, which is why it did not move when the implementation
+landed.
 
 ABI 3 was introduced by version 0.14.0. It removes `authorize`, `audit` and
 `policy_context` from `maelys_mcp_runtime_config_t`: the middleware chain

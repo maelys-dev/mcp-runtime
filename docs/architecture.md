@@ -128,9 +128,9 @@ Every child process this runtime starts - a native `maelys-provider` binary and 
 `mcp-proxy` upstream alike - is started through one seam,
 `maelys/mcp/process_launcher.h`, implemented by whatever launcher the embedder binds.
 The four operations are start it, has it exited, signal it, release it. The stock
-`maelys_mcp_posix_launcher()` reproduces what both providers used to do for
-themselves: a socketpair, a fork, the peer end on the child's stdin and stdout, a
-closed-allowlist environment, `execve`.
+`maelys_mcp_posix_launcher_create()` reproduces what both providers used to do for
+themselves: a socketpair, a fork, the peer end on the child's stdin and stdout, the
+closed-allowlist environment the runtime compiled, `execve`.
 
 The seam exists for confinement rather than for tidiness. A sandboxing policy
 enforcement point that governed native providers but not proxied upstreams would
@@ -139,21 +139,46 @@ upstream. So `scripts/audit_boundaries.sh` forbids `fork`, `execve`, `posix_spaw
 `waitpid` and `socketpair` anywhere outside `src/process/`: a second launch site
 cannot merge. The design and its reasoning are `docs/launch-contract-design.md`.
 
-Three consequences are load-bearing above the seam:
+Five consequences are load-bearing above the seam:
 
 - **The runtime holds no pid.** It holds an opaque handle it never dereferences, and
   its only liveness signal is EOF on the protocol descriptor. That is what lets a
   container id or a remote executord ticket stand in for a local process with no
   change here. `NULL` is a valid handle, so exactly-once teardown is tracked by an
-  explicit `instance_live` flag rather than by handle nullity.
+  explicit flag in the runtime's own private per-launch record rather than by
+  handle nullity - and that record is private precisely so no launcher can write
+  the flag the guarantee rests on.
 - **Teardown is bounded at every rung**, including the last: `stop(GRACEFUL)` ->
-  `wait(grace)` -> `stop(FORCED)` -> `wait(force)` -> `destroy`, where destroy is
+  `wait(grace)` -> `stop(FORCED)` -> `wait(force)` -> `release`, where release is
   local release only and cannot wait for anything. A child that outlives a forced
   stop is reported as a containment failure and left behind; the alternative is an
-  unkillable host with no message.
+  unkillable host with no message. A rung that fails does not end the ladder, and
+  the sharpest diagnostic seen is what gets reported rather than the last one.
+- **What to launch is opaque and read through getters.** A launcher is handed a
+  `maelys_mcp_process_request_t` and consults it through nothing else, so a new
+  launch fact is a new entry point rather than an ABI break. Every pointer a getter
+  returns is valid only for the duration of that `spawn` call; the runtime builds
+  the request on the stack of the call that makes it, so this is enforced by scope.
+- **The child's environment is the runtime's decision, not each launcher's.** A
+  closed allowlist - `PATH`, `LANG`, `LC_ALL`, plus `MAELYS_PROVIDER_FD` under the
+  `ISOLATED` layout - is compiled once, in the runtime, and travels through the
+  seam with a platform token saying what a launcher must do with it. `"local"`
+  means copy it exactly; any other token means protocol and locale variables only,
+  `PATH` produced by the target profile, and an explicit refusal on anything a
+  launcher cannot classify. The stock POSIX launcher implements `"local"` and
+  refuses every other token by name.
 - **The protocol goodbye stays above the seam** and is not unified: a native provider
   gets a `provider/shutdown` exchange, an MCP upstream gets a half-close, because
   those are protocol facts rather than launch facts.
+
+The launcher itself is opaque and refcounted, and **the runtime retains one
+reference per provider**, released when that provider is destroyed. An embedder
+that spawns several providers from one launcher may therefore release its own
+reference immediately; no ordering between that release and any teardown can be
+wrong. `wait` reports a full exit status - whether the end was observed, and
+either the exit code or the terminating signal - so "the provider died" and "the
+provider was killed after ignoring a polite request" are no longer the same
+sentence in a shutdown report.
 
 ## Protocol eras
 
