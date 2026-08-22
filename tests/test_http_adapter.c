@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_EVENTS 16
@@ -1748,6 +1749,98 @@ static int an_out_of_band_cancel_works_without_a_readable_descriptor(void) {
 }
 
 /*
+ * Nothing is kept alive before there is a stream to keep alive.
+ *
+ * A keep-alive is an SSE comment. Writing one while the reply's mode is still
+ * undecided would either commit the reply to being a stream by accident, or -
+ * on the real socket writer, which refuses a comment before begin_stream -
+ * fail the exchange outright. Both are worse than the idle wait it saves.
+ *
+ * scripts/mutate.py found this: turning `MODE_STREAM && write_keepalive` into
+ * `MODE_STREAM || write_keepalive` survived, because every idle poll in the
+ * suite happened after a stream had already begun. The shape that shows it is a
+ * request whose first frame is slow AND whose reply turns out to be JSON, which
+ * needs a provider that answers nothing for a while.
+ */
+typedef struct armed_cancel {
+    int write_fd;
+    unsigned int after_ms;
+} armed_cancel_t;
+
+static void *arm_cancel_after(void *argument) {
+    const armed_cancel_t *armed = argument;
+    struct timespec pause = {
+        .tv_sec = armed->after_ms / 1000u,
+        .tv_nsec = (long)(armed->after_ms % 1000u) * 1000L * 1000L
+    };
+    (void)nanosleep(&pause, NULL);
+    ssize_t written = write(armed->write_fd, "x", 1u);
+    (void)written;
+    return NULL;
+}
+
+static int no_keepalive_is_written_before_the_mode_is_chosen(void) {
+    int hold[2] = {-1, -1};
+    int cancel[2] = {-1, -1};
+    ASSERT_TRUE(pipe(hold) == 0);
+    ASSERT_TRUE(pipe(cancel) == 0);
+    /* Wedged, and asked for no progress - so it emits nothing at all and the
+     * drain sits idle with the reply's mode still open. */
+    tool_state_t tools = {.entered_write = -1, .hold_read = hold[0]};
+    maelys_mcp_runtime_t *runtime = serving_runtime(&tools);
+    ASSERT_TRUE(runtime != NULL);
+    maelys_mcp_http_adapter_config_t config = {
+        .runtime = runtime,
+        .close_timeout_ms = 100u,
+        /* Small enough that many idle polls happen inside the window below. */
+        .keepalive_interval_ms = 2u
+    };
+    maelys_mcp_http_adapter_t *adapter = NULL;
+    ASSERT_TRUE(maelys_mcp_http_adapter_create(&config, &adapter) == MAELYS_MCP_OK);
+
+    armed_cancel_t armed = {.write_fd = cancel[1], .after_ms = 120u};
+    pthread_t arming;
+    ASSERT_TRUE(pthread_create(&arming, NULL, arm_cancel_after, &armed) == 0);
+
+    /* No progressToken, so this resolves to a single buffered response - had it
+     * ever arrived. */
+    static const char *const call_headers[] = {
+        "MCP-Protocol-Version", "2026-07-28",
+        "Mcp-Method", "tools/call",
+        "Mcp-Name", "fx.stream",
+        NULL
+    };
+    static const char call_body[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"fx.stream\",\"arguments\":{}," MODERN_META "}}";
+    slice_headers_t headers = {.pairs = call_headers};
+    maelys_mcp_http_request_t request = make_request(&headers, call_body);
+    request.cancel_fd = cancel[0];
+    recording_writer_t state = {0};
+    maelys_mcp_http_response_writer_t writer = make_writer(&state);
+    ASSERT_TRUE(maelys_mcp_http_adapter_handle(adapter, &request, &writer, NULL) ==
+        MAELYS_MCP_ERR_CLOSED);
+    pthread_join(arming, NULL);
+
+    /* Many idle polls happened - the exchange sat there for 120 ms with a 2 ms
+     * interval - and not one of them wrote anything. */
+    ASSERT_TRUE(state.keepalive_calls == 0);
+    ASSERT_TRUE(state.begin_stream_calls == 0);
+    ASSERT_TRUE(state.begin_json_calls == 0);
+    ASSERT_TRUE(state.event_calls == 0);
+
+    ssize_t written = write(hold[1], "x", 1u);
+    (void)written;
+    maelys_mcp_http_adapter_destroy(adapter);
+    ASSERT_TRUE(maelys_mcp_runtime_destroy(runtime) == MAELYS_MCP_OK);
+    close(hold[0]);
+    close(hold[1]);
+    close(cancel[0]);
+    close(cancel[1]);
+    return 0;
+}
+
+/*
  * Shutdown is BOUNDED, and a stream that cannot finish inside the bound is cut
  * rather than waited on.
  *
@@ -1912,6 +2005,8 @@ int main(void) {
             a_listen_stream_completes_on_shutdown},
         {"a listen stream is truncated without a terminal chunk on cancel",
             a_listen_stream_is_truncated_on_cancel},
+        {"no keep-alive is written before the reply's mode is chosen",
+            no_keepalive_is_written_before_the_mode_is_chosen},
         {"a shutdown that misses its deadline truncates rather than waits",
             a_shutdown_that_misses_its_deadline_truncates},
         {"an idle stream is kept alive and never before it exists",
