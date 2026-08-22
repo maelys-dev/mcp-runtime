@@ -929,7 +929,7 @@ static void process_destroy(void *context) {
      * still returns: bounded at every rung, including the last.
      */
     char *containment_error = NULL;
-    (void)maelys_mcp_process_shutdown(process->launcher, &process->instance,
+    (void)maelys_mcp_process_shutdown(&process->slot,
         process->shutdown_timeout_ms, process->shutdown_timeout_ms,
         &containment_error);
     free(containment_error);
@@ -972,7 +972,7 @@ static maelys_mcp_result_t spawn_process(
     const maelys_mcp_provider_process_options_t *options,
     char *const *extra_args,
     const char *execution_profile,
-    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_process_context_t **out_process,
     char **out_error) {
     /*
@@ -996,11 +996,10 @@ static maelys_mcp_result_t spawn_process(
         argv[2u + index] = extra_args[index];
     }
     argv[2u + extra_count] = NULL;
-    maelys_mcp_process_spec_t spec = {
+    maelys_mcp_process_launch_params_t params = {
         .executable_path = options->executable_path,
         .argv = argv,
         .execution_profile = execution_profile,
-        .max_message_bytes = options->max_message_bytes,
         /* The enclosing budget this launch has to complete inside - a provider
          * that is not up in time to answer describe is not up. Carried rather
          * than enforced: this runtime has no thread to time a spawn out with,
@@ -1017,25 +1016,27 @@ static maelys_mcp_result_t spawn_process(
          * native default through M4, until both first-party SDKs have shipped
          * MAELYS_PROVIDER_FD support and a deprecation window has passed
          * (docs/launch-contract-design.md, "The layout is a function of the
-         * child's protocol type"). Selection this release is via the public
-         * spec only - an embedder driving the launcher directly, as the
-         * conformance suite does, may opt in today.
+         * child's protocol type"). An embedder driving the launcher's ops
+         * directly, as the conformance suite does, may opt in today.
          */
         .fd_layout = MAELYS_MCP_PROCESS_FD_STDIO
     };
-    maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
-    maelys_mcp_result_t status = maelys_mcp_process_launch(launcher, &spec,
-        &instance, out_error);
-    /* Every spec field is read before spawn returns (process_launcher.h); the
-     * vector this compiled has no life beyond that call. */
+    maelys_mcp_process_slot_t slot = {
+        .launcher = NULL, .handle = NULL, .protocol_fd = -1, .live = 0
+    };
+    maelys_mcp_result_t status = maelys_mcp_process_launch(launcher, &params,
+        &slot, out_error);
+    /* The request compiled from these params is gone the moment launch
+     * returns, and every pointer it lent the launcher with it
+     * (process_launcher.h); the vector this compiled has no life beyond that
+     * call either. */
     free(argv);
     if (status != MAELYS_MCP_OK) return status;
-    int fd = instance.protocol_fd;
+    int fd = slot.protocol_fd;
     maelys_mcp_process_context_t *process = calloc(1u, sizeof(*process));
     if (!process) {
         close(fd);
-        maelys_mcp_process_abandon(launcher, &instance,
-            options->shutdown_timeout_ms);
+        maelys_mcp_process_abandon(&slot, options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_MEMORY;
     }
     process->reader = calloc(1u, sizeof(*process->reader));
@@ -1044,8 +1045,7 @@ static maelys_mcp_result_t spawn_process(
         free(process->reader);
         free(process);
         close(fd);
-        maelys_mcp_process_abandon(launcher, &instance,
-            options->shutdown_timeout_ms);
+        maelys_mcp_process_abandon(&slot, options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_MEMORY;
     }
     if (pthread_mutex_init(&process->exchange_mutex, NULL) != 0) {
@@ -1053,8 +1053,7 @@ static maelys_mcp_result_t spawn_process(
         free(process->reader);
         free(process);
         close(fd);
-        maelys_mcp_process_abandon(launcher, &instance,
-            options->shutdown_timeout_ms);
+        maelys_mcp_process_abandon(&slot, options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->exchange_mutex_initialized = 1;
@@ -1064,8 +1063,7 @@ static maelys_mcp_result_t spawn_process(
         free(process->reader);
         free(process);
         close(fd);
-        maelys_mcp_process_abandon(launcher, &instance,
-            options->shutdown_timeout_ms);
+        maelys_mcp_process_abandon(&slot, options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->state_mutex_initialized = 1;
@@ -1076,13 +1074,11 @@ static maelys_mcp_result_t spawn_process(
         free(process->reader);
         free(process);
         close(fd);
-        maelys_mcp_process_abandon(launcher, &instance,
-            options->shutdown_timeout_ms);
+        maelys_mcp_process_abandon(&slot, options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->response_ready_initialized = 1;
-    process->launcher = launcher;
-    process->instance = instance;
+    process->slot = slot;
     process->fd = fd;
     process->max_message_bytes = options->max_message_bytes;
     /* Open at the floor: until this provider tells us otherwise, assume it
@@ -1102,8 +1098,7 @@ static maelys_mcp_result_t spawn_process(
         free(process->reader);
         free(process);
         close(fd);
-        maelys_mcp_process_abandon(launcher, &instance,
-            options->shutdown_timeout_ms);
+        maelys_mcp_process_abandon(&slot, options->shutdown_timeout_ms);
         return MAELYS_MCP_ERR_IO;
     }
     process->reader_started = 1;
@@ -1212,10 +1207,19 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_options(
     const maelys_mcp_provider_process_options_t *options,
     maelys_mcp_provider_t **out_provider,
     char **out_error) {
-    /* The API that predates the seam, unchanged: it binds the launcher that
-     * reproduces what it always did. */
-    return maelys_mcp_provider_spawn_with_launcher(options,
-        maelys_mcp_posix_launcher(), out_provider, out_error);
+    /* The API that predates the seam, unchanged in behaviour: it binds the
+     * launcher that reproduces what it always did, and releases it again. The
+     * provider took its own reference if the spawn succeeded, so this release
+     * is correct on both paths and needs no ordering against any teardown -
+     * which is the whole of what refcounting bought here. */
+    maelys_mcp_process_launcher_t *launcher = NULL;
+    maelys_mcp_result_t status = maelys_mcp_posix_launcher_create(&launcher,
+        out_error);
+    if (status != MAELYS_MCP_OK) return status;
+    status = maelys_mcp_provider_spawn_with_launcher(options, launcher,
+        out_provider, out_error);
+    maelys_mcp_process_launcher_release(launcher);
+    return status;
 }
 
 /*
@@ -1228,7 +1232,7 @@ static maelys_mcp_result_t provider_spawn_with_launcher_and_args(
     const maelys_mcp_provider_process_options_t *options,
     char *const *extra_args,
     const char *execution_profile,
-    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_provider_t **out_provider,
     char **out_error) {
     if (!launcher) {
@@ -1393,7 +1397,7 @@ static maelys_mcp_result_t provider_spawn_with_launcher_and_args(
 
 maelys_mcp_result_t maelys_mcp_provider_spawn_with_launcher(
     const maelys_mcp_provider_process_options_t *options,
-    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_provider_t **out_provider,
     char **out_error) {
     /* No manifest v2 data: byte-identical to what this entry point always
@@ -1410,7 +1414,13 @@ maelys_mcp_result_t maelys_mcp_provider_spawn_with_args(
     char **out_error) {
     /* Always the POSIX launcher, like maelys_mcp_provider_spawn_with_options:
      * this entry point exists to carry manifest v2 data, not to name a
-     * launcher. */
-    return provider_spawn_with_launcher_and_args(options, args,
-        execution_profile, maelys_mcp_posix_launcher(), out_provider, out_error);
+     * launcher. It binds one of its own and releases it. */
+    maelys_mcp_process_launcher_t *launcher = NULL;
+    maelys_mcp_result_t status = maelys_mcp_posix_launcher_create(&launcher,
+        out_error);
+    if (status != MAELYS_MCP_OK) return status;
+    status = provider_spawn_with_launcher_and_args(options, args,
+        execution_profile, launcher, out_provider, out_error);
+    maelys_mcp_process_launcher_release(launcher);
+    return status;
 }

@@ -61,8 +61,7 @@ typedef struct proxy_context {
      * signal, and an upstream started inside a container or by an executord
      * must fit here unchanged.
      */
-    const maelys_mcp_process_launcher_t *launcher;
-    maelys_mcp_process_instance_t instance;
+    maelys_mcp_process_slot_t slot;
     int fd;
     size_t max_message_bytes;
     unsigned int call_timeout_ms;
@@ -655,7 +654,7 @@ static void proxy_destroy(void *context) {
      * tests/test_process_launcher.c pins the ladder's own return instead.
      */
     char *containment_error = NULL;
-    (void)maelys_mcp_process_shutdown(proxy->launcher, &proxy->instance,
+    (void)maelys_mcp_process_shutdown(&proxy->slot,
         PROXY_SHUTDOWN_TIMEOUT_MS, PROXY_SHUTDOWN_TIMEOUT_MS,
         &containment_error);
     free(containment_error);
@@ -695,7 +694,7 @@ static void proxy_destroy(void *context) {
 static maelys_mcp_result_t spawn_upstream(
     const maelys_mcp_proxy_options_t *options,
     const char *execution_profile,
-    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_process_launcher_t *launcher,
     proxy_context_t **out_proxy,
     char **out_error) {
     /*
@@ -707,11 +706,10 @@ static maelys_mcp_result_t spawn_upstream(
      * launcher receives a complete vector.
      */
     char *const fallback_argv[] = {(char *)options->executable_path, NULL};
-    maelys_mcp_process_spec_t spec = {
+    maelys_mcp_process_launch_params_t params = {
         .executable_path = options->executable_path,
         .argv = options->argv ? options->argv : fallback_argv,
         .execution_profile = execution_profile,
-        .max_message_bytes = options->max_message_bytes,
         /* One connect budget covers spawn, era negotiation and the single
          * tools/list, so the launch's share of it is the whole thing. */
         .spawn_timeout_ms = options->connect_timeout_ms,
@@ -722,27 +720,29 @@ static maelys_mcp_result_t spawn_upstream(
          * mcp-proxy upstream is a third-party MCP server that speaks stdin and
          * stdout by specification and will never understand a protocol
          * descriptor on fd 3. maelys_mcp_proxy_options_t exposes no layout
-         * field, so this kind cannot be given anything else even by mistake.
+         * field, so this kind cannot be given anything else even by mistake -
+         * and because the layout is what decides MAELYS_PROVIDER_FD, this kind
+         * cannot be handed that variable by mistake either.
          */
         .fd_layout = MAELYS_MCP_PROCESS_FD_STDIO
     };
-    maelys_mcp_process_instance_t instance = {.protocol_fd = -1};
+    maelys_mcp_process_slot_t slot = {
+        .launcher = NULL, .handle = NULL, .protocol_fd = -1, .live = 0
+    };
     maelys_mcp_result_t launch_status = maelys_mcp_process_launch(launcher,
-        &spec, &instance, out_error);
+        &params, &slot, out_error);
     if (launch_status != MAELYS_MCP_OK) return launch_status;
     proxy_context_t *proxy = calloc(1u, sizeof(*proxy));
     if (!proxy) {
-        close(instance.protocol_fd);
+        close(slot.protocol_fd);
         /* Forced, with no graceful rung: the child is seconds old and has
          * produced nothing to flush, and this is a failure of the runtime's
          * own rather than a shutdown the upstream deserves notice of. */
-        maelys_mcp_process_abandon(launcher, &instance,
-            PROXY_SHUTDOWN_TIMEOUT_MS);
+        maelys_mcp_process_abandon(&slot, PROXY_SHUTDOWN_TIMEOUT_MS);
         return MAELYS_MCP_ERR_MEMORY;
     }
     proxy->fd = -1;
-    proxy->launcher = launcher;
-    proxy->instance = instance;
+    proxy->slot = slot;
     proxy->max_message_bytes = options->max_message_bytes;
     proxy->call_timeout_ms = options->call_timeout_ms;
     proxy->reader = calloc(1u, sizeof(*proxy->reader));
@@ -758,7 +758,7 @@ static maelys_mcp_result_t spawn_upstream(
     proxy->state_mutex_initialized = 1;
     if (maelys_mcp_cond_init_monotonic(&proxy->response_ready) != 0) goto failed;
     proxy->response_ready_initialized = 1;
-    proxy->fd = instance.protocol_fd;
+    proxy->fd = slot.protocol_fd;
     if (pthread_create(&proxy->reader_thread, NULL, proxy_reader_main, proxy) != 0) {
         goto failed;
     }
@@ -766,16 +766,16 @@ static maelys_mcp_result_t spawn_upstream(
     *out_proxy = proxy;
     return MAELYS_MCP_OK;
 failed:
-    if (proxy->fd < 0) close(instance.protocol_fd);
+    if (proxy->fd < 0) close(slot.protocol_fd);
     /*
      * Abandoned rather than shut down: nothing has spoken to this upstream
      * yet, so it is owed no goodbye and no graceful rung. Doing it here also
-     * leaves instance_live clear, which makes the ladder inside proxy_destroy
-     * the no-op it should be - destroy still reaches the launcher exactly
-     * once, from exactly one place.
+     * leaves the slot not live, which makes the ladder inside proxy_destroy
+     * the no-op it should be - release still reaches the launcher exactly
+     * once, from exactly one place, and so does the drop of the reference this
+     * provider took on it.
      */
-    maelys_mcp_process_abandon(proxy->launcher, &proxy->instance,
-        PROXY_SHUTDOWN_TIMEOUT_MS);
+    maelys_mcp_process_abandon(&proxy->slot, PROXY_SHUTDOWN_TIMEOUT_MS);
     replace_error(out_error, "cannot start the upstream MCP transport");
     proxy_destroy(proxy);
     return status;
@@ -995,11 +995,20 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
     char **out_error) {
-    /* The API that predates the seam, unchanged: it binds the launcher that
-     * reproduces what it always did. */
-    return maelys_mcp_provider_proxy_spawn_with_launcher(options,
-        maelys_mcp_posix_launcher(), out_provider, out_skipped_tools,
+    /* The API that predates the seam, unchanged in behaviour: it binds the
+     * launcher that reproduces what it always did, and releases it. The
+     * provider took its own reference if the spawn succeeded. */
+    maelys_mcp_process_launcher_t *launcher = NULL;
+    maelys_mcp_result_t status = maelys_mcp_posix_launcher_create(&launcher,
         out_error);
+    if (status != MAELYS_MCP_OK) {
+        if (out_skipped_tools) *out_skipped_tools = NULL;
+        return status;
+    }
+    status = maelys_mcp_provider_proxy_spawn_with_launcher(options, launcher,
+        out_provider, out_skipped_tools, out_error);
+    maelys_mcp_process_launcher_release(launcher);
+    return status;
 }
 
 /*
@@ -1011,7 +1020,7 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn(
 static maelys_mcp_result_t provider_proxy_spawn_with_launcher_and_profile(
     const maelys_mcp_proxy_options_t *options,
     const char *execution_profile,
-    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
     char **out_error) {
@@ -1153,7 +1162,7 @@ static maelys_mcp_result_t provider_proxy_spawn_with_launcher_and_profile(
 
 maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_launcher(
     const maelys_mcp_proxy_options_t *options,
-    const maelys_mcp_process_launcher_t *launcher,
+    maelys_mcp_process_launcher_t *launcher,
     maelys_mcp_provider_t **out_provider,
     char **out_skipped_tools,
     char **out_error) {
@@ -1170,8 +1179,18 @@ maelys_mcp_result_t maelys_mcp_provider_proxy_spawn_with_profile(
     char **out_skipped_tools,
     char **out_error) {
     /* Always the POSIX launcher, like maelys_mcp_provider_proxy_spawn: this
-     * entry point exists to carry manifest v2 data, not to name a launcher. */
-    return provider_proxy_spawn_with_launcher_and_profile(options,
-        execution_profile, maelys_mcp_posix_launcher(), out_provider,
-        out_skipped_tools, out_error);
+     * entry point exists to carry manifest v2 data, not to name a launcher.
+     * It binds one of its own and releases it. */
+    maelys_mcp_process_launcher_t *launcher = NULL;
+    maelys_mcp_result_t status = maelys_mcp_posix_launcher_create(&launcher,
+        out_error);
+    if (status != MAELYS_MCP_OK) {
+        if (out_skipped_tools) *out_skipped_tools = NULL;
+        return status;
+    }
+    status = provider_proxy_spawn_with_launcher_and_profile(options,
+        execution_profile, launcher, out_provider, out_skipped_tools,
+        out_error);
+    maelys_mcp_process_launcher_release(launcher);
+    return status;
 }
