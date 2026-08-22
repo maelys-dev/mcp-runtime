@@ -585,6 +585,12 @@ static int the_adapter_never_asks_for_authorization(void) {
     return 0;
 }
 
+/* Never called: the adapter must refuse the request before it could be. */
+static void unreached_release(void *context, maelys_mcp_principal_t *principal) {
+    (void)context;
+    (void)principal;
+}
+
 static int arguments_are_validated(void) {
     maelys_mcp_runtime_t *runtime = bare_runtime();
     ASSERT_TRUE(runtime != NULL);
@@ -632,7 +638,10 @@ static int arguments_are_validated(void) {
      */
     maelys_mcp_http_request_t half_pair = request;
     half_pair.principal_retain = NULL;
-    half_pair.principal_release = (void (*)(void *, maelys_mcp_principal_t *))(void *)abort;
+    /* A real function of the right type rather than a cast through void *:
+     * converting a function pointer to an object pointer is not something ISO C
+     * defines, and -Wpedantic -Werror is entitled to say so. */
+    half_pair.principal_release = unreached_release;
     ASSERT_TRUE(maelys_mcp_http_adapter_handle(adapter, &half_pair, &writer, NULL) ==
         MAELYS_MCP_ERR_ARGUMENT);
     maelys_mcp_http_adapter_destroy(adapter);
