@@ -79,8 +79,19 @@
 - The HTTP listener binds `127.0.0.1` by default and is off unless `--http-listen`
   asks for it. Binding any other address refuses to start without an authenticator
   other than loopback trust, and refuses before the socket exists rather than after.
-  It does not serve MCP yet (`docs/protocol-support.md`): it parses, routes and
-  authenticates, and answers `503`.
+  It serves MCP over `2026-07-28` only (`docs/protocol-support.md`), and that
+  restriction is structural rather than a policy: an HTTP channel is created
+  with the modern era alone, so `initialize` is refused by the runtime and no
+  request can negotiate a legacy revision on it. Legacy support stays stdio-only.
+- Every `POST` gets its own channel and its own authentication. A kept-alive
+  connection is a transport optimisation and never a session: the credential is
+  re-checked per request, the principal is bound to that request's channel
+  alone, and nothing about one request survives into the next.
+- A principal reference is released exactly once, at the moment its channel
+  stops being reachable — which for a channel that missed its close deadline is
+  after the connection has already been let go. That is what the channel context
+  destructor exists for, and it is why a wedged provider cannot make a
+  connection slot, or a principal, outlive its own bound.
 - `Origin` is validated on every request, before the body is read, before
   authentication, and before anything else. The allowlist is empty by default and a
   request with no `Origin` is accepted only on a loopback bind. This is the
@@ -171,17 +182,26 @@ the protocol on a non-standard descriptor with its stdout wired to stderr; an
 specification. Confinement covers both kinds; descriptor isolation covers only the
 kind whose protocol this project defines.
 
-The runtime serves MCP over stdio only. It can now open an HTTP listener, and that
-listener authenticates a network principal — but it does not dispatch, so no MCP
-request has yet reached a provider over HTTP and the effect policy is still
-runtime-wide rather than per-principal. Both remaining controls are mandatory before
-a network transport can safely expose providers that run with host privileges: the
-listener must serve MCP (`docs/http-transport-design.md`, phases H2 and H3) and the
-policy must decide on the principal rather than on the process. The mechanism for
-the second exists — the middleware chain's per-channel context is where a
-transport-established principal binds, and ABI 4's `context_release` is what lets a
-per-request transport own one safely — and no middleware in this repository reads it
-yet.
+The runtime serves MCP over stdio and over HTTP. The listener authenticates a
+network principal, binds it to the channel that serves the request, and dispatches;
+the official conformance runner drives that endpoint directly
+(`docs/official-conformance.md`). Of the two controls this paragraph named as
+mandatory before a network transport can safely expose providers that run with host
+privileges, **one is done and one is not**.
+
+Done: the listener serves MCP, and every request is attributed to a principal the
+transport itself authenticated rather than to anything the payload asserted.
+
+Not done: **the effect policy is still runtime-wide rather than per-principal.**
+`--allow-effect` enables an effect for the process, not for a caller, so every
+authenticated principal that reaches a tool gets the same effect set. The mechanism
+for fixing that exists and is unused — the middleware chain's per-channel context is
+where a transport-established principal binds, and ABI 4's `context_release` is what
+lets a per-request transport own one safely — but no middleware in this repository
+reads it yet. Until one does, an HTTP deployment that enables `apply`, `commit` or
+`execute` grants those effects to **every** principal the authenticator admits, and
+a single shared bearer token is therefore a single shared privilege level. That is
+the control to build before exposing this listener to more than one caller.
 
 ## Required provider practices
 

@@ -54,11 +54,14 @@ static void usage(FILE *stream) {
         "its providers are added after --provider's, in the manifest's order.\n"
         "Its \"allowEffects\" is OR-ed with --allow-effect rather than replacing it.\n"
         "\n"
-        "--http-listen starts the HTTP listener alongside stdio. It binds\n"
-        "127.0.0.1 unless told otherwise, and a non-loopback address refuses to\n"
-        "start unless --http-bearer-token supplies an authenticator other than\n"
-        "loopback trust. THE HTTP ENDPOINT DOES NOT SERVE MCP YET: it parses,\n"
-        "routes and authenticates, and answers 503 (see docs/protocol-support.md).\n");
+        "--http-listen starts the HTTP listener alongside stdio, on the same\n"
+        "runtime. It binds 127.0.0.1 unless told otherwise, and a non-loopback\n"
+        "address refuses to start unless --http-bearer-token supplies an\n"
+        "authenticator other than loopback trust.\n"
+        "\n"
+        "The HTTP endpoint serves MCP over 2026-07-28 ONLY; every older revision\n"
+        "stays on stdio. Streamable HTTP is not claimed until the official\n"
+        "conformance suite runs against this listener (docs/protocol-support.md).\n");
 }
 
 /*
@@ -357,10 +360,11 @@ int main(int argc, char **argv) {
     manifest_clear(&manifest);
 
     /*
-     * The HTTP listener, when asked for. It runs alongside stdio and, in this
-     * phase, shares nothing with the runtime: the adapter behind it answers
-     * from a table and dispatches nothing, so there is no channel, no principal
-     * bound to one, and no MCP traffic on this endpoint yet.
+     * The HTTP listener, when asked for. It runs alongside stdio ON THE SAME
+     * RUNTIME, and since H3 it serves MCP: each POST creates a channel bound to
+     * that request's authenticated principal and to the modern era alone, so
+     * one process answers 2026-07-28 over HTTP and every era over stdio without
+     * either transport rewriting the other's dispatch results.
      */
     maelys_mcp_authenticator_t authenticator = {0};
     maelys_mcp_http_adapter_t *adapter = NULL;
@@ -371,8 +375,14 @@ int main(int argc, char **argv) {
                 &authenticator)
             : maelys_http_auth_loopback_create(&authenticator);
         if (http_status == MAELYS_MCP_OK) {
-            http_status = maelys_mcp_http_adapter_create(
-                MAELYS_MCP_HTTP_PLACEHOLDER_JSON, &adapter);
+            maelys_mcp_http_adapter_config_t adapter_config = {
+                .runtime = runtime,
+                /* Every other field zero, which is each one's own way of saying
+                 * "the runtime's default": the same channel budgets stdio gets,
+                 * the 15 s keep-alive, and the 5 s close deadline. */
+                .max_bytes = 0u
+            };
+            http_status = maelys_mcp_http_adapter_create(&adapter_config, &adapter);
         }
         if (http_status == MAELYS_MCP_OK) {
             maelys_http_server_options_t http_options = {
@@ -409,13 +419,24 @@ int main(int argc, char **argv) {
     };
     status = maelys_mcp_runtime_serve_stdio_with_options(
         runtime, STDIN_FILENO, transport_fd, &stdio_options);
-    /* Stop accepting and join every connection before the runtime goes away,
-     * which is the ordering that stays correct once H3 gives those connections
-     * channels to hold. */
+    /*
+     * Teardown order, and every step of it is load-bearing now that a
+     * connection holds a channel and a channel holds a principal.
+     *
+     * Stop accepting and join every connection first, so no new channel can be
+     * created. Destroy the runtime SECOND, because a channel that missed its
+     * close deadline was detached rather than waited on and is still out there:
+     * maelys_mcp_runtime_destroy drains those, which is what runs the last
+     * context_release and hands the last principal reference back. Only then
+     * destroy the authenticator, whose own contract is that it is destroyed
+     * "after the last channel that could have carried one of its principals is
+     * destroyed" - doing it before the runtime would be releasing a principal
+     * into an authenticator that had already freed its table.
+     */
     if (http_server) (void)maelys_http_server_stop(http_server);
     if (adapter) maelys_mcp_http_adapter_destroy(adapter);
-    if (authenticator.destroy) authenticator.destroy(authenticator.context);
     maelys_mcp_result_t destroy_status = maelys_mcp_runtime_destroy(runtime);
+    if (authenticator.destroy) authenticator.destroy(authenticator.context);
     if (status == MAELYS_MCP_OK) status = destroy_status;
     close(transport_fd);
     if (status != MAELYS_MCP_OK) {
