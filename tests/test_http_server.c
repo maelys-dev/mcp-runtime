@@ -131,6 +131,14 @@ static maelys_mcp_result_t fixture_read_resource(
     return out_result->contents ? MAELYS_MCP_OK : MAELYS_MCP_ERR_MEMORY;
 }
 
+/* GCC's -Wunused-result ignores a (void) cast on a warn_unused_result
+ * call; capture-and-discard through a helper instead, as in
+ * test_http_adapter.c. Fixture failure/teardown paths only. */
+static void destroy_runtime_quietly(maelys_mcp_runtime_t *runtime) {
+    maelys_mcp_result_t status = maelys_mcp_runtime_destroy(runtime);
+    (void)status;
+}
+
 static maelys_mcp_runtime_t *serving_runtime(tool_state_t *state) {
     maelys_mcp_runtime_config_t config = {
         .server_name = "http-server-test", .server_version = "1.0"
@@ -141,12 +149,12 @@ static maelys_mcp_runtime_t *serving_runtime(tool_state_t *state) {
         maelys_mcp_runtime_enable_module(runtime, MAELYS_MCP_MODULE_RESOURCES) != MAELYS_MCP_OK ||
         maelys_mcp_runtime_enable_module(runtime,
             MAELYS_MCP_MODULE_SUBSCRIPTIONS) != MAELYS_MCP_OK) {
-        (void)maelys_mcp_runtime_destroy(runtime);
+        destroy_runtime_quietly(runtime);
         return NULL;
     }
     json_t *schema = json_pack("{s:s,s:b}", "type", "object", "additionalProperties", 0);
     if (!schema) {
-        (void)maelys_mcp_runtime_destroy(runtime);
+        destroy_runtime_quietly(runtime);
         return NULL;
     }
     maelys_mcp_tool_t tools[] = {{
@@ -174,12 +182,12 @@ static maelys_mcp_runtime_t *serving_runtime(tool_state_t *state) {
     maelys_mcp_result_t status = maelys_mcp_provider_create(&provider_config, &provider);
     json_decref(schema);
     if (status != MAELYS_MCP_OK) {
-        (void)maelys_mcp_runtime_destroy(runtime);
+        destroy_runtime_quietly(runtime);
         return NULL;
     }
     if (maelys_mcp_runtime_add_provider(runtime, provider, NULL) != MAELYS_MCP_OK) {
         maelys_mcp_provider_destroy(provider);
-        (void)maelys_mcp_runtime_destroy(runtime);
+        destroy_runtime_quietly(runtime);
         return NULL;
     }
     return runtime;
@@ -220,7 +228,7 @@ static int fixture_start(
     };
     if (maelys_mcp_http_adapter_create(
         &adapter_config, &fixture->adapter) != MAELYS_MCP_OK) {
-        (void)maelys_mcp_runtime_destroy(fixture->runtime);
+        destroy_runtime_quietly(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -241,7 +249,7 @@ static int fixture_start(
     };
     if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
         maelys_mcp_http_adapter_destroy(fixture->adapter);
-        (void)maelys_mcp_runtime_destroy(fixture->runtime);
+        destroy_runtime_quietly(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -310,7 +318,7 @@ static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) 
     };
     if (maelys_mcp_http_adapter_create(
         &adapter_config, &fixture->adapter) != MAELYS_MCP_OK) {
-        (void)maelys_mcp_runtime_destroy(fixture->runtime);
+        destroy_runtime_quietly(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -329,7 +337,7 @@ static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) 
     };
     if (maelys_http_server_start(&options, &fixture->server) != MAELYS_MCP_OK) {
         maelys_mcp_http_adapter_destroy(fixture->adapter);
-        (void)maelys_mcp_runtime_destroy(fixture->runtime);
+        destroy_runtime_quietly(fixture->runtime);
         fixture->authenticator.destroy(fixture->authenticator.context);
         return -1;
     }
@@ -352,7 +360,7 @@ static int fixture_start_counting(fixture_t *fixture, counting_auth_t *counter) 
 static void fixture_stop(fixture_t *fixture) {
     if (fixture->server) maelys_http_server_stop(fixture->server);
     if (fixture->adapter) maelys_mcp_http_adapter_destroy(fixture->adapter);
-    if (fixture->runtime) (void)maelys_mcp_runtime_destroy(fixture->runtime);
+    if (fixture->runtime) destroy_runtime_quietly(fixture->runtime);
     if (fixture->authenticator.destroy) {
         fixture->authenticator.destroy(fixture->authenticator.context);
     }
