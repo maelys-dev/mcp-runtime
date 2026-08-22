@@ -76,6 +76,26 @@ for (typed identity, cancellation policy, transport options) are not in it and
 remain on the 1.0 runway. See `docs/authenticated-principal-design.md` for the
 ownership argument behind `context_release`.
 
+ABI 5 revises the process launch seam, and is the first change to it that could
+not use the new-structure-and-new-entry-point idiom: `maelys_mcp_process_spec_t`
+and `maelys_mcp_process_instance_t` are removed rather than extended, and
+`maelys_mcp_process_ops_t` changes shape, so the constant moves. The spec
+becomes the opaque `maelys_mcp_process_request_t` read through getters — which
+restores the idiom for everything after this, since a getter is a new entry
+point — the instance struct is replaced by `spawn` out-parameters, `wait`
+reports a full `maelys_mcp_process_exit_status_t`, the launcher becomes an
+opaque refcounted handle created by `maelys_mcp_process_launcher_create`, and
+the child environment travels through the seam under an explicit
+platform rule. `maelys_mcp_process_ops_t` leads with an `abi_version` field
+that `maelys_mcp_process_launcher_create` checks for exact equality against
+`MAELYS_MCP_ABI_VERSION`, refusing any mismatch: an ops table is populated at
+run time by a separately compiled launcher, so it links cleanly and then calls
+through a function pointer at the wrong offset, and the check is what restores
+the link error this policy prefers at the one place a link error cannot occur.
+Still no `struct_size`, for the reason stated above. `docs/launch-contract-design.md`,
+"ABI 5 — the launcher contract", carries the full contract and the argument for
+each part of it.
+
 ABI 3 was introduced by version 0.14.0. It removes `authorize`, `audit` and
 `policy_context` from `maelys_mcp_runtime_config_t`: the middleware chain
 (`maelys/mcp/middleware.h`) replaces those callbacks, and
