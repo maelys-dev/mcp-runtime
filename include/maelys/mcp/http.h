@@ -1,5 +1,6 @@
 #pragma once
 
+#include "maelys/mcp/channel.h"
 #include "maelys/mcp/error.h"
 #include "maelys/mcp/principal.h"
 
@@ -26,12 +27,17 @@ extern "C" {
  * already terminated TLS reuses the adapter verbatim behind its own listener;
  * and the fuzz targets get a seam that is a function rather than a socket.
  *
- * H2 STATUS. This header is the whole contract. The adapter behind it now
- * validates the MCP routing headers against the body and refuses a
- * disagreement with -32020, and it still does not dispatch: see
- * maelys_mcp_http_adapter_create. channel_create, channel_accept, mode
- * selection on the first frame, SSE framing, 202 for notifications and the
- * cancellation chain are H3.
+ * H3 STATUS. This header is the whole contract, and the adapter behind it now
+ * SERVES MCP: it creates a channel per POST bound to the caller's principal and
+ * to MAELYS_MCP_ERA_MODERN, accepts the frame, drains the channel's outbox,
+ * chooses application/json or text/event-stream from the first frame, answers a
+ * notification 202, and runs the cancellation and shutdown chains. The 503
+ * placeholder H1 and H2 answered from is gone, and so is the enum that selected
+ * it.
+ *
+ * What is NOT proven here is the conformance claim: H4 points the official
+ * runner at the real binary with no adapter in the path, and until it does,
+ * docs/protocol-support.md says so.
  */
 
 /* One in-flight exchange. Opaque; created by the adapter, valid from the moment
@@ -68,9 +74,35 @@ typedef struct maelys_mcp_http_request {
     void *header_context;
     const void *body;
     size_t body_length;
-    /* Established by the server layer. Borrowed for the call; the server layer
-     * owns the retain/release pair (docs/authenticated-principal-design.md). */
+    /*
+     * Established by the server layer, and bound to this exchange's channel as
+     * maelys_mcp_channel_config_t::context so that middleware and modules see
+     * the caller the runtime is acting for.
+     *
+     * BORROWED for the call. The server layer keeps owning the reference it
+     * authenticated and releases it on its own schedule; the adapter takes a
+     * SECOND reference through principal_retain below and gives that one back
+     * through principal_release, at the moment the channel stops being
+     * reachable. Two references rather than a transfer, because a channel that
+     * misses its close deadline is destroyed detached and its context outlives
+     * _handle - so "release when _handle returns" and "release when the channel
+     * is freed" are different instants and each needs its own reference.
+     */
     maelys_mcp_principal_t *principal;
+    /*
+     * The authenticator's refcount pair for `principal`, and its context.
+     *
+     * Supply both or neither. With both, the adapter retains before
+     * channel_create and installs a release that the runtime runs EXACTLY ONCE
+     * at the real free - inline for a clean close, and on whichever worker
+     * finishes last for a detached one. With neither, the channel carries the
+     * principal with no destructor and the embedder must keep it alive until
+     * maelys_mcp_runtime_destroy has returned, which is the only bound left to
+     * it; a transport that can detach should always supply them.
+     */
+    void (*principal_retain)(void *context, maelys_mcp_principal_t *principal);
+    void (*principal_release)(void *context, maelys_mcp_principal_t *principal);
+    void *principal_context;
     /*
      * An ABSTRACT cancellation source: a descriptor that becomes readable when
      * this exchange has been cancelled, and stays readable. What made it
@@ -83,6 +115,21 @@ typedef struct maelys_mcp_http_request {
      * rather than pretending otherwise.
      */
     int cancel_fd;
+    /*
+     * The same shape, for the other way an exchange can end early: a descriptor
+     * that becomes readable when this exchange should finish GRACEFULLY. It is
+     * a different signal from cancel_fd and not a synonym - cancellation ends
+     * the stream truncated, with no terminal chunk, because the peer is gone,
+     * while shutdown completes every surviving subscription with
+     * `resultType: "complete"`, writes those frames, and closes the body
+     * properly, because the peer is still there and is owed an ending.
+     *
+     * One descriptor may be shared by every in-flight exchange, which is what a
+     * server-wide "stop" is: the adapter only ever polls it.
+     *
+     * -1 means the embedder uses maelys_mcp_http_exchange_shutdown instead.
+     */
+    int shutdown_fd;
 } maelys_mcp_http_request_t;
 
 typedef enum maelys_mcp_http_stream_end {
@@ -117,25 +164,42 @@ typedef struct maelys_mcp_http_response_writer {
 } maelys_mcp_http_response_writer_t;
 
 /*
- * The placeholder answer, unchanged by H2. The adapter now validates, but it
- * still "dispatches nothing yet" - "Still no dispatch" is H2's own boundary in
- * docs/http-transport-design.md - so this enum remains the table that selects
- * which canned answer a request that PASSED validation gets, and it is what
- * lets a recording writer drive both response modes with no socket involved.
- *
- * It exists only until H3 replaces the table with mode selection on the first
- * frame the channel produces, and disappears with it.
+ * What every channel this adapter creates is configured with, plus the two
+ * durations the drain loop needs. Zero means "the runtime's own default" for
+ * each channel field, exactly as maelys_mcp_channel_config_t already defines
+ * it, so a zero-initialized config is a working one.
  */
-typedef enum maelys_mcp_http_placeholder {
-    /* begin_json with 503 and a -32600 body carrying no id: this endpoint
-     * parses and authenticates, and does not serve MCP yet. */
-    MAELYS_MCP_HTTP_PLACEHOLDER_JSON = 0,
-    /* begin_stream, no events, end_stream(COMPLETE). */
-    MAELYS_MCP_HTTP_PLACEHOLDER_STREAM = 1
-} maelys_mcp_http_placeholder_t;
+typedef struct maelys_mcp_http_adapter_config {
+    /* Required. Every exchange creates one channel on it and destroys that
+     * channel inside the request. */
+    maelys_mcp_runtime_t *runtime;
+    size_t max_messages;
+    size_t max_bytes;
+    size_t response_burst;
+    unsigned int admission_timeout_ms;
+    /* The bound on the close phase of every exchange, cancelled or not. A close
+     * that misses it detaches rather than waits, so this is what stops a wedged
+     * provider from holding a connection slot. 0 selects the channel default. */
+    unsigned int close_timeout_ms;
+    /*
+     * How long the drain loop waits with nothing to write before emitting an
+     * SSE keep-alive comment. 0 selects MAELYS_MCP_HTTP_KEEPALIVE_INTERVAL_MS.
+     * It is a keep-alive interval and NOT a cancellation poll: cancellation
+     * arrives as descriptor readiness, so shortening this buys no latency and
+     * lengthening it costs none.
+     */
+    unsigned int keepalive_interval_ms;
+} maelys_mcp_http_adapter_config_t;
+
+/* The design's limits table: "SSE keep-alive | 15 s". */
+#define MAELYS_MCP_HTTP_KEEPALIVE_INTERVAL_MS 15000u
+/* The same 5 s maelys_mcp_channel_create applies to a zero close_timeout_ms.
+ * Named here because the adapter resolves the zero itself, and two places
+ * silently agreeing on a number is how they stop agreeing. */
+#define MAELYS_MCP_HTTP_CLOSE_TIMEOUT_MS 5000u
 
 maelys_mcp_result_t maelys_mcp_http_adapter_create(
-    maelys_mcp_http_placeholder_t placeholder,
+    const maelys_mcp_http_adapter_config_t *config,
     maelys_mcp_http_adapter_t **out_adapter);
 
 void maelys_mcp_http_adapter_destroy(maelys_mcp_http_adapter_t *adapter);
@@ -156,8 +220,32 @@ maelys_mcp_result_t maelys_mcp_http_adapter_handle(
  * Cancellation names an exchange rather than a request on purpose. Naming the
  * request would make its *address* a concurrent identity, which is a race the
  * moment _handle returns and the caller reuses or frees that struct.
+ *
+ * WAKING THE DRAIN. An exchange that supplied cancel_fd or shutdown_fd is woken
+ * by the embedder making that descriptor readable, which is the whole reason
+ * they exist; this call only records the disposition. An exchange that supplied
+ * NEITHER descriptor is woken by this call itself, through a wakeup pipe the
+ * adapter allocates for exactly that case - so an embedder with no descriptor
+ * of its own still gets prompt cancellation rather than one bounded by the
+ * keep-alive interval.
  */
 void maelys_mcp_http_exchange_cancel(maelys_mcp_http_exchange_t *exchange);
+
+/*
+ * The graceful sibling, with the same threading and lifetime rules: callable
+ * from any thread while _handle is running, idempotent, a no-op afterwards.
+ *
+ * It asks the exchange to END, not to STOP. Every subscription still open on
+ * this exchange's channel is completed with `resultType: "complete"`, those
+ * frames are written, and the stream is terminated properly - which is what
+ * server shutdown owes a client that is still connected and still reading. A
+ * cancellation, by contrast, writes nothing further and leaves the body
+ * truncated on purpose.
+ *
+ * A cancellation already recorded wins: a peer that is gone cannot be given a
+ * graceful ending, and pretending otherwise would write to a dead socket.
+ */
+void maelys_mcp_http_exchange_shutdown(maelys_mcp_http_exchange_t *exchange);
 
 #ifdef __cplusplus
 }

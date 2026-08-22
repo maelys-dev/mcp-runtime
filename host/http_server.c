@@ -37,6 +37,16 @@ struct maelys_http_server {
      * is src/transport/stdio.c:69's, moved to a listener. */
     int wake_read;
     int wake_write;
+    /*
+     * Phase 2's signal, and one pipe for the whole server rather than one per
+     * exchange: "finish gracefully" is a fact about the server and becomes true
+     * for every in-flight exchange at the same instant. Its read end is handed
+     * to the adapter as maelys_mcp_http_request_t::shutdown_fd, which only ever
+     * polls it, so sharing one descriptor across every connection thread is
+     * sound and costs two descriptors in total.
+     */
+    int shutdown_read;
+    int shutdown_write;
     unsigned short port;
     int bind_is_loopback;
 
@@ -51,6 +61,11 @@ struct maelys_http_server {
     pthread_mutex_t mutex;
     int stopping;
     size_t connection_count;
+    /* How many connection threads are currently inside the adapter. Phase 2
+     * waits on this and not on connection_count, because a connection parked
+     * between two kept-alive requests has nothing to finish gracefully and
+     * would only make the wait longer. */
+    size_t exchange_count;
     connection_t *connections;
 
     /* Owned copies, so the caller's argv may go away. */
@@ -205,6 +220,14 @@ typedef struct status_row {
 } status_row_t;
 
 static const status_row_t STATUS_ROWS[] = {
+    /*
+     * The one success row, and it is here for its REASON PHRASE rather than for
+     * a body it never carries. writer_status_only reads this table to name the
+     * status it is writing, and a 202 that was not in it went onto the wire as
+     * "HTTP/1.1 202 Error" - syntactically legal, since a reason phrase is
+     * advisory, and a lie to every human reading a capture.
+     */
+    {202, "Accepted", 0, NULL, NULL},
     {400, "Bad Request", 0, NULL, NULL},
     {401, "Unauthorized", -32600, "Authentication required.", "WWW-Authenticate: Bearer"},
     {403, "Forbidden", -32600, "Origin not allowed.", NULL},
@@ -310,12 +333,28 @@ static void reject_and_close(
 
 /* ------------------------------------------------------------ the writer */
 
+/* The S-chain's watcher, defined below with the rest of it. The writer only
+ * needs to tell it when the response is finished. */
+typedef struct socket_watcher socket_watcher_t;
+static void watcher_mark_finished(socket_watcher_t *watcher);
+
 typedef struct socket_writer {
     connection_t *connection;
     int keep_alive;
     int began;
     int streamed;
+    /* NULL when no watcher was started, which is the half-closed case. */
+    socket_watcher_t *watcher;
 } socket_writer_t;
+
+/*
+ * The instant the pipelining window closes: the response this exchange owes is
+ * on the wire in full. Every terminal writer entry point ends here, and nothing
+ * else does - a stream that has written an event is still mid-response.
+ */
+static void writer_response_complete(socket_writer_t *writer) {
+    if (writer->watcher) watcher_mark_finished(writer->watcher);
+}
 
 static maelys_mcp_result_t writer_begin_json(
     void *context, int status, const char *body, size_t length) {
@@ -340,6 +379,7 @@ static maelys_mcp_result_t writer_begin_json(
         result = write_all(writer->connection->fd, body, length,
             writer->connection->server->write_timeout_ms);
     }
+    writer_response_complete(writer);
     return result;
 }
 
@@ -425,18 +465,31 @@ static maelys_mcp_result_t writer_end_stream(
      * stream completed normally, which would silently turn a cancelled call
      * into an apparently-successful empty one.
      */
-    if (disposition == MAELYS_MCP_HTTP_STREAM_ABORTED) return MAELYS_MCP_OK;
-    return write_all(writer->connection->fd, "0\r\n\r\n", 5u,
+    if (disposition == MAELYS_MCP_HTTP_STREAM_ABORTED) {
+        writer_response_complete(writer);
+        return MAELYS_MCP_OK;
+    }
+    maelys_mcp_result_t result = write_all(writer->connection->fd, "0\r\n\r\n", 5u,
         writer->connection->server->write_timeout_ms);
+    writer_response_complete(writer);
+    return result;
 }
 
+/*
+ * A status-only reply, which since H3 is how a notification's 202 is written.
+ *
+ * Keep-alive is NOT forced off here, and that changed with H3 for a reason: the
+ * body length is explicitly zero, so the connection is left in a known state
+ * and the framing state machine has nothing to guess. Refusing reuse after a
+ * 202 would make a client that batches notifications on one connection pay a
+ * handshake per notification, for no property anyone gains.
+ */
 static maelys_mcp_result_t writer_status_only(
     void *context, int status, const char *const *extra_headers,
     size_t extra_header_count) {
     socket_writer_t *writer = context;
     if (writer->began) return MAELYS_MCP_ERR_STATE;
     writer->began = 1;
-    writer->keep_alive = 0;
     const status_row_t *row = status_row(status);
     char head[RESPONSE_BUFFER_BYTES];
     int head_length = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\n",
@@ -451,9 +504,172 @@ static maelys_mcp_result_t writer_status_only(
         if (result == MAELYS_MCP_OK) result = write_all(fd, "\r\n", 2u, timeout);
     }
     if (result == MAELYS_MCP_OK) {
-        result = write_all(fd, "Content-Length: 0\r\nConnection: close\r\n\r\n", 40u, timeout);
+        const char *tail = writer->keep_alive
+            ? "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+            : "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        result = write_all(fd, tail, strlen(tail), timeout);
     }
+    writer_response_complete(writer);
     return result;
+}
+
+/* ---------------------------------------------------------- the S-chain */
+
+/*
+ * S0-S3. The socket watcher: the one party that looks at the socket while an
+ * exchange is being produced, and the whole of what the adapter is spared.
+ *
+ * It exists because the two jobs cannot share a thread. The adapter's drain
+ * sits in poll() on descriptors that are not sockets and must not be, since
+ * telling a FIN from a pipelined byte needs the socket AND the pipelining rule
+ * AND the ability to say which of the two happened - none of which the adapter
+ * has or should have. So the connection thread runs the exchange and this
+ * thread watches the socket beside it.
+ *
+ * The lifetime protocol is a pipe rather than a reference, which is what makes
+ * it small: this thread never names the exchange, never touches the channel,
+ * and never aborts anything. It writes one byte. The connection thread creates
+ * the pipe before this thread exists and closes it after joining, so there is
+ * no window in which this thread holds a descriptor number that has been handed
+ * to something else.
+ *
+ * Both endings write that byte, and the two are DIFFERENT FAULTS logged
+ * differently even though they end the same way. Conflating a client bug with a
+ * cancellation at the source is how a pipelining defect disappears into a
+ * disconnect statistic.
+ */
+/* Defined with the listener below, where the acceptor's own wakeup pipe is. */
+static int create_wakeup_pipe(int *read_fd, int *write_fd);
+
+struct socket_watcher {
+    pthread_t thread;
+    int started;
+    int fd;
+    /* Read end handed to the adapter as cancel_fd; write end raised here. */
+    int cancel_read;
+    int cancel_write;
+    const char *peer;
+    /*
+     * Set by the connection thread the moment the exchange is over, and read by
+     * the watcher before it decides that an inbound byte means anything.
+     *
+     * Without it a kept-alive client that sends its NEXT request promptly is
+     * reported as pipelining: the byte is legitimate, because this request's
+     * response was already complete, but the watcher is still in poll() and
+     * cannot tell that from the socket alone. The pipelining rule is about
+     * bytes arriving BETWEEN a request's body and its response, and this flag
+     * is what makes the watcher's view of "between" the same as the rule's.
+     */
+    pthread_mutex_t mutex;
+    int mutex_ready;
+    int finished;
+};
+
+static void watcher_mark_finished(socket_watcher_t *watcher) {
+    if (!watcher->mutex_ready) return;
+    pthread_mutex_lock(&watcher->mutex);
+    watcher->finished = 1;
+    pthread_mutex_unlock(&watcher->mutex);
+}
+
+static void watcher_raise(socket_watcher_t *watcher) {
+    if (watcher->cancel_write < 0) return;
+    ssize_t written = write(watcher->cancel_write, "x", 1u);
+    (void)written;
+}
+
+static int watcher_finished(socket_watcher_t *watcher) {
+    pthread_mutex_lock(&watcher->mutex);
+    int finished = watcher->finished;
+    pthread_mutex_unlock(&watcher->mutex);
+    return finished;
+}
+
+static void *watcher_main(void *argument) {
+    socket_watcher_t *watcher = argument;
+    for (;;) {
+        struct pollfd descriptors[2] = {
+            {.fd = watcher->fd, .events = POLLIN, .revents = 0},
+            /* Readable means somebody already ended this exchange - the
+             * connection thread on its way out, or a shutdown - and there is
+             * nothing left to watch for. Polled, never read: the adapter's
+             * level-triggered reading of the same descriptor depends on the
+             * byte staying there. */
+            {.fd = watcher->cancel_read, .events = POLLIN, .revents = 0}
+        };
+        int ready = poll(descriptors, 2u, -1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return NULL;
+        }
+        if (descriptors[1].revents) return NULL;
+        if (!descriptors[0].revents) continue;
+        int peeked = maelys_http_peek_disambiguate(watcher->fd);
+        /* Checked AFTER the peek and before acting on it: an exchange that
+         * ended while this thread was in poll() has nothing left to cancel, and
+         * whatever the peer sent belongs to its next request. */
+        if (watcher_finished(watcher)) return NULL;
+        if (peeked == 0) {
+            /* FIN. On this transport the client closing IS the cancellation. */
+            watcher_raise(watcher);
+            return NULL;
+        }
+        if (peeked == 1) {
+            fprintf(stderr,
+                "http: refused pipelined bytes from %s during an exchange\n",
+                watcher->peer);
+            watcher_raise(watcher);
+            return NULL;
+        }
+        /* Neither yet: a spurious wakeup, or an error that the exchange's own
+         * write will surface with its own errno. Poll again rather than guess,
+         * because guessing here would abort a live request. */
+        struct pollfd settle = {.fd = watcher->fd, .events = POLLIN, .revents = 0};
+        if (poll(&settle, 1u, 1) < 0 && errno != EINTR) return NULL;
+    }
+}
+
+static int watcher_start(socket_watcher_t *watcher, int fd, const char *peer) {
+    memset(watcher, 0, sizeof(*watcher));
+    watcher->fd = fd;
+    watcher->peer = peer;
+    watcher->cancel_read = -1;
+    watcher->cancel_write = -1;
+    if (pthread_mutex_init(&watcher->mutex, NULL) != 0) return -1;
+    watcher->mutex_ready = 1;
+    if (create_wakeup_pipe(&watcher->cancel_read, &watcher->cancel_write) != 0) {
+        return -1;
+    }
+    if (pthread_create(&watcher->thread, NULL, watcher_main, watcher) != 0) {
+        close(watcher->cancel_read);
+        close(watcher->cancel_write);
+        watcher->cancel_read = -1;
+        watcher->cancel_write = -1;
+        return -1;
+    }
+    watcher->started = 1;
+    return 0;
+}
+
+static void watcher_stop(socket_watcher_t *watcher) {
+    if (watcher->started) {
+        pthread_mutex_lock(&watcher->mutex);
+        watcher->finished = 1;
+        pthread_mutex_unlock(&watcher->mutex);
+        /* Raised by this thread too, so the watcher leaves poll() whether or
+         * not the client did anything. Joined before either end is closed. */
+        watcher_raise(watcher);
+        pthread_join(watcher->thread, NULL);
+        watcher->started = 0;
+    }
+    if (watcher->cancel_read >= 0) close(watcher->cancel_read);
+    if (watcher->cancel_write >= 0) close(watcher->cancel_write);
+    watcher->cancel_read = -1;
+    watcher->cancel_write = -1;
+    if (watcher->mutex_ready) {
+        pthread_mutex_destroy(&watcher->mutex);
+        watcher->mutex_ready = 0;
+    }
 }
 
 /* ------------------------------------------------------------ the exchange */
@@ -723,11 +939,16 @@ static int serve_request(connection_t *connection, int is_first_request) {
     if (!pipelined) {
         int peeked = maelys_http_peek_disambiguate(connection->fd);
         if (peeked == 1) pipelined = 1;
-        /* A FIN after a complete request is a client that has finished asking,
-         * not a cancellation of an exchange in flight: the answer is still
-         * written, and the connection is not reused. The cancellation reading
-         * of a FIN belongs to a stream that is still being produced, which is
-         * H3. */
+        /*
+         * A FIN that is ALREADY here when the request is complete is a client
+         * that has finished asking and is still reading - a half-close, which
+         * is legitimate and is answered. It is deliberately not the
+         * cancellation reading: cancellation is a FIN that arrives WHILE the
+         * answer is being produced, and telling the two apart is exactly what
+         * this peek, before the watcher starts, is for. Starting a watcher on a
+         * socket that is already at end-of-stream would abort every half-closing
+         * client's request the instant it was dispatched.
+         */
         if (peeked == 0) half_closed = 1;
     }
     if (pipelined) {
@@ -739,6 +960,24 @@ static int serve_request(connection_t *connection, int is_first_request) {
         return 0;
     }
 
+    /*
+     * The watcher, and only when there is something left to watch for. A
+     * half-closed peer has already said everything it is going to say, so the
+     * socket is permanently readable and a watcher on it would report a
+     * cancellation that has not happened.
+     *
+     * A watcher that cannot start is not fatal: the exchange runs with no
+     * cancellation source, which is the same contract an embedder that offers
+     * neither gets, and _handle answers accordingly rather than pretending.
+     */
+    socket_watcher_t watcher;
+    memset(&watcher, 0, sizeof(watcher));
+    watcher.cancel_read = -1;
+    watcher.cancel_write = -1;
+    if (!half_closed) {
+        (void)watcher_start(&watcher, connection->fd, connection->peer);
+    }
+
     header_lookup_context_t lookup = {.parser = &parser};
     socket_writer_t writer_state = {
         .connection = connection,
@@ -746,7 +985,16 @@ static int serve_request(connection_t *connection, int is_first_request) {
          * streams; writer_begin_stream clears it. */
         .keep_alive = !half_closed && !client_asked_to_close(&parser),
         .began = 0,
-        .streamed = 0
+        .streamed = 0,
+        /*
+         * The writer is what knows when the response is COMPLETE, which is
+         * where the pipelining window closes. Not when _handle returns: the
+         * channel is still being torn down then, and a kept-alive client that
+         * reads its answer and sends the next request promptly would be
+         * reported as pipelining for bytes that arrived after the response the
+         * rule measures against.
+         */
+        .watcher = &watcher
     };
     maelys_mcp_http_response_writer_t writer = {
         .context = &writer_state,
@@ -757,6 +1005,7 @@ static int serve_request(connection_t *connection, int is_first_request) {
         .end_stream = writer_end_stream,
         .status_only = writer_status_only
     };
+
     maelys_mcp_http_request_t request = {
         .method = "POST",
         .path = path,
@@ -766,24 +1015,38 @@ static int serve_request(connection_t *connection, int is_first_request) {
         .body_length = body_length,
         .principal = principal,
         /*
-         * -1 through H2. The adapter validates and answers from a table, and
-         * neither of those blocks, so
-         * there is nothing for a cancellation source to interrupt; wiring a
-         * per-request pipe with no consumer would be ceremony. The descriptor
-         * becomes real in H3, when the adapter starts polling the outbox.
+         * The retain/release pair, so the channel gets a reference of its own.
+         * The server layer keeps the one it authenticated and gives it back
+         * below; the adapter's goes back through
+         * maelys_mcp_channel_config_t::context_release, at the real free, which
+         * for a detached channel is later than this function and on a thread
+         * this one never created. That is the whole reason ABI 4 grew a context
+         * destructor, and this is its first consumer.
          */
-        .cancel_fd = -1
+        .principal_retain = server->authenticator->retain,
+        .principal_release = server->authenticator->release,
+        .principal_context = server->authenticator->context,
+        /* Abstract on the adapter's side; a pipe the watcher raises on this
+         * one. The adapter never learns whether it was a FIN or a pipelined
+         * byte, because it does not need to and could not act differently. */
+        .cancel_fd = watcher.cancel_read,
+        .shutdown_fd = server->shutdown_read
     };
+    pthread_mutex_lock(&server->mutex);
+    ++server->exchange_count;
+    pthread_mutex_unlock(&server->mutex);
     maelys_mcp_result_t handled = maelys_mcp_http_adapter_handle(
         server->adapter, &request, &writer, NULL);
+    pthread_mutex_lock(&server->mutex);
+    --server->exchange_count;
+    pthread_mutex_unlock(&server->mutex);
 
+    watcher_stop(&watcher);
     free(body);
     /*
-     * The server layer owns the retain/release pair. H2 creates no channel
-     * either - it validates and stops - so the reference the authenticator
-     * handed over is still given back here. H3 hands it to
-     * maelys_mcp_channel_config_t::context_release instead, because that is the
-     * phase in which a channel exists to bind it to.
+     * The server layer's own reference, released here as it always was. The
+     * channel's second one is not this call: releasing twice from here would
+     * be exactly the double free the two-reference shape exists to avoid.
      */
     server->authenticator->release(server->authenticator->context, principal);
     maelys_http_parser_clear(&parser);
@@ -951,6 +1214,8 @@ static void server_free(maelys_http_server_t *server) {
     if (server->listen_fd >= 0) close(server->listen_fd);
     if (server->wake_read >= 0) close(server->wake_read);
     if (server->wake_write >= 0) close(server->wake_write);
+    if (server->shutdown_read >= 0) close(server->shutdown_read);
+    if (server->shutdown_write >= 0) close(server->shutdown_write);
     free(server->endpoint_path);
     for (size_t index = 0; index < server->allowed_origin_count; ++index) {
         free(server->allowed_origins[index]);
@@ -1066,6 +1331,8 @@ maelys_mcp_result_t maelys_http_server_start(
     server->listen_fd = -1;
     server->wake_read = -1;
     server->wake_write = -1;
+    server->shutdown_read = -1;
+    server->shutdown_write = -1;
     if (pthread_mutex_init(&server->mutex, NULL) != 0) {
         free(server);
         return MAELYS_MCP_ERR_MEMORY;
@@ -1142,6 +1409,12 @@ maelys_mcp_result_t maelys_http_server_start(
         server_free(server);
         return MAELYS_MCP_ERR_IO;
     }
+    /* Created before the acceptor exists, so every connection thread that can
+     * ever run already has a valid descriptor to hand the adapter. */
+    if (create_wakeup_pipe(&server->shutdown_read, &server->shutdown_write) != 0) {
+        server_free(server);
+        return MAELYS_MCP_ERR_IO;
+    }
     if (pthread_create(&server->acceptor, NULL, acceptor_main, server) != 0) {
         server_free(server);
         return MAELYS_MCP_ERR_IO;
@@ -1155,13 +1428,34 @@ unsigned short maelys_http_server_port(const maelys_http_server_t *server) {
     return server ? server->port : 0u;
 }
 
+/*
+ * How long phase 2 gives every in-flight exchange to end gracefully before
+ * phase 3 stops being polite. It is the adapter's own close deadline plus a
+ * margin for the writes that follow it: a shorter value would cut the streams
+ * phase 2 exists to let finish, and a longer one would only delay a shutdown
+ * that the adapter has already bounded on its own.
+ */
+#define MAELYS_HTTP_DRAIN_GRACE_MS (MAELYS_MCP_HTTP_CLOSE_TIMEOUT_MS + 1000u)
+
 maelys_mcp_result_t maelys_http_server_stop(maelys_http_server_t *server) {
     if (!server) return MAELYS_MCP_ERR_ARGUMENT;
     /*
-     * Three ordered phases, and the order is the whole content. Stop accepting
-     * first, so no new connection can arrive; then let the in-flight ones end;
-     * then join. Reversing the first two would mean racing a connection that
-     * arrived after the drain started.
+     * Four ordered phases, and the order is the whole content.
+     *
+     * 1. Stop accepting. In-flight requests are untouched, so no client loses
+     *    an answer because a later one arrived.
+     * 2. Ask every open stream to FINISH, which is not the same as stopping it:
+     *    each surviving subscription is completed with `resultType: "complete"`,
+     *    those frames are written, and the body is terminated properly. This is
+     *    the phase that would not exist if shutdown were spelled as
+     *    cancellation, and the difference is visible on the wire.
+     * 3. Only then stop being polite: shutdown() the stragglers, which is what
+     *    makes a connection parked in a header read leave promptly.
+     * 4. Join.
+     *
+     * Reversing 1 and 2 would race a connection that arrived after the drain
+     * started; reversing 2 and 3 would truncate exactly the streams 2 exists to
+     * let finish.
      */
     pthread_mutex_lock(&server->mutex);
     server->stopping = 1;
@@ -1175,11 +1469,36 @@ maelys_mcp_result_t maelys_http_server_stop(maelys_http_server_t *server) {
         close(server->listen_fd);
         server->listen_fd = -1;
     }
+
+    /* Phase 2. One byte, read by nobody and polled by every adapter that is
+     * currently draining. */
+    if (server->shutdown_write >= 0) {
+        ssize_t written = write(server->shutdown_write, "x", 1u);
+        (void)written;
+    }
+    uint64_t grace = deadline_from(MAELYS_HTTP_DRAIN_GRACE_MS);
+    for (;;) {
+        pthread_mutex_lock(&server->mutex);
+        size_t in_flight = server->exchange_count;
+        pthread_mutex_unlock(&server->mutex);
+        if (!in_flight) break;
+        uint64_t now = 0u;
+        if (monotonic_milliseconds(&now) != 0 || now >= grace) break;
+        /*
+         * A 2 ms sleep and not a condition variable, because this is the only
+         * place in the process that waits on this count and it runs once per
+         * lifetime. A condvar here would add a signal to the exchange hot path
+         * to save a handful of wakeups on a path taken at exit.
+         */
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+        (void)nanosleep(&pause, NULL);
+    }
+
     /*
-     * Every connection thread terminates in bounded time on its own - each read
-     * carries a deadline and each write carries the write timeout - so the
-     * shutdown below is what makes it prompt rather than what makes it
-     * terminate.
+     * Phase 3. Every connection thread terminates in bounded time on its own -
+     * each read carries a deadline, each write carries the write timeout, and
+     * each exchange's close deadline detaches rather than waits - so this is
+     * what makes it prompt rather than what makes it terminate.
      */
     pthread_mutex_lock(&server->mutex);
     for (connection_t *entry = server->connections; entry; entry = entry->next) {

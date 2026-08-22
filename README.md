@@ -177,9 +177,20 @@ three bundled SDKs expose nested requests since 0.16, declaring `/5` only
 once a provider actually nests so a non-nesting provider stays byte-identical
 on the wire.
 
-Not implemented yet: streamable HTTP transport (in progress — the server
-layer ships, MCP dispatch does not yet), prompts, Tasks, dynamic provider
-reload, full JSON Schema 2020-12, Windows.
+**The HTTP endpoint serves MCP as of the 0.19 line, over the `2026-07-28` era
+only.** `--http-listen` dispatches: a channel per `POST` bound to that request's
+authenticated principal, `application/json` for a request that resolves to one
+response and `text/event-stream` for one that streams, `202` for a
+notification, and cancellation when the client disconnects. Legacy protocol
+support stays stdio-only, and one process serves both at once. What is not
+claimed yet is **Streamable HTTP**: the official conformance suite still runs
+through a test-only adapter rather than against this listener, and the claim
+waits until it does — see
+[protocol support](docs/protocol-support.md).
+
+Not implemented yet: Streamable HTTP conformance (the transport ships; the
+claim does not), prompts, Tasks, dynamic provider reload, full JSON Schema
+2020-12, Windows.
 The pre-1.0 ABI policy is documented and versioned; same-major ABI stability
 begins with 1.0.
 

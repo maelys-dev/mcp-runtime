@@ -26,8 +26,11 @@ extern "C" {
  * maelys_mcp_http_request_t and nothing that would let the adapter tell a FIN
  * from a pipelined byte.
  *
- * H1 STATUS. The adapter behind this answers from a table and dispatches
- * nothing; docs/protocol-support.md stays honest about that until H2 and H3.
+ * H3 STATUS. The adapter behind this now serves MCP over the modern era only.
+ * What the server layer gained in this phase is the S-chain: a per-exchange
+ * socket watcher that turns a client FIN, or a pipelined byte, into the
+ * abstract cancellation the adapter reacts to - and a server-wide shutdown
+ * descriptor that asks every open stream to finish rather than to stop.
  */
 
 /* Every duration and count is from the design's limits table. */
