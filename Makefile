@@ -60,6 +60,7 @@ LIB_SOURCES := \
 	src/modules/resources.c \
 	src/modules/subscriptions.c \
 	src/process/launcher.c \
+	src/process/request.c \
 	src/process/posix_launcher.c \
 	src/provider/provider.c \
 	src/provider/process_provider.c \
